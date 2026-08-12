@@ -46,7 +46,13 @@ if str(_PROJECT_ROOT) not in sys.path:
 from semantics.model_client import OpenAICompatibleModelClient
 from semantics.classifier import SemanticClassifier
 from semantics.protocol_loader import load_protocol
-from semantics.evaluator import LabeledCase, EvalPrediction, evaluate, EvaluationReport
+from semantics.evaluator import (
+    LabeledCase,
+    EvalPrediction,
+    EvaluationReport,
+    _make_live_candidates,
+    evaluate,
+)
 from semantics.keyword_matcher import match_keyword
 from models import NormalizedMessage
 
@@ -61,6 +67,10 @@ _LABELED_PATH = _FIXTURES_DIR / "semantic_cases.json"
 _NATURAL_PATH = _FIXTURES_DIR / "semantic_cases_natural.json"
 _BLIND_PATH = _FIXTURES_DIR / "semantic_cases.blind.json"
 _PROTOCOL_PATH = _PROJECT_ROOT / "protocols" / "ticket_semantics.v4.json"
+
+
+def _format_metric(value: float | None) -> str:
+    return "N/A" if value is None else f"{value:.1%}"
 
 
 # ───────────────────────── 数据加载 ─────────────────────────
@@ -120,7 +130,10 @@ async def _run_classifier_on_cases(
         print(f"  [{i}/{total}] {c['id']}: ", end="", flush=True)
 
         try:
-            decision = await classifier.classify(msg, candidates=[])
+            decision = await classifier.classify(
+                msg,
+                candidates=_make_live_candidates(c),
+            )
             predicted_intent = decision.intent
             confidence = decision.intent_confidence
             fields = dict(decision.fields)
@@ -206,11 +219,16 @@ def _print_report(
     print(f"  总用例数:     {report.total_cases}")
     print(f"  匹配预测数:   {report.matched_cases}")
     print(f"  意图准确率:   {report.intent_accuracy:.1%}")
-    print(f"  字段准确率:   {report.field_accuracy:.1%}")
+    print(f"  字段准确率:   {_format_metric(report.field_accuracy)}")
+    print(f"  字段精确率:   {_format_metric(report.field_precision)}")
+    print(f"  字段召回率:   {_format_metric(report.field_recall)}")
+    print(f"  字段 F1:      {_format_metric(report.field_f1)}")
+    print(f"  字段标签覆盖: {report.field_coverage:.1%}")
     print(f"  建单精确率:   {report.create_precision:.1%}")
     print(f"  建单召回率:   {report.create_recall:.1%}")
     print(f"  误建单率:     {report.false_create_rate:.1%}")
-    print(f"  路由精确率:   {report.routing_precision:.1%}")
+    print(f"  路由精确率:   {_format_metric(report.routing_precision)}")
+    print(f"  路由覆盖率:   {report.routing_coverage:.1%}")
     print(f"  歧义澄清率:   {report.ambiguity_clarification_rate:.1%}")
 
     if report.per_class:
@@ -235,12 +253,30 @@ def _print_detail_table(details: list[dict[str, Any]]) -> None:
     print(f"\n{'─' * 80}")
     print(f"  {'ID':<12} {'期望':<28} {'预测':<28} {'结果'}")
     print(f"{'─' * 80}")
-    for d in details:
-        mark = "✓" if d["correct"] else "✗"
+    for detail in details:
+        mark = "✓" if detail["correct"] else "✗"
         print(
-            f"  {d['id']:<12} {d['expected']:<28} {d['predicted']:<28} {mark}"
+            f"  {detail['id']:<12} {detail['expected']:<28} "
+            f"{detail['predicted']:<28} {mark}"
         )
     print(f"{'─' * 80}")
+
+
+def _print_summary(reports: list[tuple[str, EvaluationReport]]) -> None:
+    """打印多数据集汇总，允许指标因无标签而不可用。"""
+    print(f"\n{'=' * 60}")
+    print("  汇总")
+    print(f"{'=' * 60}")
+    for name, report in reports:
+        print(
+            f"  {name:<12}  "
+            f"intent_acc={report.intent_accuracy:.1%}  "
+            f"field_acc={_format_metric(report.field_accuracy)}  "
+            f"create_prec={report.create_precision:.1%}  "
+            f"create_rec={report.create_recall:.1%}  "
+            f"false_create={report.false_create_rate:.1%}"
+        )
+    print()
 
 
 # ───────────────────────── 主入口 ─────────────────────────
@@ -329,19 +365,7 @@ async def main(
 
     # ─── 汇总 ───
     if all_reports:
-        print(f"\n{'=' * 60}")
-        print(f"  汇总")
-        print(f"{'=' * 60}")
-        for name, r in all_reports:
-            print(
-                f"  {name:<12}  "
-                f"intent_acc={r.intent_accuracy:.1%}  "
-                f"field_acc={r.field_accuracy:.1%}  "
-                f"create_prec={r.create_precision:.1%}  "
-                f"create_rec={r.create_recall:.1%}  "
-                f"false_create={r.false_create_rate:.1%}"
-            )
-        print()
+        _print_summary(all_reports)
 
 
 if __name__ == "__main__":

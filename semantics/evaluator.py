@@ -44,22 +44,38 @@ class EvaluationReport:
     total_cases: int
     matched_cases: int
     intent_accuracy: float
-    field_accuracy: float
+    field_accuracy: float | None
+    field_precision: float | None
+    field_recall: float | None
+    field_f1: float | None
+    field_coverage: float
     create_precision: float
     create_recall: float
     false_create_rate: float
-    routing_precision: float
+    routing_precision: float | None
+    routing_coverage: float
     ambiguity_clarification_rate: float
     per_class: dict[str, dict[str, int]] = field(default_factory=dict)
 
     def __str__(self) -> str:
         return (
             f"EvaluationReport(total={self.total_cases}, matched={self.matched_cases}, "
-            f"intent_acc={self.intent_accuracy:.2%}, field_acc={self.field_accuracy:.2%}, "
+            f"intent_acc={self.intent_accuracy:.2%}, "
+            f"field_acc={_format_metric(self.field_accuracy)}, "
+            f"field_prec={_format_metric(self.field_precision)}, "
+            f"field_rec={_format_metric(self.field_recall)}, "
+            f"field_f1={_format_metric(self.field_f1)}, "
+            f"field_coverage={self.field_coverage:.2%}, "
             f"create_prec={self.create_precision:.2%}, create_rec={self.create_recall:.2%}, "
-            f"false_create={self.false_create_rate:.2%}, routing_prec={self.routing_precision:.2%}, "
+            f"false_create={self.false_create_rate:.2%}, "
+            f"routing_prec={_format_metric(self.routing_precision)}, "
+            f"routing_coverage={self.routing_coverage:.2%}, "
             f"ambiguity_clarify={self.ambiguity_clarification_rate:.2%})"
         )
+
+
+def _format_metric(value: float | None) -> str:
+    return "N/A" if value is None else f"{value:.2%}"
 
 
 def _index_unique(items: list[Any], *, kind: str) -> dict[str, Any]:
@@ -85,8 +101,11 @@ def evaluate(
     total = len(cases)
     matched = 0
     intent_correct = 0
-    field_correct_count = 0
-    field_total_count = 0
+    field_true_positive = 0
+    field_false_positive = 0
+    field_false_negative = 0
+    field_union_count = 0
+    field_labeled_cases = 0
     create_true_positive = 0
     create_false_positive = 0
     create_false_negative = 0
@@ -94,6 +113,7 @@ def evaluate(
     clarify_correct = 0
     routed_predictions = 0
     correctly_routed_predictions = 0
+    routing_eligible_cases = 0
     per_class: dict[str, dict[str, int]] = {}
 
     for case in cases:
@@ -109,20 +129,29 @@ def evaluate(
             intent_correct += 1
             stats["correct"] += 1
 
-        predicted_fields = pred.predicted_fields if pred else {}
-        field_names = set(case.expected_fields) | set(predicted_fields)
-        for field_name in field_names:
-            field_total_count += 1
-            if (
-                pred_intent == exp
-                and
-                field_name in case.expected_fields
-                and field_name in predicted_fields
-                and _field_values_equal(
-                    case.expected_fields[field_name], predicted_fields[field_name]
+        if case.expected_fields:
+            field_labeled_cases += 1
+            predicted_fields = pred.predicted_fields if pred else {}
+            field_names = set(case.expected_fields) | set(predicted_fields)
+            field_union_count += len(field_names)
+            for field_name in field_names:
+                expected_exists = field_name in case.expected_fields
+                predicted_exists = field_name in predicted_fields
+                values_match = (
+                    pred_intent == exp
+                    and expected_exists
+                    and predicted_exists
+                    and _field_values_equal(
+                        case.expected_fields[field_name], predicted_fields[field_name]
+                    )
                 )
-            ):
-                field_correct_count += 1
+                if values_match:
+                    field_true_positive += 1
+                else:
+                    if predicted_exists:
+                        field_false_positive += 1
+                    if expected_exists:
+                        field_false_negative += 1
 
         if exp == "ticket.create":
             if pred_intent == "ticket.create":
@@ -137,21 +166,46 @@ def evaluate(
             if pred_intent == "system.clarify":
                 clarify_correct += 1
 
-        if pred and pred.predicted_ticket_no is not None:
-            routed_predictions += 1
-            if pred.predicted_ticket_no == case.expected_ticket_no:
-                correctly_routed_predictions += 1
+        if case.expected_ticket_no is not None:
+            routing_eligible_cases += 1
+            if pred and pred.predicted_ticket_no is not None:
+                routed_predictions += 1
+                if pred.predicted_ticket_no == case.expected_ticket_no:
+                    correctly_routed_predictions += 1
 
     create_precision_denominator = create_true_positive + create_false_positive
     create_recall_denominator = create_true_positive + create_false_negative
+    field_precision_denominator = field_true_positive + field_false_positive
+    field_recall_denominator = field_true_positive + field_false_negative
+    field_precision = (
+        field_true_positive / field_precision_denominator
+        if field_precision_denominator
+        else None
+    )
+    field_recall = (
+        field_true_positive / field_recall_denominator
+        if field_recall_denominator
+        else None
+    )
+    field_f1 = (
+        2 * field_precision * field_recall / (field_precision + field_recall)
+        if field_precision is not None
+        and field_recall is not None
+        and field_precision + field_recall > 0
+        else None
+    )
 
     return EvaluationReport(
         total_cases=total,
         matched_cases=matched,
         intent_accuracy=intent_correct / total if total else 0.0,
         field_accuracy=(
-            field_correct_count / field_total_count if field_total_count else 0.0
+            field_true_positive / field_union_count if field_union_count else None
         ),
+        field_precision=field_precision,
+        field_recall=field_recall,
+        field_f1=field_f1,
+        field_coverage=field_labeled_cases / total if total else 0.0,
         create_precision=(
             create_true_positive / create_precision_denominator
             if create_precision_denominator
@@ -164,7 +218,12 @@ def evaluate(
         ),
         false_create_rate=create_false_positive / total if total else 0.0,
         routing_precision=(
-            correctly_routed_predictions / routed_predictions if routed_predictions else 0.0
+            correctly_routed_predictions / routed_predictions
+            if routed_predictions
+            else None
+        ),
+        routing_coverage=(
+            routed_predictions / routing_eligible_cases if routing_eligible_cases else 0.0
         ),
         ambiguity_clarification_rate=(
             clarify_correct / clarify_expected if clarify_expected else 0.0
@@ -324,10 +383,15 @@ def _report_dict(report: EvaluationReport) -> dict[str, Any]:
         "matched_cases": report.matched_cases,
         "intent_accuracy": report.intent_accuracy,
         "field_accuracy": report.field_accuracy,
+        "field_precision": report.field_precision,
+        "field_recall": report.field_recall,
+        "field_f1": report.field_f1,
+        "field_coverage": report.field_coverage,
         "create_precision": report.create_precision,
         "create_recall": report.create_recall,
         "false_create_rate": report.false_create_rate,
         "routing_precision": report.routing_precision,
+        "routing_coverage": report.routing_coverage,
         "ambiguity_clarification_rate": report.ambiguity_clarification_rate,
         "per_class": report.per_class,
     }

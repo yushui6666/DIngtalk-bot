@@ -1,12 +1,12 @@
-"""数据库层集成测试：9 张表、事务幂等、部分唯一索引、upsert_group。
+"""数据库层集成测试：16 张表、事务幂等、v4 多工单、upsert_group。
 
-覆盖计划书 15 节数据模型 + Phase 1 清单中的：
-- 一次性建全 9 张表及索引、唯一约束、「每群最多一张非终态工单」部分唯一索引
+覆盖计划书 15 节数据模型 + Phase 1 清单：
+- 一次性建全 16 张表及索引、唯一约束；v4.0 Task 5 已移除
+  「每群最多一张非终态工单」部分唯一索引，支持同群多工单并行
 - processed_events 幂等表：业务处理与幂等写入同事务（回滚后不残留）
 - 群配置 upsert：覆盖更新保留 ticket_seq
 """
 
-import sqlite3
 from pathlib import Path
 
 import pytest
@@ -15,7 +15,7 @@ from config import GROUPS, DB_PATH
 from db import Database
 from models import TICKET_ACTIVE, TICKET_COMPLETED, TICKET_OVERDUE
 
-# 期望的 9 张业务表
+# 期望的 16 张业务表
 EXPECTED_TABLES = {
     "groups",
     "tickets",
@@ -26,11 +26,18 @@ EXPECTED_TABLES = {
     "repair_method_versions",
     "timeout_cycles",
     "notification_deliveries",
+    "schema_migrations",
+    "inbox_messages",
+    "semantic_decisions",
+    "message_ticket_links",
+    "ticket_contexts",
+    "pending_actions",
+    "action_executions",
 }
 
-# 期望的关键索引（部分唯一索引 + 业务索引）
+# 期望的关键索引（v4：无单活动工单唯一索引）
 EXPECTED_INDEXES = {
-    "idx_tickets_one_active",   # 每群最多一张非终态工单
+    "idx_tickets_group_status",   # 活动工单按 (group_id, status) 查询
     "idx_tickets_group",
     "idx_tickets_status",
     "idx_cycles_ticket",
@@ -41,6 +48,13 @@ EXPECTED_INDEXES = {
     "idx_timeout_ticket",
     "idx_timeout_one_waiting",  # 同工单唯一 WAITING_REASON 周期
     "idx_notify_status",
+    "idx_inbox_status",
+    "idx_inbox_group",
+    "idx_semantic_decisions_msg",
+    "idx_links_ticket",
+    "idx_pending_one_waiting",  # 同 (group,user) 唯一 WAITING
+    "idx_pending_status_exp",
+    "idx_exec_src",
 }
 
 
@@ -55,7 +69,7 @@ def db(tmp_path: Path) -> Database:
 
 # ─────────────────────── 1. schema 完整性 ───────────────────────
 
-def test_all_9_tables_created(db: Database):
+def test_all_16_tables_created(db: Database):
     tables = {
         r["name"] for r in db.connect().execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
@@ -73,13 +87,23 @@ def test_all_indexes_created(db: Database):
     assert EXPECTED_INDEXES <= idx, f"缺少索引: {EXPECTED_INDEXES - idx}"
 
 
+def test_old_single_active_constraint_removed(db: Database):
+    """v4.0 Task 5：v3 遗留单活动工单唯一索引必须已删除。"""
+    idx = {
+        r["name"] for r in db.connect().execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+    }
+    assert "idx_tickets_one_active" not in idx
+
+
 def test_init_schema_idempotent(db: Database):
     """重复 init_schema 不报错（CREATE IF NOT EXISTS）。"""
     db.init_schema()
     tables = db.connect().execute(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
     ).fetchone()[0]
-    assert tables == 9
+    assert tables == 16
 
 
 # ─────────────────────── 2. 事务与幂等 ───────────────────────
@@ -117,26 +141,27 @@ def test_duplicate_message_seen_once(db: Database):
     assert result == "ARCHIVED"
 
 
-# ─────────────────────── 3. 部分唯一索引 ───────────────────────
+# ─────────────────────── 3. 多工单并行（v4.0 Task 5） ───────────────────────
 
 def _insert_ticket(db: Database, ticket_no: str, group_id: str, status: str = TICKET_ACTIVE):
     conn = db.connect()
     conn.execute(
         """INSERT INTO tickets (ticket_no, group_id, store_name, reporter_id, subject,
            location, problem_description, sla_days, initial_deadline_at,
-           current_deadline_at, status, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+           current_deadline_at, status, version, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?)""",
         (ticket_no, group_id, "店A", "uid-mgr", "主题", "位置", "描述",
          3, "2026-08-11 10:00:00", "2026-08-14 10:00:00", status, "2026-08-11 10:00:00"),
     )
     return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
 
-def test_one_active_ticket_per_group(db: Database):
-    """同群第二张 ACTIVE 工单被数据库拒绝。"""
+def test_same_group_allows_multiple_active_tickets(db: Database):
+    """v4.0 Task 5：同群可同时存在多张 ACTIVE 工单。"""
     _insert_ticket(db, "店A-主题-001", "g1")
-    with pytest.raises(sqlite3.IntegrityError):
-        _insert_ticket(db, "店A-主题-002", "g1")
+    _insert_ticket(db, "店A-主题-002", "g1")  # 不再报错
+    active = db.list_active_tickets("g1")
+    assert len(active) == 2
 
 
 def test_two_groups_independent_active_tickets(db: Database):
@@ -151,11 +176,19 @@ def test_completed_does_not_block_new_ticket(db: Database):
     _insert_ticket(db, "店A-主题-002", "g1")  # 不报错
 
 
-def test_overdue_counts_as_active(db: Database):
-    """ACTIVE_OVERDUE 仍占用活动工单名额。"""
+def test_overdue_and_active_coexist(db: Database):
+    """v4.0 Task 5：ACTIVE_OVERDUE 与 ACTIVE 可同群并存。"""
     _insert_ticket(db, "店A-主题-001", "g1", status=TICKET_OVERDUE)
-    with pytest.raises(sqlite3.IntegrityError):
-        _insert_ticket(db, "店A-主题-002", "g1")
+    _insert_ticket(db, "店A-主题-002", "g1")  # 不再报错
+    assert len(db.list_active_tickets("g1")) == 2
+
+
+def test_list_active_tickets_only_nonterminal(db: Database):
+    """list_active_tickets 只返回 ACTIVE/ACTIVE_OVERDUE。"""
+    _insert_ticket(db, "店A-主题-001", "g1")
+    _insert_ticket(db, "店A-主题-002", "g1", status=TICKET_COMPLETED)
+    nos = {t["ticket_no"] for t in db.list_active_tickets("g1")}
+    assert nos == {"店A-主题-001"}
 
 
 # ─────────────────────── 4. upsert_group ───────────────────────

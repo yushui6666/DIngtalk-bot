@@ -113,11 +113,17 @@ def _split_after_keyword(content: str, keyword: str) -> str:
     return content[len(keyword):].strip()
 
 
+# 位置式工单编号：短 ASCII 编号（T001/W001）或 中文编号（店名-主题-时效-003，以 -数字 结尾）
+_POSITIONAL_TICKET_RE = re.compile(
+    r"^(?:[A-Za-z0-9_-]+|[一-龥A-Za-z0-9_-]+-\d{2,})$"
+)
+
+
 def _extract_positional_ticket_no(text: str) -> tuple[str | None, str]:
     """提取关键词后位于首个 token 的工单编号，并返回剩余字段正文。"""
     parts = text.split(maxsplit=1)
     first_token = parts[0] if parts else ""
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", first_token):
+    if not _POSITIONAL_TICKET_RE.fullmatch(first_token):
         return None, text
     remainder = parts[1] if len(parts) == 2 else ""
     return first_token, remainder

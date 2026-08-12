@@ -65,6 +65,16 @@ _ALLOWED_REPAIR_METHODS = frozenset({
     "远程视频维修",
 })
 
+_BUSINESS_ACTION_CUES: dict[str, tuple[str, ...]] = {
+    "ticket.create": ("报修",),
+    "ticket.diagnosis.submit": ("故障判断", "判断是", "应该是"),
+    "ticket.repair_plan.submit": tuple(_ALLOWED_REPAIR_METHODS),
+    "ticket.timeout_reason.submit": ("超时原因", "没按时完成"),
+    "ticket.complete": ("完成工单", "直接完毕", "确认完毕"),
+    "ticket.cancel": ("取消工单",),
+    "ticket.reopen": ("重开工单",),
+}
+
 
 class SemanticClassifier:
     """云端模型语义分类器。
@@ -121,6 +131,25 @@ class SemanticClassifier:
                 target_ticket_no=None,
                 intent_confidence=0.0,
                 evidence=("keyword_already_matched",),
+            )
+
+        action_cues = _find_business_action_cues(message.content)
+        if len(action_cues) > 1:
+            evidence = tuple(
+                cue
+                for _, cues in action_cues
+                for cue in cues
+            )
+            return SemanticDecision(
+                protocol_version=self._protocol.protocol_version,
+                source="SEMANTIC_MODEL",
+                intent="system.clarify",
+                target_ticket_no=None,
+                intent_confidence=1.0,
+                fields={
+                    "clarification_reason": "同一消息包含多个业务动作，请拆分后重发",
+                },
+                evidence=evidence,
             )
 
         # 2. 组装 prompt 和 schema
@@ -264,6 +293,18 @@ class SemanticClassifier:
         )
 
 
+def _find_business_action_cues(
+    content: str,
+) -> list[tuple[str, tuple[str, ...]]]:
+    """识别同一消息中明确出现的多个业务动作词。"""
+    matches: list[tuple[str, tuple[str, ...]]] = []
+    for intent, cues in _BUSINESS_ACTION_CUES.items():
+        matched = tuple(cue for cue in cues if cue in content)
+        if matched:
+            matches.append((intent, matched))
+    return matches
+
+
 # ───────────────────────── 降级决策 ─────────────────────────
 
 
@@ -353,6 +394,9 @@ def _build_payload(
         "- 不要猜测位置、设备名称等\n"
         "- 字段键名使用英文字段名\n"
         "- 如果消息没有明确报修/诊断/完成等意图，返回 chat.ignore\n"
+        "- 同一消息包含两个或更多业务动作时，即使后一个动作是未来或条件动作，也返回 system.clarify\n"
+        "- 用户从候选工单中明确选择编号或序号时，返回 ticket.select\n"
+        "- 工程师使用‘可能’‘应该是’等保留表达给出具体故障判断时，仍可返回 ticket.diagnosis.submit，但应降低置信度\n"
         "- 疑问句但明确描述故障（含设备/位置/问题）时，仍返回 ticket.create；纯笼统询问、否定句返回 chat.ignore\n"
         "- 完成工单(ticket.complete)、取消工单(ticket.cancel)、"
         "重开工单(ticket.reopen) 只在用户非常确定时才返回\n"

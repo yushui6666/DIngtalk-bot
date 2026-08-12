@@ -164,8 +164,8 @@ _EXTRA_ACTIONS: list[dict[str, Any]] = [
         "intent_id": "ticket.select",
         "display_name": "选择工单上下文",
         "explicit_keywords": ["#选择工单"],
-        "semantic_enabled": False,
-        "allowed_roles": ["MANAGER", "ENGINEER"],
+        "semantic_enabled": True,
+        "allowed_roles": ["MANAGER", "ENGINEER", "OTHER"],
         "allowed_ticket_states": [],
         "required_fields": ["ticket_no"],
         "optional_fields": [],
@@ -175,8 +175,15 @@ _EXTRA_ACTIONS: list[dict[str, Any]] = [
             "EXPLICIT_KEYWORD": "NOT_REQUIRED",
             "SEMANTIC_MODEL": "NOT_REQUIRED",
         },
-        "positive_examples": ["#选择工单 W001"],
-        "negative_examples": ["选择工单 W001"],
+        "positive_examples": [
+            "#选择工单 W001",
+            "我选第二张工单 T002",
+            "选择工单 T002",
+        ],
+        "negative_examples": [
+            "现在有哪些工单",
+            "第二张工单是什么问题",
+        ],
         "confirmation_template": "",
         "executor": "select_ticket",
         "field_definitions": {},
@@ -497,6 +504,19 @@ def compile_business_protocol(source: Path, destination: Path) -> str:
             "executor": _executor_for(intent_id),
             "field_definitions": _build_field_defs_from_source(intent_id, kw_def),
         }
+        if intent_id == "ticket.select":
+            action.update({
+                "semantic_enabled": True,
+                "positive_examples": [
+                    "#选择工单 W001",
+                    "我选第二张工单 T002",
+                    "选择工单 T002",
+                ],
+                "negative_examples": [
+                    "现在有哪些工单",
+                    "第二张工单是什么问题",
+                ],
+            })
         actions.append(action)
 
     # 补全 v4.0 新增动作（业务源中没有的）

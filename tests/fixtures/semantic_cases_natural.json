@@ -91,6 +91,7 @@
   {
     "id": "N12",
     "text": "我觉得这个门可能不是下沉的问题，应该是合页松了",
+    "sender_role": "ENGINEER",
     "expected_intent": "ticket.diagnosis.submit",
     "expected_fields": {},
     "has_keyword": false,

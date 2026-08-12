@@ -497,6 +497,55 @@ async def test_classifier_payload_contains_protocol_candidates_and_pending_conte
 
 
 @pytest.mark.asyncio
+async def test_classifier_forces_clarify_for_multiple_business_actions():
+    """同一消息明确包含两个业务动作时不得只选择其中一个。"""
+    from semantics.classifier import SemanticClassifier
+
+    protocol = _load_protocol()
+    fake = FakeModelClient(response={
+        "intent": "ticket.create",
+        "confidence": 0.95,
+        "fields": {
+            "subject": "门",
+            "location": "大厅",
+            "problem_description": "坏了",
+            "sla": "3天",
+        },
+    })
+    classifier = SemanticClassifier(client=fake, protocol=protocol)
+    result = await classifier.classify(
+        _make_message(content="门坏了，位置在大厅，3天时效，先报修，修好之后就直接完毕"),
+        candidates=[],
+    )
+    assert result.intent == "system.clarify"
+    assert result.fields["clarification_reason"]
+
+
+@pytest.mark.asyncio
+async def test_classifier_allows_natural_language_ticket_select():
+    """协议允许模型识别多候选中的明确工单选择。"""
+    from semantics.classifier import SemanticClassifier
+    from semantics.types import TicketCandidate
+
+    protocol = _load_protocol()
+    fake = FakeModelClient(response={
+        "intent": "ticket.select",
+        "confidence": 0.95,
+        "fields": {"ticket_no": "T002"},
+    })
+    candidates = [
+        TicketCandidate(1, "T001", "g-test", "门", "大厅", "下沉", "ACTIVE", 1),
+        TicketCandidate(2, "T002", "g-test", "空调", "后厨", "漏水", "ACTIVE", 1),
+    ]
+    classifier = SemanticClassifier(client=fake, protocol=protocol)
+    result = await classifier.classify(
+        _make_message(content="我选第二张工单 T002"), candidates=candidates
+    )
+    assert result.intent == "ticket.select"
+    assert result.target_ticket_no == "T002"
+
+
+@pytest.mark.asyncio
 async def test_classifier_single_http_call():
     """确认 classifier 只做单次 HTTP 调用，不内部重试（§8.1）。"""
     from semantics.classifier import SemanticClassifier

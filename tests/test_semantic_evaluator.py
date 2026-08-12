@@ -139,7 +139,95 @@ def test_evaluator_handles_empty_dataset():
     from semantics.evaluator import evaluate, LabeledCase, EvalPrediction
     report = evaluate([], [])
     assert report.intent_accuracy == 0.0
-    assert report.field_accuracy == 0.0
+    assert report.field_accuracy is None
+    assert report.routing_precision is None
+
+
+def test_evaluator_reports_field_precision_recall_and_coverage():
+    """字段指标只统计有字段标签的用例，并区分精确率与召回率。"""
+    from semantics.evaluator import evaluate, LabeledCase, EvalPrediction
+
+    cases = [
+        LabeledCase(
+            id="c1",
+            text="msg",
+            expected_intent="ticket.create",
+            expected_fields={"subject": "门", "sla": "3天"},
+        ),
+        LabeledCase(id="c2", text="msg", expected_intent="chat.ignore"),
+    ]
+    predictions = [
+        EvalPrediction(
+            id="c1",
+            predicted_intent="ticket.create",
+            predicted_fields={"subject": "门", "location": "大厅"},
+        ),
+        EvalPrediction(
+            id="c2",
+            predicted_intent="chat.ignore",
+            predicted_fields={"subject": "不应参与字段评分"},
+        ),
+    ]
+
+    report = evaluate(cases, predictions)
+    assert report.field_accuracy == pytest.approx(1 / 3)
+    assert report.field_precision == 0.5
+    assert report.field_recall == 0.5
+    assert report.field_f1 == 0.5
+    assert report.field_coverage == 0.5
+
+
+def test_evaluator_unlabeled_fields_are_not_counted_as_wrong():
+    """无字段标签的数据集不应把模型输出字段误判为错误。"""
+    from semantics.evaluator import evaluate, LabeledCase, EvalPrediction
+
+    cases = [LabeledCase(id="c1", text="msg", expected_intent="chat.ignore")]
+    predictions = [
+        EvalPrediction(
+            id="c1",
+            predicted_intent="chat.ignore",
+            predicted_fields={"subject": "门"},
+        )
+    ]
+
+    report = evaluate(cases, predictions)
+    assert report.field_accuracy is None
+    assert report.field_precision is None
+    assert report.field_recall is None
+    assert report.field_f1 is None
+    assert report.field_coverage == 0.0
+
+
+def test_evaluator_reports_routing_coverage():
+    """路由覆盖率与已路由样本的精确率分别统计。"""
+    from semantics.evaluator import evaluate, LabeledCase, EvalPrediction
+
+    cases = [
+        LabeledCase(
+            id="c1",
+            text="msg",
+            expected_intent="ticket.complete",
+            expected_ticket_no="T1",
+        ),
+        LabeledCase(
+            id="c2",
+            text="msg",
+            expected_intent="ticket.complete",
+            expected_ticket_no="T2",
+        ),
+    ]
+    predictions = [
+        EvalPrediction(
+            id="c1",
+            predicted_intent="ticket.complete",
+            predicted_ticket_no="T1",
+        ),
+        EvalPrediction(id="c2", predicted_intent="ticket.complete"),
+    ]
+
+    report = evaluate(cases, predictions)
+    assert report.routing_precision == 1.0
+    assert report.routing_coverage == 0.5
 
 
 def test_evaluator_rejects_id_mismatch():
@@ -341,6 +429,67 @@ async def test_live_model_evaluator_uses_classifier_predictions():
     report = await _run_live_model(dataset, classifier=FakeClassifier())
     assert report.intent_accuracy == 1.0
     assert report.routing_precision == 1.0
+
+
+@pytest.mark.asyncio
+async def test_run_eval_passes_dataset_candidates_to_classifier():
+    """完整评测入口必须传递数据集中的候选快照。"""
+    from semantics.run_eval import _run_classifier_on_cases
+    from semantics.types import SemanticDecision
+
+    class FakeClassifier:
+        async def classify(self, message, candidates):
+            assert message.sender_role == "MANAGER"
+            assert [candidate.ticket_no for candidate in candidates] == ["T001", "T002"]
+            return SemanticDecision(
+                protocol_version="4.0.0",
+                source="SEMANTIC_MODEL",
+                intent="ticket.select",
+                target_ticket_no="T002",
+                intent_confidence=0.95,
+                fields={},
+            )
+
+    cases = [{
+        "id": "route-1",
+        "text": "我选 T002",
+        "sender_role": "MANAGER",
+        "expected_intent": "ticket.select",
+        "expected_ticket_no": "T002",
+        "candidates": [
+            {"ticket_no": "T001", "subject": "门", "status": "ACTIVE"},
+            {"ticket_no": "T002", "subject": "空调", "status": "ACTIVE"},
+        ],
+    }]
+    predictions, _ = await _run_classifier_on_cases(cases, FakeClassifier())
+    assert predictions[0].predicted_ticket_no == "T002"
+
+
+def test_run_eval_summary_formats_unavailable_metrics(capsys):
+    """最终汇总遇到无字段标签指标时应输出 N/A 而不是崩溃。"""
+    from semantics.evaluator import EvaluationReport
+    from semantics.run_eval import _print_summary
+
+    report = EvaluationReport(
+        total_cases=1,
+        matched_cases=1,
+        intent_accuracy=1.0,
+        field_accuracy=None,
+        field_precision=None,
+        field_recall=None,
+        field_f1=None,
+        field_coverage=0.0,
+        create_precision=1.0,
+        create_recall=1.0,
+        false_create_rate=0.0,
+        routing_precision=None,
+        routing_coverage=0.0,
+        ambiguity_clarification_rate=0.0,
+    )
+
+    _print_summary([("自然语言集", report)])
+
+    assert "field_acc=N/A" in capsys.readouterr().out
 
 
 # ───────────────────────── 关键词匹配器评测 ─────────────────────────

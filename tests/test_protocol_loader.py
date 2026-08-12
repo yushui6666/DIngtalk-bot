@@ -207,6 +207,9 @@ def test_compiled_protocol_matches_v4_contract(tmp_path):
         assert action is not None
         assert "OTHER" in action.allowed_roles
 
+    select = protocol.get_action("ticket.select")
+    assert select is not None and select.semantic_enabled
+
     add_detail = protocol.get_action("ticket.add_detail")
     reopen = protocol.get_action("ticket.reopen")
     timeout_reason = protocol.get_action("ticket.timeout_reason.submit")

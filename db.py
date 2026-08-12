@@ -1,17 +1,20 @@
-"""SQLite 数据层：9 张表、索引、唯一约束与事务封装。
+"""SQLite 数据层：表、索引、唯一约束、事务封装与 v4 多工单迁移。
 
-表结构对应计划书第 15 节（v3.0 基线 → v4.0 迁移中）：
-  groups / tickets / responsibility_cycles / messages / processed_events /
-  diagnosis_versions / repair_method_versions / timeout_cycles / notification_deliveries
+v4.0 Task 5 已落地：
+- 删除 v3 遗留「每群最多一张非终态工单」部分唯一索引，支持同群多工单并行。
+- tickets 新增 version（乐观并发）/cancelled_*/duplicate_of_ticket_id/reopen_count。
+- 新增 inbox_messages / semantic_decisions / message_ticket_links / ticket_contexts /
+  pending_actions / action_executions / schema_migrations。
+
+既有表（groups/tickets/responsibility_cycles/messages/processed_events/
+diagnosis_versions/repair_method_versions/timeout_cycles/notification_deliveries）继续保留。
 
 关键约束：
-- tickets: ⚠️ v3.0 遗留——每群最多一张非终态工单（部分唯一索引，
-  WHERE status IN (ACTIVE, ACTIVE_OVERDUE)）。v4.0 Task 5 将删除此索引并新增
-  inbox_messages / pending_actions / action_confirmations / ticket_routing 表。
-  在 Task 5 完成前，同群创建多张活动工单会导致 UNIQUE constraint 失败。
 - messages.message_id 唯一；processed_events.message_id 主键
 - diagnosis/repair_method 的 source_message_id 唯一（一条消息只产生一个版本）
 - notification_deliveries.dedupe_key 唯一（Outbox 防重复）
+- pending_actions 同一 (group_id, user_id) 至多一条 WAITING（部分唯一索引）
+- action_executions.dedupe_key 唯一（防崩溃重复执行）
 
 所有业务状态变更必须走 :meth:`Database.transaction`，保证同一事务内
 写业务状态 + 写 processed_events + 预写通知 Outbox。
@@ -32,8 +35,7 @@ from models import TICKET_ACTIVE, TICKET_OVERDUE
 
 logger = get_logger(__name__)
 
-_SCHEMA = """
--- ─────────────────────── groups ───────────────────────
+_SCHEMA = """-- ─────────────────────── groups ───────────────────────
 CREATE TABLE IF NOT EXISTS groups (
     group_id               TEXT PRIMARY KEY,
     store_name             TEXT NOT NULL,
@@ -67,16 +69,19 @@ CREATE TABLE IF NOT EXISTS tickets (
     current_responsibility_cycle_id INTEGER,
     last_business_event_at         TEXT,
     last_business_message_id       TEXT,
+    version                        INTEGER NOT NULL DEFAULT 1,
+    cancelled_at                   TEXT,
+    cancelled_by                   TEXT,
+    cancel_reason                  TEXT,
+    duplicate_of_ticket_id         INTEGER,
+    reopen_count                   INTEGER NOT NULL DEFAULT 0,
     created_at                     TEXT NOT NULL,
     closed_at                      TEXT
 );
 
--- ⚠️ v3.0 遗留约束：每群最多一张非终态工单。
--- v4.0 Task 5 将删除此索引以支持同群多工单并行。
--- 删除前，同群创建多张活动工单会触发 UNIQUE constraint 失败。
-CREATE UNIQUE INDEX IF NOT EXISTS idx_tickets_one_active
-    ON tickets(group_id) WHERE status IN ('ACTIVE', 'ACTIVE_OVERDUE');
-
+-- v4.0 Task 5 已删除单活动工单唯一索引，支持同群多工单并行。
+-- 活动工单按 (group_id, status) 查询。
+CREATE INDEX IF NOT EXISTS idx_tickets_group_status ON tickets(group_id, status);
 CREATE INDEX IF NOT EXISTS idx_tickets_group ON tickets(group_id);
 CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
 
@@ -180,7 +185,123 @@ CREATE TABLE IF NOT EXISTS notification_deliveries (
 );
 
 CREATE INDEX IF NOT EXISTS idx_notify_status ON notification_deliveries(status, scheduled_at);
+
+-- ─────────────────────── schema_migrations（v4.0 Task 5） ───────────────────────
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version    TEXT PRIMARY KEY,
+    applied_at TEXT NOT NULL
+);
+
+-- ─────────────────────── inbox_messages（v4.0 Task 5/6） ───────────────────────
+CREATE TABLE IF NOT EXISTS inbox_messages (
+    message_id          TEXT PRIMARY KEY,
+    group_id            TEXT NOT NULL,
+    sender_id           TEXT NOT NULL,
+    sender_role         TEXT NOT NULL,
+    content             TEXT NOT NULL DEFAULT '',
+    message_type        TEXT NOT NULL DEFAULT 'text',
+    reply_to_message_id TEXT,
+    sent_at             TEXT NOT NULL,
+    received_at         TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'RECEIVED',
+    processed_result    TEXT,
+    attempts            INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at     TEXT,
+    last_error          TEXT,
+    claimed_by          TEXT,
+    claimed_at          TEXT,
+    lease_until         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_inbox_status ON inbox_messages(status, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_inbox_group ON inbox_messages(group_id, sent_at);
+
+-- ─────────────────────── semantic_decisions（v4.0 Task 5） ───────────────────────
+CREATE TABLE IF NOT EXISTS semantic_decisions (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id           TEXT NOT NULL,
+    protocol_version     TEXT NOT NULL,
+    source               TEXT NOT NULL,
+    intent               TEXT NOT NULL,
+    target_ticket_no     TEXT,
+    confidence           REAL NOT NULL,
+    fields_json          TEXT NOT NULL DEFAULT '{}',
+    missing_fields_json  TEXT NOT NULL DEFAULT '[]',
+    evidence_json        TEXT NOT NULL DEFAULT '[]',
+    decision_status      TEXT NOT NULL DEFAULT 'RECORDED',
+    errors_json          TEXT NOT NULL DEFAULT '[]',
+    created_at           TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_semantic_decisions_msg ON semantic_decisions(message_id);
+
+-- ─────────────────────── message_ticket_links（v4.0 Task 5） ───────────────────────
+CREATE TABLE IF NOT EXISTS message_ticket_links (
+    message_id    TEXT PRIMARY KEY,
+    ticket_id     INTEGER NOT NULL,
+    link_type     TEXT NOT NULL,
+    routing_score REAL NOT NULL DEFAULT 0,
+    linked_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_links_ticket ON message_ticket_links(ticket_id);
+
+-- ─────────────────────── ticket_contexts（v4.0 Task 7） ───────────────────────
+CREATE TABLE IF NOT EXISTS ticket_contexts (
+    group_id   TEXT NOT NULL,
+    user_id    TEXT NOT NULL,
+    ticket_id  INTEGER NOT NULL,
+    order_key  TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (group_id, user_id)
+);
+
+-- ─────────────────────── pending_actions（v4.0 Task 8） ───────────────────────
+CREATE TABLE IF NOT EXISTS pending_actions (
+    id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_message_id          TEXT NOT NULL,
+    group_id                   TEXT NOT NULL,
+    user_id                    TEXT NOT NULL,
+    intent                     TEXT NOT NULL,
+    candidate_ticket_ids_json  TEXT NOT NULL DEFAULT '[]',
+    fields_json                TEXT NOT NULL DEFAULT '{}',
+    expected_versions_json     TEXT NOT NULL DEFAULT '{}',
+    status                     TEXT NOT NULL DEFAULT 'WAITING',
+    version                    INTEGER NOT NULL DEFAULT 0,
+    created_at                 TEXT NOT NULL,
+    expires_at                 TEXT NOT NULL,
+    confirmed_message_id       TEXT,
+    resolved_at                TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_one_waiting
+    ON pending_actions(group_id, user_id) WHERE status = 'WAITING';
+CREATE INDEX IF NOT EXISTS idx_pending_status_exp ON pending_actions(status, expires_at);
+
+-- ─────────────────────── action_executions（v4.0 Task 9） ───────────────────────
+CREATE TABLE IF NOT EXISTS action_executions (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    dedupe_key              TEXT NOT NULL UNIQUE,
+    source_message_id       TEXT NOT NULL,
+    confirmation_message_id TEXT,
+    pending_action_id       INTEGER,
+    intent                  TEXT NOT NULL,
+    target_ticket_id        INTEGER,
+    command_json            TEXT NOT NULL DEFAULT '{}',
+    status                  TEXT NOT NULL DEFAULT 'PENDING',
+    created_at              TEXT NOT NULL,
+    applied_at              TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_exec_src ON action_executions(source_message_id);
 """
+
+
+# v3.0 → v4.0：tickets 表迁移新增列（对已存在旧库幂等 ALTER）
+_TICKET_MIGRATION_COLUMNS = {
+    "version": "version INTEGER NOT NULL DEFAULT 1",
+    "cancelled_at": "cancelled_at TEXT",
+    "cancelled_by": "cancelled_by TEXT",
+    "cancel_reason": "cancel_reason TEXT",
+    "duplicate_of_ticket_id": "duplicate_of_ticket_id INTEGER",
+    "reopen_count": "reopen_count INTEGER NOT NULL DEFAULT 0",
+}
 
 
 def _now_str() -> str:
@@ -204,6 +325,8 @@ class Database:
             self._conn = sqlite3.connect(
                 str(self.db_path),
                 check_same_thread=False,
+                # autocommit：裸 UPDATE 不会隐式开事务；事务统一由 transaction() 显式控制
+                isolation_level=None,
             )
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA journal_mode=WAL")
@@ -212,9 +335,10 @@ class Database:
         return self._conn
 
     def init_schema(self) -> None:
+        # executescript 会隐式 COMMIT，不能用 SAVEPOINT 事务包裹。
         conn = self.connect()
-        with self.transaction("init_schema"):
-            conn.executescript(_SCHEMA)
+        conn.executescript(_SCHEMA)
+        self._apply_migrations(conn)
         # 统计表数量做校验
         tables = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
@@ -225,6 +349,28 @@ class Database:
             ",".join(r["name"] for r in tables),
         )
 
+    def _apply_migrations(self, conn: sqlite3.Connection) -> None:
+        """v3.0 → v4.0 幂等迁移（对已存在的旧数据库执行）。"""
+        # 1. 删除 v3 遗留单活动工单唯一索引
+        conn.execute("DROP INDEX IF EXISTS idx_tickets_one_active")
+
+        # 2. tickets 新增列（幂等：先查 PRAGMA table_info 再决定是否 ALTER）
+        existing = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(tickets)").fetchall()
+        }
+        for column, ddl in _TICKET_MIGRATION_COLUMNS.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE tickets ADD COLUMN {ddl}")
+
+        # 3. 记录迁移版本
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at)"
+            " VALUES ('4.0.0_task5_multiticket', ?)",
+            (_now_str(),),
+        )
+        logger.info("v4.0 多工单迁移已应用（单活动工单约束已移除）")
+
     def close(self) -> None:
         if self._conn is not None:
             self._conn.close()
@@ -234,21 +380,30 @@ class Database:
     # ─────────────────────── 事务封装 ───────────────────────
     @contextmanager
     def transaction(self, tx_name: str = "tx") -> Iterator[sqlite3.Connection]:
-        """事务上下文：提交成功打 INFO，回滚打 ERROR。
+        """事务上下文：基于 SAVEPOINT，可重入（嵌套调用安全）。
+
+        提交成功打 INFO，回滚打 ERROR。最外层 SAVEPOINT 的回滚即整体回滚，
+        嵌套事务内回滚只回滚到对应保存点。
 
         业务状态 + processed_events + 通知 Outbox 必须同事务写入。
         """
         conn = self.connect()
+        # 清洗保存点名（tx_name 可能含 ':' 等 SQLite 标识符不允许的字符）
+        savepoint = "sp_" + "".join(ch if ch.isalnum() else "_" for ch in tx_name)
         logger.debug("事务开始 tx=%s", tx_name)
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(f"SAVEPOINT {savepoint}")
             yield conn
         except Exception as exc:
-            conn.rollback()
+            try:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            except sqlite3.Error:
+                pass
             logger.error("事务回滚 tx=%s reason=%s", tx_name, exc)
             raise
         else:
-            conn.commit()
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
             logger.info("事务提交 tx=%s", tx_name)
 
     # ─────────────────────── 基础查询 ───────────────────────
@@ -314,4 +469,457 @@ class Database:
             "INSERT OR IGNORE INTO processed_events (message_id, group_id, received_at, result)"
             " VALUES (?,?,?,?)",
             (message_id, group_id, _now_str(), result),
+        )
+
+    # ─────────────────────── 收件箱 inbox_messages ───────────────────────
+    def enqueue_message(self, msg: Any) -> bool:
+        """消息入箱（幂等：message_id 已存在返回 False）。"""
+        with self.transaction("inbox_enqueue"):
+            cur = self._conn.execute(
+                """INSERT OR IGNORE INTO inbox_messages (
+                       message_id, group_id, sender_id, sender_role, content,
+                       message_type, reply_to_message_id, sent_at, received_at)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (
+                    msg.message_id, msg.group_id, msg.sender_id, msg.sender_role,
+                    msg.content, msg.message_type, msg.reply_to_message_id,
+                    msg.sent_at.strftime("%Y-%m-%d %H:%M:%S"),
+                    _now_str(),
+                ),
+            )
+        return cur.rowcount > 0
+
+    def inbox_next_due(self, limit: int = 20, *, now: str | None = None) -> list[dict[str, Any]]:
+        """取可处理消息（RECEIVED 或已到期的 RETRY_PENDING），按 (group, sent_at, message_id) 排序。"""
+        now = now or _now_str()
+        rows = self.connect().execute(
+            """SELECT * FROM inbox_messages
+               WHERE status IN ('RECEIVED', 'RETRY_PENDING')
+                 AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+               ORDER BY group_id, sent_at, message_id LIMIT ?""",
+            (now, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def inbox_set_status(
+        self,
+        message_id: str,
+        status: str,
+        *,
+        processed_result: str | None = None,
+        last_error: str | None = None,
+        attempts: int | None = None,
+        next_attempt_at: str | None = None,
+    ) -> None:
+        """更新收件箱行状态（不单独开事务，调用方在业务事务内调用）。"""
+        sets: list[str] = ["status=?"]
+        params: list[Any] = [status]
+        if processed_result is not None:
+            sets.append("processed_result=?")
+            params.append(processed_result)
+        if last_error is not None:
+            sets.append("last_error=?")
+            params.append(last_error)
+        if attempts is not None:
+            sets.append("attempts=?")
+            params.append(attempts)
+        if next_attempt_at is not None:
+            sets.append("next_attempt_at=?")
+            params.append(next_attempt_at)
+        params.append(message_id)
+        self._conn.execute(
+            f"UPDATE inbox_messages SET {', '.join(sets)} WHERE message_id=?", params
+        )
+
+    def inbox_reset_stale(self, *, now: str | None = None) -> int:
+        """启动时把残留 PROCESSING 重置回 RECEIVED（单进程崩溃恢复）。"""
+        with self.transaction("inbox_reset_stale"):
+            cur = self._conn.execute(
+                "UPDATE inbox_messages SET status='RECEIVED', claimed_by=NULL,"
+                " claimed_at=NULL, lease_until=NULL WHERE status='PROCESSING'"
+            )
+        return cur.rowcount
+
+    # ─────────────────────── 语义决策 semantic_decisions ───────────────────────
+    def save_semantic_decision(
+        self,
+        message_id: str,
+        *,
+        protocol_version: str,
+        source: str,
+        intent: str,
+        target_ticket_no: str | None,
+        confidence: float,
+        fields: dict[str, Any],
+        missing_fields: tuple[str, ...],
+        evidence: tuple[str, ...],
+        decision_status: str = "RECORDED",
+        errors: tuple[str, ...] = (),
+    ) -> int:
+        """保存一条识别结果审计记录，返回 id。"""
+        with self.transaction("save_semantic_decision"):
+            cur = self._conn.execute(
+                """INSERT INTO semantic_decisions (
+                       message_id, protocol_version, source, intent, target_ticket_no,
+                       confidence, fields_json, missing_fields_json, evidence_json,
+                       decision_status, errors_json, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    message_id, protocol_version, source, intent, target_ticket_no,
+                    confidence,
+                    json.dumps(fields, ensure_ascii=False),
+                    json.dumps(list(missing_fields), ensure_ascii=False),
+                    json.dumps(list(evidence), ensure_ascii=False),
+                    decision_status,
+                    json.dumps(list(errors), ensure_ascii=False),
+                    _now_str(),
+                ),
+            )
+        return cur.lastrowid
+
+    # ─────────────────────── 消息归属 message_ticket_links ───────────────────────
+    def link_message(
+        self, message_id: str, ticket_id: int, link_type: str, routing_score: float = 0.0
+    ) -> None:
+        """记录消息最终归属（在业务事务内调用）。"""
+        self._conn.execute(
+            """INSERT OR REPLACE INTO message_ticket_links
+                   (message_id, ticket_id, link_type, routing_score, linked_at)
+               VALUES (?,?,?,?,?)""",
+            (message_id, ticket_id, link_type, routing_score, _now_str()),
+        )
+
+    def get_message_link(self, message_id: str) -> dict[str, Any] | None:
+        row = self.connect().execute(
+            "SELECT * FROM message_ticket_links WHERE message_id=?", (message_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_quoted_ticket_id(self, reply_to_message_id: str) -> int | None:
+        """钉钉引用：查被引用消息的归属工单。"""
+        row = self.connect().execute(
+            "SELECT ticket_id FROM message_ticket_links WHERE message_id=?",
+            (reply_to_message_id,),
+        ).fetchone()
+        return row["ticket_id"] if row else None
+
+    # ─────────────────────── 用户上下文 ticket_contexts ───────────────────────
+    def set_ticket_context(
+        self, group_id: str, user_id: str, ticket_id: int, order_key: str,
+        expires_at: str, *, now: str | None = None,
+    ) -> None:
+        with self.transaction("set_ticket_context"):
+            self._conn.execute(
+                """INSERT INTO ticket_contexts (group_id, user_id, ticket_id, order_key, expires_at, updated_at)
+                   VALUES (?,?,?,?,?,?)
+                   ON CONFLICT(group_id, user_id) DO UPDATE SET
+                       ticket_id=excluded.ticket_id, order_key=excluded.order_key,
+                       expires_at=excluded.expires_at, updated_at=excluded.updated_at""",
+                (group_id, user_id, ticket_id, order_key, expires_at, now or _now_str()),
+            )
+
+    def get_ticket_context(
+        self, group_id: str, user_id: str, now: str
+    ) -> dict[str, Any] | None:
+        row = self.connect().execute(
+            "SELECT * FROM ticket_contexts WHERE group_id=? AND user_id=? AND expires_at > ?",
+            (group_id, user_id, now),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def clear_ticket_context(self, group_id: str, user_id: str) -> None:
+        with self.transaction("clear_ticket_context"):
+            self._conn.execute(
+                "DELETE FROM ticket_contexts WHERE group_id=? AND user_id=?",
+                (group_id, user_id),
+            )
+
+    def clear_contexts_by_ticket(self, ticket_id: int) -> int:
+        with self.transaction("clear_contexts_by_ticket"):
+            cur = self._conn.execute(
+                "DELETE FROM ticket_contexts WHERE ticket_id=?", (ticket_id,)
+            )
+        return cur.rowcount
+
+    # ─────────────────────── 待确认动作 pending_actions ───────────────────────
+    def create_pending(
+        self,
+        *,
+        source_message_id: str,
+        group_id: str,
+        user_id: str,
+        intent: str,
+        candidate_ticket_ids: tuple[int, ...],
+        fields: dict[str, Any],
+        expected_versions: dict[int, int],
+        expires_at: str,
+    ) -> int:
+        with self.transaction("create_pending"):
+            cur = self._conn.execute(
+                """INSERT INTO pending_actions (
+                       source_message_id, group_id, user_id, intent,
+                       candidate_ticket_ids_json, fields_json, expected_versions_json,
+                       status, version, created_at, expires_at)
+                   VALUES (?,?,?,?,?,?,?, 'WAITING', 0, ?, ?)""",
+                (
+                    source_message_id, group_id, user_id, intent,
+                    json.dumps(list(candidate_ticket_ids), ensure_ascii=False),
+                    json.dumps(fields, ensure_ascii=False),
+                    json.dumps(expected_versions, ensure_ascii=False),
+                    _now_str(), expires_at,
+                ),
+            )
+            return cur.lastrowid
+
+    def _pending_row_to_dict(self, row: Any) -> dict[str, Any]:
+        d = dict(row)
+        d["candidate_ticket_ids"] = tuple(
+            json.loads(d.get("candidate_ticket_ids_json") or "[]")
+        )
+        d["fields"] = json.loads(d.get("fields_json") or "{}")
+        d["expected_versions"] = {
+            int(k): int(v) for k, v in (json.loads(d.get("expected_versions_json") or "{}")).items()
+        }
+        return d
+
+    def get_waiting_pending(self, group_id: str, user_id: str) -> dict[str, Any] | None:
+        row = self.connect().execute(
+            "SELECT * FROM pending_actions WHERE group_id=? AND user_id=? AND status='WAITING'",
+            (group_id, user_id),
+        ).fetchone()
+        return self._pending_row_to_dict(row) if row else None
+
+    def get_pending(self, pending_id: int) -> dict[str, Any] | None:
+        row = self.connect().execute(
+            "SELECT * FROM pending_actions WHERE id=?", (pending_id,)
+        ).fetchone()
+        return self._pending_row_to_dict(row) if row else None
+
+    def supersede_waiting(self, group_id: str, user_id: str, *, now: str | None = None) -> int:
+        """把该 (group,user) 的旧 WAITING 置为 SUPERSEDED，返回受影响行数。"""
+        with self.transaction("supersede_waiting"):
+            cur = self._conn.execute(
+                "UPDATE pending_actions SET status='SUPERSEDED', resolved_at=?"
+                " WHERE group_id=? AND user_id=? AND status='WAITING'",
+                (now or _now_str(), group_id, user_id),
+            )
+        return cur.rowcount
+
+    def resolve_pending(
+        self, pending_id: int, expected_version: int, status: str,
+        confirmed_message_id: str | None = None, *, now: str | None = None,
+    ) -> bool:
+        """CAS 解决待确认动作；行数为 0 表示版本冲突或已非 WAITING。"""
+        with self.transaction("resolve_pending"):
+            cur = self._conn.execute(
+                "UPDATE pending_actions SET status=?, version=version+1,"
+                " confirmed_message_id=?, resolved_at=?"
+                " WHERE id=? AND status='WAITING' AND version=?",
+                (status, confirmed_message_id, now or _now_str(), pending_id, expected_version),
+            )
+        return cur.rowcount > 0
+
+    def expire_due_pendings(self, now: str) -> int:
+        with self.transaction("expire_due_pendings"):
+            cur = self._conn.execute(
+                "UPDATE pending_actions SET status='EXPIRED', resolved_at=?"
+                " WHERE status='WAITING' AND expires_at <= ?",
+                (now, now),
+            )
+        return cur.rowcount
+
+    # ─────────────────────── 执行记录 action_executions ───────────────────────
+    def insert_execution(
+        self,
+        *,
+        dedupe_key: str,
+        source_message_id: str,
+        confirmation_message_id: str | None,
+        pending_action_id: int | None,
+        intent: str,
+        target_ticket_id: int | None,
+        command_json: dict[str, Any],
+    ) -> bool:
+        """INSERT OR IGNORE；返回 False 表示该 dedupe_key 已存在（防重复执行）。"""
+        with self.transaction("insert_execution"):
+            cur = self._conn.execute(
+                """INSERT OR IGNORE INTO action_executions (
+                       dedupe_key, source_message_id, confirmation_message_id,
+                       pending_action_id, intent, target_ticket_id, command_json,
+                       status, created_at)
+                   VALUES (?,?,?,?,?,?,?, 'PENDING', ?)""",
+                (
+                    dedupe_key, source_message_id, confirmation_message_id,
+                    pending_action_id, intent, target_ticket_id,
+                    json.dumps(command_json, ensure_ascii=False),
+                    _now_str(),
+                ),
+            )
+        return cur.rowcount > 0
+
+    def mark_execution_applied(self, dedupe_key: str, *, now: str | None = None) -> None:
+        self._conn.execute(
+            "UPDATE action_executions SET status='APPLIED', applied_at=?"
+            " WHERE dedupe_key=?",
+            (now or _now_str(), dedupe_key),
+        )
+
+    def execution_applied(self, dedupe_key: str) -> bool:
+        row = self.connect().execute(
+            "SELECT status FROM action_executions WHERE dedupe_key=?", (dedupe_key,)
+        ).fetchone()
+        return row is not None and row["status"] == "APPLIED"
+
+    # ─────────────────────── 工单基础读写（供 tickets/repository 使用） ───────────────────────
+    def get_ticket(self, ticket_id: int) -> dict[str, Any] | None:
+        row = self.connect().execute(
+            "SELECT * FROM tickets WHERE id=?", (ticket_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_ticket_by_no(self, ticket_no: str) -> dict[str, Any] | None:
+        row = self.connect().execute(
+            "SELECT * FROM tickets WHERE ticket_no=?", (ticket_no,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_active_tickets(self, group_id: str) -> list[dict[str, Any]]:
+        rows = self.connect().execute(
+            "SELECT * FROM tickets WHERE group_id=? AND status IN ('ACTIVE','ACTIVE_OVERDUE')"
+            " ORDER BY id",
+            (group_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def next_ticket_seq(self, group_id: str) -> int:
+        """分配工单序号（必须在事务内调用，配合 upsert 递增）。"""
+        row = self._conn.execute(
+            "SELECT ticket_seq FROM groups WHERE group_id=?", (group_id,)
+        ).fetchone()
+        seq = int(row["ticket_seq"]) if row else 0
+        new_seq = seq + 1
+        self._conn.execute(
+            "UPDATE groups SET ticket_seq=? WHERE group_id=?", (new_seq, group_id)
+        )
+        return new_seq
+
+    def insert_ticket(self, row: dict[str, Any]) -> int:
+        cur = self._conn.execute(
+            """INSERT INTO tickets (
+                   ticket_no, group_id, store_name, reporter_id, subject, location,
+                   problem_description, sla_days, initial_deadline_at, current_deadline_at,
+                   status, version, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                row["ticket_no"], row["group_id"], row["store_name"], row["reporter_id"],
+                row["subject"], row["location"], row["problem_description"],
+                row["sla_days"], row["initial_deadline_at"], row["current_deadline_at"],
+                row.get("status", "ACTIVE"), 1, _now_str(),
+            ),
+        )
+        return cur.lastrowid
+
+    def update_ticket_cas(
+        self, ticket_id: int, expected_version: int, set_clause: str, params: tuple[Any, ...]
+    ) -> bool:
+        """乐观版本条件更新；set_clause 形如 'status=?, closed_at=?'，params 含该子句参数。
+        返回 False 表示版本冲突。"""
+        cur = self._conn.execute(
+            f"UPDATE tickets SET {set_clause}, version=version+1"
+            " WHERE id=? AND version=?",
+            (*params, ticket_id, expected_version),
+        )
+        return cur.rowcount > 0
+
+    def add_ticket_message(
+        self, message_id: str, ticket_id: int, sender_id: str, sender_role: str,
+        content: str, message_type: str, sent_at: str,
+    ) -> None:
+        self._conn.execute(
+            """INSERT INTO messages (message_id, ticket_id, sender_id, sender_role,
+                   content, message_type, sent_at)
+               VALUES (?,?,?,?,?,?,?) ON CONFLICT(message_id) DO NOTHING""",
+            (message_id, ticket_id, sender_id, sender_role, content, message_type, sent_at),
+        )
+
+    def add_diagnosis_version(
+        self, ticket_id: int, message_id: str, items: list[str], engineer_id: str
+    ) -> None:
+        self._conn.execute(
+            "UPDATE diagnosis_versions SET is_current=0 WHERE ticket_id=? AND is_current=1",
+            (ticket_id,),
+        )
+        self._conn.execute(
+            """INSERT INTO diagnosis_versions
+                   (ticket_id, source_message_id, items_json, engineer_id, submitted_at, is_current)
+               VALUES (?,?,?,?,?,1)""",
+            (ticket_id, message_id, json.dumps(items, ensure_ascii=False), engineer_id, _now_str()),
+        )
+
+    def add_repair_method_version(
+        self, ticket_id: int, message_id: str, repair_method: str,
+        order_no: str | None, engineer_id: str,
+    ) -> None:
+        self._conn.execute(
+            "UPDATE repair_method_versions SET is_current=0 WHERE ticket_id=? AND is_current=1",
+            (ticket_id,),
+        )
+        self._conn.execute(
+            """INSERT INTO repair_method_versions
+                   (ticket_id, source_message_id, repair_method, order_no, engineer_id, submitted_at, is_current)
+               VALUES (?,?,?,?,?,?,1)""",
+            (ticket_id, message_id, repair_method, order_no, engineer_id, _now_str()),
+        )
+
+    def add_timeout_cycle_reason(
+        self, ticket_id: int, message_id: str, timeout_reason: str, engineer_id: str
+    ) -> None:
+        self._conn.execute(
+            """INSERT INTO timeout_cycles
+                   (ticket_id, cycle_no, status, old_deadline_at, reminded_at, reason,
+                    reason_engineer_id, reason_submitted_at)
+               SELECT ticket_id,
+                      COALESCE((SELECT MAX(cycle_no) FROM timeout_cycles WHERE ticket_id=?), 0) + 1,
+                      'EXTENDED', current_deadline_at, ?, ?, ?, ?
+               FROM tickets WHERE id=?""",
+            (ticket_id, _now_str(), timeout_reason, engineer_id, _now_str(), ticket_id),
+        )
+
+    # ─────────────────────── 通知 Outbox notification_deliveries ───────────────────────
+    def insert_notification(
+        self,
+        *,
+        dedupe_key: str,
+        ticket_id: int | None,
+        notification_type: str,
+        target_type: str,
+        target_id: str,
+        scheduled_at: str | None = None,
+    ) -> int:
+        """在业务事务内预写通知（PENDING）。"""
+        cur = self._conn.execute(
+            """INSERT OR IGNORE INTO notification_deliveries
+                   (dedupe_key, ticket_id, notification_type, target_type, target_id,
+                    scheduled_at, status)
+               VALUES (?,?,?,?,?,?, 'PENDING')""",
+            (dedupe_key, ticket_id, notification_type, target_type, target_id,
+             scheduled_at or _now_str()),
+        )
+        return cur.lastrowid if cur.rowcount > 0 else 0
+
+    def claim_pending_notifications(self, limit: int = 20) -> list[dict[str, Any]]:
+        rows = self.connect().execute(
+            "SELECT * FROM notification_deliveries WHERE status='PENDING'"
+            " ORDER BY scheduled_at LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_notification(
+        self, notification_id: int, status: str, *, error: str | None = None
+    ) -> None:
+        self._conn.execute(
+            "UPDATE notification_deliveries SET status=?, sent_at=?, last_error=?"
+            " WHERE id=?",
+            (status, _now_str() if status != "PENDING" else None, error, notification_id),
         )
