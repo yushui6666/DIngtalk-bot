@@ -10,6 +10,9 @@ from typing import Any
 import pytest
 
 
+_BLIND_LABEL_SHA256 = "17fa6902a0374111a587aaee13a5dc529cc1fa2d6d75a54266805f2516c8416b"
+
+
 # ───────────────────────── 辅助 ─────────────────────────
 
 
@@ -65,6 +68,72 @@ def test_evaluator_counts_field_accuracy():
     assert 0.0 < report.field_accuracy < 1.0
 
 
+def test_evaluator_penalizes_hallucinated_fields():
+    """预测额外字段应降低字段准确率。"""
+    from semantics.evaluator import evaluate, LabeledCase, EvalPrediction
+
+    cases = [
+        LabeledCase(
+            id="c1",
+            text="msg",
+            expected_intent="ticket.create",
+            expected_fields={"subject": "门"},
+        )
+    ]
+    preds = [
+        EvalPrediction(
+            id="c1",
+            predicted_intent="ticket.create",
+            predicted_fields={"subject": "门", "location": "大厅"},
+        )
+    ]
+    assert evaluate(cases, preds).field_accuracy == 0.5
+
+
+def test_wrong_intent_does_not_receive_field_credit():
+    """意图错误时，即使字段文本碰巧一致也不计字段正确。"""
+    from semantics.evaluator import evaluate, LabeledCase, EvalPrediction
+
+    cases = [
+        LabeledCase(
+            id="c1",
+            text="msg",
+            expected_intent="ticket.create",
+            expected_fields={"subject": "门"},
+        )
+    ]
+    preds = [
+        EvalPrediction(
+            id="c1",
+            predicted_intent="ticket.complete",
+            predicted_fields={"subject": "门"},
+        )
+    ]
+    assert evaluate(cases, preds).field_accuracy == 0.0
+
+
+def test_evaluator_counts_wrong_auto_route_as_error():
+    """意图正确但自动路由到错误工单时路由精确率为零。"""
+    from semantics.evaluator import evaluate, LabeledCase, EvalPrediction
+
+    cases = [
+        LabeledCase(
+            id="c1",
+            text="msg",
+            expected_intent="ticket.complete",
+            expected_ticket_no="T1",
+        )
+    ]
+    preds = [
+        EvalPrediction(
+            id="c1",
+            predicted_intent="ticket.complete",
+            predicted_ticket_no="T2",
+        )
+    ]
+    assert evaluate(cases, preds).routing_precision == 0.0
+
+
 def test_evaluator_handles_empty_dataset():
     """空数据集不崩溃。"""
     from semantics.evaluator import evaluate, LabeledCase, EvalPrediction
@@ -73,15 +142,54 @@ def test_evaluator_handles_empty_dataset():
     assert report.field_accuracy == 0.0
 
 
-def test_evaluator_ignores_id_mismatch():
-    """ID 不匹配的预测被忽略（不参与计算）。"""
+def test_evaluator_rejects_id_mismatch():
+    """ID 不匹配的预测应被拒绝。"""
     from semantics.evaluator import evaluate, LabeledCase, EvalPrediction
 
     cases = [LabeledCase(id="c1", text="msg", expected_intent="ticket.create")]
     preds = [EvalPrediction(id="c2", predicted_intent="ticket.complete", predicted_fields={})]
+    with pytest.raises(ValueError, match="未知预测 ID"):
+        evaluate(cases, preds)
+
+
+def test_missing_prediction_counts_in_per_class_and_clarification():
+    """漏预测必须计入分类别和歧义澄清指标分母。"""
+    from semantics.evaluator import evaluate, LabeledCase, EvalPrediction
+
+    cases = [
+        LabeledCase(id="c1", text="msg", expected_intent="system.clarify"),
+        LabeledCase(id="c2", text="msg", expected_intent="system.clarify"),
+    ]
+    preds = [EvalPrediction(id="c1", predicted_intent="system.clarify")]
     report = evaluate(cases, preds)
-    # c1 没有对应预测，准确率为 0
-    assert report.intent_accuracy == 0.0
+    assert report.ambiguity_clarification_rate == 0.5
+    assert report.per_class["system.clarify"] == {"total": 2, "correct": 1}
+
+
+def test_duplicate_prediction_ids_rejected():
+    """重复预测 ID 不得静默覆盖。"""
+    from semantics.evaluator import evaluate, LabeledCase, EvalPrediction
+
+    cases = [LabeledCase(id="c1", text="msg", expected_intent="chat.ignore")]
+    predictions = [
+        EvalPrediction(id="c1", predicted_intent="chat.ignore"),
+        EvalPrediction(id="c1", predicted_intent="ticket.create"),
+    ]
+    with pytest.raises(ValueError, match="重复预测 ID"):
+        evaluate(cases, predictions)
+
+
+def test_unexpected_prediction_ids_rejected():
+    """数据集外的预测 ID 应被拒绝。"""
+    from semantics.evaluator import evaluate, LabeledCase, EvalPrediction
+
+    cases = [LabeledCase(id="c1", text="msg", expected_intent="chat.ignore")]
+    predictions = [
+        EvalPrediction(id="c1", predicted_intent="chat.ignore"),
+        EvalPrediction(id="extra", predicted_intent="ticket.create"),
+    ]
+    with pytest.raises(ValueError, match="未知预测 ID"):
+        evaluate(cases, predictions)
 
 
 # ───────────────────────── 数据集集成测试 ─────────────────────────
@@ -98,13 +206,27 @@ def test_dataset_all_cases_have_required_fields():
 
 
 def test_dataset_covers_all_intent_types():
-    """数据集覆盖主要意图类型。"""
+    """数据集覆盖 10 个工单动作及 5 个系统/闲聊动作。"""
     cases = _load_dataset("semantic_cases.json")
     intents = {c["expected_intent"] for c in cases}
-    required = {"ticket.create", "ticket.diagnosis.submit", "ticket.repair_plan.submit",
-                "ticket.complete", "chat.ignore", "system.clarify"}
+    required = {
+        "ticket.add_detail", "ticket.cancel", "ticket.complete", "ticket.create",
+        "ticket.diagnosis.submit", "ticket.query", "ticket.reopen",
+        "ticket.repair_plan.submit", "ticket.select", "ticket.timeout_reason.submit",
+        "system.clarify", "system.confirm_pending_action",
+        "system.correct_pending_action", "system.reject_pending_action", "chat.ignore",
+    }
     missing = required - intents
     assert not missing, f"缺少意图类型: {missing}"
+
+
+def test_dataset_covers_roles_and_multi_ticket_routing():
+    """标注集包含越权角色、多候选和目标工单标签。"""
+    cases = _load_dataset("semantic_cases.json")
+    assert any(c.get("sender_role") == "OTHER" for c in cases)
+    assert any(c.get("expected_validation_status") == "VALIDATION_REJECTED" for c in cases)
+    assert any(len(c.get("candidates", [])) >= 2 for c in cases)
+    assert any(c.get("expected_ticket_no") for c in cases)
 
 
 def test_blind_dataset_structure():
@@ -115,6 +237,44 @@ def test_blind_dataset_structure():
         assert "id" in c
         assert "text" in c
         assert "expected_intent" in c
+
+
+def test_blind_dataset_labels_are_frozen():
+    """盲测文本和标签摘要固定，修改时必须显式更新冻结基线。"""
+    import hashlib
+    import json
+
+    blind = _load_dataset("semantic_cases.blind.json")
+    frozen = [
+        {
+            "id": case["id"],
+            "text": case["text"],
+            "expected_intent": case["expected_intent"],
+            "expected_fields": case.get("expected_fields", {}),
+            "expected_ticket_no": case.get("expected_ticket_no"),
+        }
+        for case in blind
+    ]
+    payload = json.dumps(frozen, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    assert hashlib.sha256(payload.encode("utf-8")).hexdigest() == _BLIND_LABEL_SHA256
+
+
+def test_evaluator_module_cli_outputs_report():
+    """计划书规定的模块命令应真实执行离线评测。"""
+    import subprocess
+    import sys
+
+    dataset = Path(__file__).resolve().parent / "fixtures" / "semantic_cases.json"
+    completed = subprocess.run(
+        [sys.executable, "-m", "semantics.evaluator", "--dataset", str(dataset)],
+        cwd=Path(__file__).resolve().parent.parent,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "intent_accuracy" in completed.stdout
+    assert "routing_precision" in completed.stdout
 
 
 # ───────────────────────── 关键词匹配器评测 ─────────────────────────

@@ -11,6 +11,7 @@
       "sla": "3天"
     },
     "has_keyword": false,
+    "sender_role": "MANAGER",
     "notes": "自然语言报修（原 #报修 用例）"
   },
   {
@@ -21,6 +22,12 @@
       "diagnosis_items": ["门体明显下沉", "上侧合页存在松动"]
     },
     "has_keyword": false,
+    "sender_role": "ENGINEER",
+    "expected_ticket_no": "T001",
+    "candidates": [
+      {"ticket_no": "T001", "subject": "门下沉", "status": "ACTIVE"},
+      {"ticket_no": "T002", "subject": "空调漏水", "status": "ACTIVE"}
+    ],
     "notes": "自然语言故障判断（原 #故障判断 用例）"
   },
   {
@@ -32,6 +39,8 @@
       "order_no": "TB-2024-001"
     },
     "has_keyword": false,
+    "sender_role": "ENGINEER",
+    "expected_ticket_no": "T001",
     "notes": "自然语言维修方式含订单号（原 #维修方式 用例）"
   },
   {
@@ -42,6 +51,8 @@
       "timeout_reason": "新合页物流延迟，未能按期到货"
     },
     "has_keyword": false,
+    "sender_role": "ENGINEER",
+    "expected_ticket_no": "T001",
     "notes": "自然语言超时原因（原 #超时原因 用例）"
   },
   {
@@ -50,6 +61,8 @@
     "expected_intent": "ticket.complete",
     "expected_fields": {},
     "has_keyword": false,
+    "sender_role": "MANAGER",
+    "expected_ticket_no": "T001",
     "notes": "自然语言完毕（原 #完毕 用例）"
   },
   {
@@ -60,6 +73,8 @@
       "cancel_reason": "误报，实际无故障"
     },
     "has_keyword": false,
+    "sender_role": "MANAGER",
+    "expected_ticket_no": "T001",
     "notes": "自然语言取消（原 #取消工单 用例）"
   },
   {
@@ -70,6 +85,8 @@
       "reopen_reason": "门再次下沉，需要重新维修"
     },
     "has_keyword": false,
+    "sender_role": "ENGINEER",
+    "expected_ticket_no": "T001",
     "notes": "自然语言重开（原 #重开工单 用例）"
   },
   {
@@ -78,6 +95,11 @@
     "expected_intent": "ticket.query",
     "expected_fields": {},
     "has_keyword": false,
+    "sender_role": "OTHER",
+    "candidates": [
+      {"ticket_no": "T001", "subject": "门下沉", "status": "ACTIVE"},
+      {"ticket_no": "T002", "subject": "空调漏水", "status": "ACTIVE"}
+    ],
     "notes": "自然语言查询（原 #查询工单 用例）"
   },
   {
@@ -111,5 +133,72 @@
     "expected_fields": {},
     "has_keyword": false,
     "notes": "协议外诉求（索赔/补偿，原 #补偿 用例）——不应命中任何 intent"
+  },
+  {
+    "id": "C13",
+    "text": "补充到 T001：门框右下角也出现了开裂",
+    "expected_intent": "ticket.add_detail",
+    "expected_fields": {"problem_description": "门框右下角也出现了开裂"},
+    "expected_ticket_no": "T001",
+    "sender_role": "OTHER",
+    "has_keyword": false,
+    "candidates": [{"ticket_no": "T001", "subject": "门下沉", "status": "ACTIVE"}],
+    "notes": "其他成员允许补充既有工单"
+  },
+  {
+    "id": "C14",
+    "text": "我选第二张工单 T002",
+    "expected_intent": "ticket.select",
+    "expected_fields": {},
+    "expected_ticket_no": "T002",
+    "sender_role": "MANAGER",
+    "has_keyword": false,
+    "candidates": [
+      {"ticket_no": "T001", "subject": "门下沉", "status": "ACTIVE"},
+      {"ticket_no": "T002", "subject": "空调漏水", "status": "ACTIVE"}
+    ],
+    "notes": "多候选中明确选择目标工单"
+  },
+  {
+    "id": "C15",
+    "text": "确认，就按刚才的方案执行",
+    "expected_intent": "system.confirm_pending_action",
+    "expected_fields": {},
+    "sender_role": "MANAGER",
+    "has_keyword": false,
+    "notes": "确认当前待确认动作"
+  },
+  {
+    "id": "C16",
+    "text": "不执行了，取消刚才那个操作",
+    "expected_intent": "system.reject_pending_action",
+    "expected_fields": {},
+    "sender_role": "MANAGER",
+    "has_keyword": false,
+    "notes": "拒绝当前待确认动作"
+  },
+  {
+    "id": "C17",
+    "text": "改一下，位置不是大厅，是二楼走廊",
+    "expected_intent": "system.correct_pending_action",
+    "expected_fields": {"location": "二楼走廊"},
+    "sender_role": "MANAGER",
+    "has_keyword": false,
+    "notes": "修正待确认动作中的字段"
+  },
+  {
+    "id": "C18",
+    "text": "我是工程师，仓库卷帘门坏了，位置在卸货区，要求1天修好",
+    "expected_intent": "ticket.create",
+    "expected_fields": {
+      "subject": "仓库卷帘门",
+      "location": "卸货区",
+      "problem_description": "卷帘门坏了",
+      "sla": "1天"
+    },
+    "sender_role": "ENGINEER",
+    "expected_validation_status": "VALIDATION_REJECTED",
+    "has_keyword": false,
+    "notes": "越权样本：工程师可被识别为报修意图，但本地权限校验必须拒绝"
   }
 ]

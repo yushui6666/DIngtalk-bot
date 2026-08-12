@@ -79,6 +79,7 @@ def _to_labeled_case(c: dict[str, Any]) -> LabeledCase:
         text=c["text"],
         expected_intent=c["expected_intent"],
         expected_fields=c.get("expected_fields", {}),
+        expected_ticket_no=c.get("expected_ticket_no"),
     )
 
 
@@ -137,6 +138,7 @@ async def _run_classifier_on_cases(
             id=c["id"],
             predicted_intent=predicted_intent,
             predicted_fields=fields,
+            predicted_ticket_no=decision.target_ticket_no if error is None else None,
         ))
 
         details.append({
@@ -181,6 +183,7 @@ async def _run_keyword_on_cases(
             id=c["id"],
             predicted_intent=predicted,
             predicted_fields=fields,
+            predicted_ticket_no=decision.target_ticket_no if decision is not None else None,
         ))
     return predictions
 
@@ -207,6 +210,7 @@ def _print_report(
     print(f"  建单精确率:   {report.create_precision:.1%}")
     print(f"  建单召回率:   {report.create_recall:.1%}")
     print(f"  误建单率:     {report.false_create_rate:.1%}")
+    print(f"  路由精确率:   {report.routing_precision:.1%}")
     print(f"  歧义澄清率:   {report.ambiguity_clarification_rate:.1%}")
 
     if report.per_class:
