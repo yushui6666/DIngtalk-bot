@@ -105,6 +105,27 @@ def test_engineer_cannot_report():
     assert len(errors) > 0
 
 
+def test_other_member_can_report():
+    """其他成员（店铺同事）可以直接报修（业务决策 2026-08-12）。"""
+    from semantics.validator import validate_decision
+    from semantics.types import DecisionStatus, SemanticDecision
+
+    protocol = _load_test_protocol()
+    decision = SemanticDecision(
+        protocol_version="4.0",
+        source="keyword",
+        intent="ticket.create",
+        target_ticket_no=None,
+        intent_confidence=1.0,
+        fields={"subject": "门", "location": "大厅", "problem_description": "坏了", "sla": "3天"},
+    )
+    msg = _make_message(sender_role="OTHER")
+    status, cmd, errors = validate_decision(decision, message=msg, candidates=[], protocol=protocol)
+    assert status == DecisionStatus.AUTO_EXECUTE
+    assert cmd is not None
+    assert errors == ()
+
+
 def test_other_member_cannot_diagnose():
     """其他成员不能 #故障判断。"""
     from semantics.validator import validate_decision

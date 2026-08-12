@@ -2,7 +2,7 @@
   "protocol_version": "4.0.0",
   "compiled_at": "2026-08-12T10:19:26+08:00",
   "compiled_by": "protocol_compiler",
-  "source_sha256": "59685ff960fa18c4f8c45734bb7f1196c36a9476f7c09a6c2d79d30f7e06bae0",
+  "source_sha256": "f569fc0b3908f0762ca9d8c68702d77dbb77e17513ea649aa103329323c9cdb0",
   "actions": [
     {
       "intent_id": "ticket.add_detail",
@@ -187,7 +187,8 @@
       ],
       "semantic_enabled": true,
       "allowed_roles": [
-        "MANAGER"
+        "MANAGER",
+        "OTHER"
       ],
       "allowed_ticket_states": [],
       "required_fields": [
