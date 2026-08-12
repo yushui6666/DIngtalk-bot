@@ -134,6 +134,10 @@ class MessageProcessingPipeline:
         if decision.intent == "ticket.select":
             return self._handle_select(item, msg, decision, candidates)
 
+        # 查询工单：列活动工单（不走执行器）
+        if decision.intent == "ticket.query":
+            return self._handle_query(item, msg, decision, candidates)
+
         # 路由
         route = self._router.route(
             message=msg,
@@ -438,6 +442,41 @@ class MessageProcessingPipeline:
         )
         self._notifier.send_group_now(
             msg.group_id, f"已切换到工单 {target.ticket_no}。", message_id=msg.message_id
+        )
+        return self._complete(item, msg, "EXECUTED")
+
+    def _handle_query(
+        self, item: dict[str, Any], msg: NormalizedMessage, decision: SemanticDecision, candidates: list[Any]
+    ) -> str:
+        """查询工单：无编号时列出当前活动工单。"""
+        if decision.target_ticket_no:
+            target = next((c for c in candidates if c.ticket_no == decision.target_ticket_no), None)
+            if target is None:
+                self._notifier.send_group_now(
+                    msg.group_id, "没有找到该工单，请检查编号。", message_id=msg.message_id
+                )
+                return self._complete(item, msg, "REJECTED")
+            ticket = self._db.get_ticket(target.ticket_id)
+            text = (
+                f"📋 {ticket['ticket_no']}  {ticket['status']}\n"
+                f"主题：{ticket['subject']}\n位置：{ticket['location']}\n"
+                f"问题：{ticket['problem_description'][:80]}\n"
+                f"预计完成：{ticket['current_deadline_at']}"
+            )
+            self._notifier.send_group_now(msg.group_id, text, message_id=msg.message_id)
+            return self._complete(item, msg, "EXECUTED")
+
+        if not candidates:
+            self._notifier.send_group_now(
+                msg.group_id, "当前没有活动工单。", message_id=msg.message_id
+            )
+            return self._complete(item, msg, "EXECUTED")
+
+        lines = "\n".join(
+            f"- {c.ticket_no}：{c.subject} @ {c.location}（{c.status}）" for c in candidates
+        )
+        self._notifier.send_group_now(
+            msg.group_id, f"当前活动工单：\n{lines}", message_id=msg.message_id
         )
         return self._complete(item, msg, "EXECUTED")
 
