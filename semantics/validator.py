@@ -15,13 +15,9 @@ from typing import Any
 from semantics.protocol_loader import TicketProtocol
 from semantics.types import (
     DecisionStatus,
-    PendingActionStatus,
-    RouteDecision,
     SemanticDecision,
     TicketCandidate,
-    TicketScore,
     ValidatedCommand,
-    RouteResult,
 )
 
 from models import NormalizedMessage
@@ -52,10 +48,18 @@ def _validate_role(action: Any, message: NormalizedMessage) -> bool:
     return message.sender_role in action.allowed_roles
 
 
-def _validate_required_fields(action: Any, fields: dict[str, Any]) -> list[str]:
+def _validate_required_fields(
+    action: Any,
+    fields: dict[str, Any],
+    target_ticket_no: str | None,
+) -> list[str]:
     """校验必填字段是否存在且非空。"""
     missing: list[str] = []
     for fname in action.required_fields:
+        if fname == "ticket_no":
+            if not target_ticket_no:
+                missing.append(fname)
+            continue
         val = fields.get(fname)
         if val is None or (isinstance(val, str) and not val.strip()):
             missing.append(fname)
@@ -119,6 +123,7 @@ def _build_validated_command(
     message: NormalizedMessage,
     target_ticket_id: int | None,
     expected_ticket_version: int | None,
+    fields: dict[str, Any],
 ) -> ValidatedCommand:
     return ValidatedCommand(
         message_id=message.message_id,
@@ -128,9 +133,59 @@ def _build_validated_command(
         intent=decision.intent,
         target_ticket_id=target_ticket_id,
         expected_ticket_version=expected_ticket_version,
-        fields=decision.fields,
+        fields=fields,
         source=decision.source,
     )
+
+
+def _resolve_target_candidate(
+    decision: SemanticDecision,
+    action: Any,
+    message: NormalizedMessage,
+    candidates: list[TicketCandidate],
+) -> tuple[TicketCandidate | None, list[str]]:
+    """按协议目标策略解析当前群内候选工单。"""
+    errors: list[str] = []
+    group_candidates = [candidate for candidate in candidates if candidate.group_id == message.group_id]
+    target: TicketCandidate | None = None
+
+    if decision.target_ticket_no:
+        target = next(
+            (
+                candidate
+                for candidate in group_candidates
+                if candidate.ticket_no == decision.target_ticket_no
+            ),
+            None,
+        )
+        if target is None:
+            errors.append(f"目标工单 '{decision.target_ticket_no}' 不存在或不属于当前群")
+    elif action.target_ticket_policy == "MUST_EXIST":
+        if len(group_candidates) == 1:
+            target = group_candidates[0]
+        elif not group_candidates:
+            errors.append("该动作需要目标工单，但当前没有可用候选")
+        else:
+            errors.append("该动作需要唯一目标工单，请明确提供工单编号")
+
+    if action.target_ticket_policy == "MUST_NOT_EXIST" and decision.target_ticket_no:
+        errors.append("该动作不得绑定既有目标工单")
+
+    if target and action.allowed_ticket_states and target.status not in action.allowed_ticket_states:
+        errors.append(
+            f"目标工单状态 '{target.status}' 不允许执行 '{decision.intent}'，"
+            f"允许状态: {action.allowed_ticket_states}"
+        )
+
+    return target, errors
+
+
+def _requires_confirmation(decision: SemanticDecision, action: Any) -> bool:
+    """根据决策来源和协议确认策略判断是否进入确认流程。"""
+    if decision.requires_confirmation:
+        return True
+    source_key = "EXPLICIT_KEYWORD" if decision.source == "keyword" else "SEMANTIC_MODEL"
+    return action.confirmation_policy.get(source_key) == "ALWAYS"
 
 
 def validate_decision(
@@ -145,8 +200,7 @@ def validate_decision(
     校验顺序：intent 查找 → ignore 快路径 → 角色权限 → 必填字段 →
     枚举值 → 订单号规则。
 
-    当前 Phase 2 不涉及 target_ticket_id 解析（Task 7 路由负责），
-    target_ticket_id/expected_ticket_version 设为 None。
+    candidates 是路由层冻结的当前群候选快照，用于目标、状态和版本校验。
     """
     action = protocol.get_action(decision.intent)
     if action is None:
@@ -168,8 +222,10 @@ def validate_decision(
     if decision.intent == "system.clarify":
         return (DecisionStatus.WAITING_CONFIRMATION, None, decision.missing_fields)
 
+    fields = dict(decision.fields)
+
     # 字段分发：通用 "原因" → 按 intent 映射到具体字段
-    _dispatch_reason_field(decision.fields, decision.intent)
+    _dispatch_reason_field(fields, decision.intent)
 
     errors: list[str] = []
 
@@ -181,36 +237,49 @@ def validate_decision(
         )
 
     # 2. 必填字段
-    missing = _validate_required_fields(action, decision.fields)
+    missing = _validate_required_fields(action, fields, decision.target_ticket_no)
     for mf in missing:
         errors.append(f"缺少必填字段 '{mf}'")
 
     # 3. 枚举值校验
-    for fname, fvalue in decision.fields.items():
+    for fname, fvalue in fields.items():
         err = _validate_enum(fname, fvalue, action)
         if err:
             errors.append(err)
 
     # SLA 特殊枚举校验（字段名可能在不同 action 中）
-    if "sla" in decision.fields and decision.fields["sla"] not in _ALLOWED_SLA:
+    if "sla" in fields and fields["sla"] not in _ALLOWED_SLA:
         if "sla" not in [f for f in errors if "sla" in f]:
-            errors.append(f"时效 '{decision.fields['sla']}' 不在允许范围 ['1天', '3天', '7天']")
+            errors.append(f"时效 '{fields['sla']}' 不在允许范围 ['1天', '3天', '7天']")
 
     # 维修方式枚举校验
-    if "repair_method" in decision.fields:
-        if decision.fields["repair_method"] not in _ALLOWED_REPAIR_METHODS:
+    if "repair_method" in fields:
+        if fields["repair_method"] not in _ALLOWED_REPAIR_METHODS:
             if "repair_method" not in [f for f in errors if "repair_method" in f]:
-                errors.append(f"维修方式 '{decision.fields['repair_method']}' 不在允许的 5 种方式中")
+                errors.append(f"维修方式 '{fields['repair_method']}' 不在允许的 5 种方式中")
 
     # 4. 订单号校验（淘宝采购特例）
-    if decision.fields.get("repair_method") == "淘宝采购后自行维修":
-        order_err = _validate_order_no(decision.fields)
+    if fields.get("repair_method") == "淘宝采购后自行维修":
+        order_err = _validate_order_no(fields)
         if order_err:
             errors.append(order_err)
+
+    # 5. 目标工单、群归属和状态校验
+    target, target_errors = _resolve_target_candidate(decision, action, message, candidates)
+    errors.extend(target_errors)
 
     if errors:
         return (DecisionStatus.VALIDATION_REJECTED, None, tuple(errors))
 
+    if _requires_confirmation(decision, action):
+        return (DecisionStatus.WAITING_CONFIRMATION, None, ())
+
     # 全部通过
-    cmd = _build_validated_command(decision, message, None, None)
+    cmd = _build_validated_command(
+        decision,
+        message,
+        target.ticket_id if target else None,
+        target.version if target else None,
+        fields,
+    )
     return (DecisionStatus.AUTO_EXECUTE, cmd, ())

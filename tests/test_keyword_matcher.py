@@ -139,6 +139,30 @@ def test_parse_cancel():
     assert result.fields.get("cancel_reason") == "误报，实际无故障"
 
 
+def test_parse_protocol_cancel_example():
+    """协议正式示例中的字段别名和位置式编号均应正确解析。"""
+    from semantics.keyword_matcher import match_keyword
+
+    protocol = _load_test_protocol()
+    result = match_keyword("#取消工单 工单编号：W001 取消原因：误报", protocol)
+    assert result is not None
+    assert result.target_ticket_no == "W001"
+    assert result.fields == {"cancel_reason": "误报"}
+    assert result.missing_fields == ()
+
+
+def test_parse_positional_ticket_no_before_fields():
+    """位置式工单号不得污染紧随其后的字段名。"""
+    from semantics.keyword_matcher import match_keyword
+
+    protocol = _load_test_protocol()
+    result = match_keyword("#取消工单 T001 原因：误报", protocol)
+    assert result is not None
+    assert result.target_ticket_no == "T001"
+    assert result.fields == {"cancel_reason": "误报"}
+    assert result.missing_fields == ()
+
+
 def test_parse_reopen():
     """#重开工单 字段解析。"""
     from semantics.keyword_matcher import match_keyword
@@ -149,6 +173,18 @@ def test_parse_reopen():
     assert result is not None
     assert result.intent == "ticket.reopen"
     assert result.fields.get("reopen_reason") == "门再次下沉，需要重新维修"
+
+
+def test_parse_protocol_reopen_example():
+    """协议正式重开示例中的字段别名应正确解析。"""
+    from semantics.keyword_matcher import match_keyword
+
+    protocol = _load_test_protocol()
+    result = match_keyword("#重开工单 工单编号：W001 重开原因：复发", protocol)
+    assert result is not None
+    assert result.target_ticket_no == "W001"
+    assert result.fields == {"reopen_reason": "复发"}
+    assert result.missing_fields == ()
 
 
 # ───────────────────────── 结肠/冒号归一 ─────────────────────────

@@ -17,6 +17,7 @@ from semantics.types import SemanticDecision, TicketScore
 _COLON_PATTERN = re.compile(r"[：:]")
 # 字段名：中文别名 → 英文键
 _FIELD_ALIAS_MAP: dict[str, str] = {
+    "工单编号": "ticket_no",
     "主题": "subject",
     "位置": "location",
     "问题描述": "problem_description",
@@ -25,6 +26,8 @@ _FIELD_ALIAS_MAP: dict[str, str] = {
     "维修方式": "repair_method",
     "订单号": "order_no",
     "未完成原因": "timeout_reason",
+    "取消原因": "cancel_reason",
+    "重开原因": "reopen_reason",
     "原因": "reason",  # 通用 "原因"，需按 intent 再分发
     "完成说明": "completion_note",
 }
@@ -110,6 +113,16 @@ def _split_after_keyword(content: str, keyword: str) -> str:
     return content[len(keyword):].strip()
 
 
+def _extract_positional_ticket_no(text: str) -> tuple[str | None, str]:
+    """提取关键词后位于首个 token 的工单编号，并返回剩余字段正文。"""
+    parts = text.split(maxsplit=1)
+    first_token = parts[0] if parts else ""
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", first_token):
+        return None, text
+    remainder = parts[1] if len(parts) == 2 else ""
+    return first_token, remainder
+
+
 def match_keyword(content: str, protocol: TicketProtocol) -> SemanticDecision | None:
     """在消息文本中匹配显式关键词，返回 SemanticDecision 或 None。
 
@@ -167,24 +180,15 @@ def match_keyword(content: str, protocol: TicketProtocol) -> SemanticDecision | 
     keyword_text, action = hits[0]
     after = _split_after_keyword(stripped, keyword_text)
 
-    # 解析字段
-    fields = _parse_fields(after)
+    # 先提取位置式工单编号，避免其污染紧随其后的字段名。
+    ticket_no, field_text = _extract_positional_ticket_no(after)
 
-    # 提取工单编号（如果有）
-    ticket_no: str | None = None
+    # 解析字段
+    fields = _parse_fields(field_text)
+
+    # 提取字段式工单编号（如果有）
     if "ticket_no" in fields:
         ticket_no = fields.pop("ticket_no")
-    elif after:
-        # 关键词后第一个 token 可能是工单编号
-        first_token = after.split()[0] if after.split() else ""
-        if first_token and not _COLON_PATTERN.search(first_token):
-            # 检查是不是看起来像工单编号（不以中文/冒号开头）
-            if re.match(r'^[A-Za-z0-9_-]+$', first_token) and first_token not in ("主题", "位置", "问题描述", "时效"):
-                ticket_no = first_token
-                # 从 fields 中移除可能被误解析的值
-                for k in list(fields.keys()):
-                    if fields[k] == ticket_no:
-                        del fields[k]
 
     # 重复字段冲突
     if fields.pop("_duplicate_conflict", False):
@@ -206,7 +210,12 @@ def match_keyword(content: str, protocol: TicketProtocol) -> SemanticDecision | 
             fields["reopen_reason"] = reason
 
     # 计算 missing_fields
-    missing = tuple(f for f in action.required_fields if f not in fields)
+    missing = tuple(
+        field_name
+        for field_name in action.required_fields
+        if field_name != "ticket_no" and field_name not in fields
+        or field_name == "ticket_no" and not ticket_no
+    )
 
     return SemanticDecision(
         protocol_version=protocol.protocol_version,

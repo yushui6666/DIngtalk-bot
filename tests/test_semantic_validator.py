@@ -41,6 +41,26 @@ def _make_message(
     )
 
 
+def _make_candidate(
+    ticket_id: int = 1,
+    ticket_no: str = "T001",
+    group_id: str = "g-001",
+    status: str = "ACTIVE",
+    version: int = 3,
+) -> Any:
+    from semantics.types import TicketCandidate
+    return TicketCandidate(
+        ticket_id=ticket_id,
+        ticket_no=ticket_no,
+        group_id=group_id,
+        subject="门下沉",
+        location="大厅",
+        problem_summary="门体损坏",
+        status=status,
+        version=version,
+    )
+
+
 # ───────────────────────── 角色权限 ─────────────────────────
 
 
@@ -252,3 +272,130 @@ def test_duplicate_field_in_same_decision_rejected():
     status, cmd, errors = validate_decision(decision, message=msg, candidates=[], protocol=protocol)
     assert status == DecisionStatus.VALIDATION_REJECTED
     assert len(errors) > 0
+
+
+# ───────────────────────── 目标与状态 ─────────────────────────
+
+
+def test_explicit_ticket_no_resolves_candidate_and_version():
+    """显式工单号应解析为候选 ID 和乐观锁版本。"""
+    from semantics.validator import validate_decision
+    from semantics.types import DecisionStatus, SemanticDecision
+
+    protocol = _load_test_protocol()
+    decision = SemanticDecision(
+        protocol_version="4.0",
+        source="keyword",
+        intent="ticket.complete",
+        target_ticket_no="T001",
+        intent_confidence=1.0,
+        fields={},
+    )
+    status, cmd, errors = validate_decision(
+        decision,
+        message=_make_message(),
+        candidates=[_make_candidate()],
+        protocol=protocol,
+    )
+    assert status == DecisionStatus.AUTO_EXECUTE
+    assert errors == ()
+    assert cmd is not None
+    assert cmd.target_ticket_id == 1
+    assert cmd.expected_ticket_version == 3
+
+
+def test_update_action_without_target_is_rejected():
+    """要求既有工单的动作不能在无候选时自动执行。"""
+    from semantics.validator import validate_decision
+    from semantics.types import DecisionStatus, SemanticDecision
+
+    protocol = _load_test_protocol()
+    decision = SemanticDecision(
+        protocol_version="4.0",
+        source="keyword",
+        intent="ticket.complete",
+        target_ticket_no=None,
+        intent_confidence=1.0,
+        fields={},
+    )
+    status, cmd, errors = validate_decision(
+        decision, message=_make_message(), candidates=[], protocol=protocol
+    )
+    assert status == DecisionStatus.VALIDATION_REJECTED
+    assert cmd is None
+    assert any("目标工单" in error for error in errors)
+
+
+def test_disallowed_ticket_state_is_rejected():
+    """候选状态不在协议允许范围时拒绝执行。"""
+    from semantics.validator import validate_decision
+    from semantics.types import DecisionStatus, SemanticDecision
+
+    protocol = _load_test_protocol()
+    decision = SemanticDecision(
+        protocol_version="4.0",
+        source="keyword",
+        intent="ticket.complete",
+        target_ticket_no="T001",
+        intent_confidence=1.0,
+        fields={},
+    )
+    status, cmd, errors = validate_decision(
+        decision,
+        message=_make_message(),
+        candidates=[_make_candidate(status="COMPLETED")],
+        protocol=protocol,
+    )
+    assert status == DecisionStatus.VALIDATION_REJECTED
+    assert cmd is None
+    assert any("状态" in error for error in errors)
+
+
+def test_model_high_risk_action_waits_for_confirmation():
+    """自然语言识别出的高风险动作必须进入确认流程。"""
+    from semantics.validator import validate_decision
+    from semantics.types import DecisionStatus, SemanticDecision
+
+    protocol = _load_test_protocol()
+    decision = SemanticDecision(
+        protocol_version="4.0",
+        source="model",
+        intent="ticket.cancel",
+        target_ticket_no="T001",
+        intent_confidence=0.99,
+        fields={"cancel_reason": "误报"},
+    )
+    status, cmd, errors = validate_decision(
+        decision,
+        message=_make_message(),
+        candidates=[_make_candidate()],
+        protocol=protocol,
+    )
+    assert status == DecisionStatus.WAITING_CONFIRMATION
+    assert cmd is None
+    assert errors == ()
+
+
+def test_keyword_cancel_accepts_target_ticket_no_contract():
+    """target_ticket_no 应满足协议中的 ticket_no 必填契约。"""
+    from semantics.validator import validate_decision
+    from semantics.types import DecisionStatus, SemanticDecision
+
+    protocol = _load_test_protocol()
+    decision = SemanticDecision(
+        protocol_version="4.0",
+        source="keyword",
+        intent="ticket.cancel",
+        target_ticket_no="T001",
+        intent_confidence=1.0,
+        fields={"cancel_reason": "误报"},
+    )
+    status, cmd, errors = validate_decision(
+        decision,
+        message=_make_message(),
+        candidates=[_make_candidate()],
+        protocol=protocol,
+    )
+    assert status == DecisionStatus.AUTO_EXECUTE
+    assert errors == ()
+    assert cmd is not None
