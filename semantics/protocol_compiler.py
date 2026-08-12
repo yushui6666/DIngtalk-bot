@@ -387,8 +387,12 @@ def _infer_risk(intent_id: str) -> str:
 
 
 def _infer_confirmation_policy(intent_id: str) -> dict[str, str]:
-    if intent_id in ("ticket.complete", "ticket.cancel", "ticket.reopen"):
+    if intent_id in ("ticket.cancel", "ticket.reopen"):
         return {"EXPLICIT_KEYWORD": "NOT_REQUIRED", "SEMANTIC_MODEL": "ALWAYS"}
+    # 业务决策（2026-08-12）：完工在群里说「修好了」即直接完成，不再强制二次确认。
+    # 取消/重开仍要求确认，避免误操作。
+    elif intent_id == "ticket.complete":
+        return {"EXPLICIT_KEYWORD": "NOT_REQUIRED", "SEMANTIC_MODEL": "NOT_REQUIRED"}
     elif intent_id == "ticket.create":
         return {"EXPLICIT_KEYWORD": "NOT_REQUIRED", "SEMANTIC_MODEL": "BY_CONFIDENCE"}
     return {"EXPLICIT_KEYWORD": "NOT_REQUIRED", "SEMANTIC_MODEL": "BY_CONFIDENCE"}
@@ -544,7 +548,7 @@ def compile_business_protocol(source: Path, destination: Path) -> str:
             "clarify_threshold": 1.5,
         },
         "risk_policies": {
-            "ticket.complete": {"SEMANTIC_MODEL": "ALWAYS"},
+            "ticket.complete": {"SEMANTIC_MODEL": "NOT_REQUIRED"},
             "ticket.cancel": {"SEMANTIC_MODEL": "ALWAYS"},
             "ticket.reopen": {"SEMANTIC_MODEL": "ALWAYS"},
         },

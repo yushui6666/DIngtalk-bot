@@ -75,6 +75,7 @@ class MessageProcessingPipeline:
         llm_enabled: bool = LLM_ENABLED,
         max_attempts: int = LLM_MAX_ATTEMPTS,
         retry_delays: tuple[float, ...] = tuple(LLM_RETRY_DELAYS_SECONDS),
+        delivery: Any | None = None,
     ) -> None:
         self._db = db
         self._repo = repo
@@ -89,6 +90,7 @@ class MessageProcessingPipeline:
         self._llm_enabled = llm_enabled and classifier is not None
         self._max_attempts = max_attempts
         self._retry_delays = retry_delays
+        self._delivery = delivery
 
     async def process(self, item: dict[str, Any]) -> str:
         """处理一条收件箱消息，返回最终收件箱状态。"""
@@ -102,6 +104,12 @@ class MessageProcessingPipeline:
 
     # ─────────────────────── 主流程 ───────────────────────
     async def _handle(self, msg: NormalizedMessage, item: dict[str, Any]) -> str:
+        # 0. 快递签收确认回复（本地快路径，不调模型）
+        if self._delivery is not None:
+            delivery_reply = self._handle_delivery_reply(item, msg)
+            if delivery_reply is not None:
+                return delivery_reply
+
         pending = self._pending.get_waiting(msg.group_id, msg.sender_id)
 
         decision = await self._decide(msg)
@@ -177,6 +185,12 @@ class MessageProcessingPipeline:
         result = self._executor.execute(cmd, message=msg)
         self._complete(item, msg, "EXECUTED" if result.status == RESULT_OK else result.status)
         if result.status == RESULT_OK:
+            # 维修方式带订单号 → 触发快递签收确认（询问发起人）
+            self._maybe_trigger_delivery(cmd, result, msg)
+            # 工单完成/取消 → 作废该单待确认的快递记录
+            if self._delivery is not None and cmd.intent in ("ticket.complete", "ticket.cancel"):
+                if result.ticket_id is not None:
+                    self._delivery.expire_by_ticket(result.ticket_id)
             self._notifier.flush()
         else:
             self._notifier.send_group_now(
@@ -184,6 +198,48 @@ class MessageProcessingPipeline:
                 message_id=msg.message_id,
             )
         return _INBOX_COMPLETED
+
+    # ─────────────────────── 快递签收确认 ───────────────────────
+    def _handle_delivery_reply(
+        self, item: dict[str, Any], msg: NormalizedMessage
+    ) -> str | None:
+        """发起人在待确认快递期间回复「已签收/未收到」→ 本地匹配并记录。"""
+        from routing.delivery import match_reply, STATUS_SIGNED, STATUS_UNSIGNED
+
+        waiting = self._delivery.get_waiting(msg.group_id, msg.sender_id)
+        if waiting is None:
+            return None
+        result = match_reply(msg.content)
+        if result is None:
+            return None
+        if not self._delivery.resolve(waiting["id"], result, msg.message_id):
+            return self._complete(item, msg, "REJECTED")
+        reply = "已记录：快递已签收 ✅" if result == STATUS_SIGNED else "已记录：快递尚未签收"
+        self._notifier.send_group_now(msg.group_id, reply, message_id=msg.message_id)
+        return self._complete(item, msg, "EXECUTED")
+
+    def _maybe_trigger_delivery(self, cmd: Any, result: Any, msg: NormalizedMessage) -> None:
+        """工程师提交维修方式且带订单号 → 群内询问发起人快递是否签收。"""
+        if self._delivery is None:
+            return
+        if cmd.intent != "ticket.repair_plan.submit" or result.status != RESULT_OK:
+            return
+        order_no = cmd.fields.get("order_no")
+        if not order_no or result.ticket_id is None:
+            return
+        ticket = self._db.get_ticket(result.ticket_id)
+        if ticket is None:
+            return
+        confirmation_id = self._delivery.create(
+            result.ticket_id, order_no, msg.group_id, ticket["reporter_id"]
+        )
+        if confirmation_id:
+            self._notifier.send_group_now(
+                msg.group_id,
+                f"【快递签收确认】工单 {ticket['ticket_no']} 的淘宝订单 {order_no} "
+                f"已提交采购。请发起人回复「已签收」或「未收到」。",
+                message_id=msg.message_id,
+            )
 
     # ─────────────────────── 决策 ───────────────────────
     async def _decide(self, msg: NormalizedMessage) -> SemanticDecision:

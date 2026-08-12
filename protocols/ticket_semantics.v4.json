@@ -149,7 +149,7 @@
       "risk_level": "HIGH",
       "confirmation_policy": {
         "EXPLICIT_KEYWORD": "NOT_REQUIRED",
-        "SEMANTIC_MODEL": "ALWAYS"
+        "SEMANTIC_MODEL": "NOT_REQUIRED"
       },
       "positive_examples": [
         "维修已经完成了，今天测试一切正常",
@@ -899,7 +899,7 @@
   },
   "risk_policies": {
     "ticket.complete": {
-      "SEMANTIC_MODEL": "ALWAYS"
+      "SEMANTIC_MODEL": "NOT_REQUIRED"
     },
     "ticket.cancel": {
       "SEMANTIC_MODEL": "ALWAYS"

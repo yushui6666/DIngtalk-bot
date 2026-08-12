@@ -22,13 +22,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-from config import (
-    GROUPS,
-    LLM_ENABLED,
-    LLM_API_KEY,
-    LOG_DIR,
-    load_groups,
-)
 from logger import get_logger, setup_logging
 
 logger = get_logger(__name__)
@@ -37,7 +30,11 @@ _PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 def _load_env_file() -> None:
-    """简单加载项目 .env（不覆盖已有环境变量）。"""
+    """简单加载项目 .env（不覆盖已有环境变量）。
+
+    必须在 import config 之前调用，否则 config 里的 LLM_API_KEY 等
+    环境变量读取不到。
+    """
     env_path = _PROJECT_ROOT / ".env"
     if not env_path.exists():
         return
@@ -50,6 +47,18 @@ def _load_env_file() -> None:
         value = value.strip().strip('"').strip("'")
         if key:
             os.environ.setdefault(key, value)
+
+
+# 模块加载即加载 .env，保证 config 能读到 LLM_API_KEY 等环境变量
+_load_env_file()
+
+from config import (  # noqa: E402  — 需在 _load_env_file 之后导入
+    GROUPS,
+    LLM_API_KEY,
+    LLM_ENABLED,
+    LOG_DIR,
+    load_groups,
+)
 
 
 def _dws_sender(target_id: str, text: str) -> None:
@@ -67,6 +76,7 @@ def _build_pipeline(mode: str):
     from db import Database
     from notifier import Notifier
     from pipeline import MessageProcessingPipeline, RuntimeMode
+    from routing.delivery import DeliveryConfirmService
     from routing.pending_actions import PendingActionService
     from routing.ticket_contexts import TicketContextStore
     from routing.ticket_router import TicketRouter
@@ -84,6 +94,7 @@ def _build_pipeline(mode: str):
     router = TicketRouter()
     context = TicketContextStore(db)
     pending = PendingActionService(db)
+    delivery = DeliveryConfirmService(db)
     executor = TicketCommandExecutor(db, repo)
     notifier = Notifier(db, _dws_sender)
 
@@ -108,6 +119,7 @@ def _build_pipeline(mode: str):
         executor=executor,
         notifier=notifier,
         classifier=classifier,
+        delivery=delivery,
         mode=RuntimeMode(mode),
     )
     return db, pipeline, notifier
@@ -175,7 +187,6 @@ async def main(mode: str, duration: int | None, group_filter: str | None) -> Non
 
 
 if __name__ == "__main__":
-    _load_env_file()
     parser = argparse.ArgumentParser(description="钉钉报修工单系统")
     parser.add_argument("--mode", choices=["SHADOW", "ASSISTED", "PRODUCTION"],
                         default="PRODUCTION", help="运行模式")

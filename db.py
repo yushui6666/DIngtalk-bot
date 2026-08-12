@@ -290,6 +290,22 @@ CREATE TABLE IF NOT EXISTS action_executions (
     applied_at              TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_exec_src ON action_executions(source_message_id);
+
+-- ─────────────────────── delivery_confirmations（v4.0 快递签收确认） ───────────────────────
+CREATE TABLE IF NOT EXISTS delivery_confirmations (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_id          INTEGER NOT NULL,
+    order_no           TEXT NOT NULL,
+    group_id           TEXT NOT NULL,
+    confirm_user_id    TEXT NOT NULL,
+    status             TEXT NOT NULL DEFAULT 'WAITING',
+    created_at         TEXT NOT NULL,
+    resolved_at        TEXT,
+    resolve_message_id TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_one_waiting
+    ON delivery_confirmations(ticket_id, order_no) WHERE status = 'WAITING';
+CREATE INDEX IF NOT EXISTS idx_delivery_status ON delivery_confirmations(status);
 """
 
 
@@ -944,3 +960,46 @@ class Database:
             " WHERE id=?",
             (status, _now_str() if status != "PENDING" else None, error, notification_id),
         )
+
+    # ─────────────────────── 快递签收确认 delivery_confirmations ───────────────────────
+    def create_delivery_confirmation(
+        self, ticket_id: int, order_no: str, group_id: str, confirm_user_id: str
+    ) -> int:
+        """创建待确认快递记录（同单同单号 WAITING 已存在则返回 0）。"""
+        with self.transaction("create_delivery_confirmation"):
+            cur = self._conn.execute(
+                """INSERT OR IGNORE INTO delivery_confirmations
+                       (ticket_id, order_no, group_id, confirm_user_id, status, created_at)
+                   VALUES (?,?,?,?, 'WAITING', ?)""",
+                (ticket_id, order_no, group_id, confirm_user_id, _now_str()),
+            )
+        return cur.lastrowid if cur.rowcount > 0 else 0
+
+    def get_waiting_delivery_confirmation(self, group_id: str, user_id: str) -> dict[str, Any] | None:
+        row = self.connect().execute(
+            """SELECT * FROM delivery_confirmations
+               WHERE group_id=? AND confirm_user_id=? AND status='WAITING'
+               ORDER BY id DESC LIMIT 1""",
+            (group_id, user_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def resolve_delivery_confirmation(
+        self, confirmation_id: int, status: str, message_id: str
+    ) -> bool:
+        with self.transaction("resolve_delivery_confirmation"):
+            cur = self._conn.execute(
+                "UPDATE delivery_confirmations SET status=?, resolved_at=?, resolve_message_id=?"
+                " WHERE id=? AND status='WAITING'",
+                (status, _now_str(), message_id, confirmation_id),
+            )
+        return cur.rowcount > 0
+
+    def expire_deliveries_by_ticket(self, ticket_id: int) -> int:
+        with self.transaction("expire_deliveries_by_ticket"):
+            cur = self._conn.execute(
+                "UPDATE delivery_confirmations SET status='EXPIRED', resolved_at=?"
+                " WHERE ticket_id=? AND status='WAITING'",
+                (_now_str(), ticket_id),
+            )
+        return cur.rowcount

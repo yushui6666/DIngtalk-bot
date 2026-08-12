@@ -174,28 +174,38 @@ async def test_natural_language_without_model_ignored(env):
 
 
 @pytest.mark.asyncio
-async def test_model_complete_requires_confirmation_then_confirmed(env):
+async def test_model_complete_executes_directly(env):
+    """业务决策（2026-08-12）：自然语言说「修好了」即直接完成，不再强制二次确认。"""
     await env.process("#报修\n主题：收银机\n位置：前台\n问题描述：死机\n时效：1天", "m1")
     t1 = _active(env.db)[0]
-    # 模型说“完成”→ 协议 ALWAYS 确认 → 建待确认
+    # 模型说“完成”→ 协议已改 NOT_REQUIRED → 直接执行
     env.classifier.responses["m2"] = SemanticDecision(
         protocol_version="4.0.0", source="SEMANTIC_MODEL", intent="ticket.complete",
         target_ticket_no=t1["ticket_no"], intent_confidence=0.95)
     await env.process("维修已经完成了", "m2")
     row = env.db.connect().execute(
         "SELECT processed_result FROM inbox_messages WHERE message_id='m2'").fetchone()
-    assert row["processed_result"] == "WAITING_CONFIRMATION"
-    pending = env.db.get_waiting_pending("G1", "uid-mgr")
-    assert pending is not None and pending["intent"] == "ticket.complete"
-    # 尚未执行
-    assert _ticket(env.db, t1["ticket_no"])["status"] == "ACTIVE"
-    # 用户确认 → 模型识别为确认动作
-    env.classifier.responses["m3"] = SemanticDecision(
-        protocol_version="4.0.0", source="SEMANTIC_MODEL", intent="system.confirm_pending_action",
-        target_ticket_no=None, intent_confidence=0.95)
-    await env.process("确认", "m3")
+    assert row["processed_result"] == "EXECUTED"
     assert _ticket(env.db, t1["ticket_no"])["status"] == "COMPLETED"
+    # 未创建待确认
     assert env.db.get_waiting_pending("G1", "uid-mgr") is None
+    assert any("已完成" in s for s in env.sent)
+
+
+@pytest.mark.asyncio
+async def test_model_cancel_still_requires_confirmation(env):
+    """取消/重开仍保持确认策略（高危误操作防护）。"""
+    await env.process("#报修\n主题：收银机\n位置：前台\n问题描述：死机\n时效：1天", "m1")
+    t1 = _active(env.db)[0]
+    env.classifier.responses["m2"] = SemanticDecision(
+        protocol_version="4.0.0", source="SEMANTIC_MODEL", intent="ticket.cancel",
+        target_ticket_no=t1["ticket_no"], intent_confidence=0.95,
+        fields={"cancel_reason": "误报"})
+    await env.process("帮我把这个误报工单取消掉", "m2")
+    row = env.db.connect().execute(
+        "SELECT processed_result FROM inbox_messages WHERE message_id='m2'").fetchone()
+    assert row["processed_result"] == "WAITING_CONFIRMATION"
+    assert _ticket(env.db, t1["ticket_no"])["status"] == "ACTIVE"
 
 
 @pytest.mark.asyncio
