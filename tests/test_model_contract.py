@@ -35,9 +35,15 @@ class FakeModelClient:
     should_timeout: bool = False
     should_raise: Exception | None = None
     call_count: int = 0
+    last_payload: dict[str, Any] | None = None
+    last_schema: dict[str, Any] | None = None
+    last_idempotency_key: str | None = None
 
     async def complete_json(self, *, payload, schema, idempotency_key) -> dict[str, Any]:
         self.call_count += 1
+        self.last_payload = payload
+        self.last_schema = schema
+        self.last_idempotency_key = idempotency_key
         if self.should_raise:
             raise self.should_raise
         if self.should_timeout:
@@ -45,6 +51,56 @@ class FakeModelClient:
         if self.response is None:
             raise ModelResponseError("模拟空响应")
         return self.response
+
+
+class _FakeHttpResponse:
+    status_code = 200
+    text = ""
+
+    def json(self) -> dict[str, Any]:
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": '{"intent":"chat.ignore","confidence":1,"fields":{}}'
+                    }
+                }
+            ]
+        }
+
+
+class _CapturingAsyncClient:
+    instances: list["_CapturingAsyncClient"] = []
+
+    def __init__(self, *, timeout: float) -> None:
+        self.timeout = timeout
+        self.posts: list[dict[str, Any]] = []
+        self.instances.append(self)
+
+    async def __aenter__(self) -> "_CapturingAsyncClient":
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback) -> None:
+        return None
+
+    async def post(self, url: str, *, headers: dict[str, str], json: dict[str, Any]) -> _FakeHttpResponse:
+        self.posts.append({"url": url, "headers": headers, "json": json})
+        return _FakeHttpResponse()
+
+
+class _ErrorHttpResponse:
+    status_code = 400
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+class _ErrorAsyncClient(_CapturingAsyncClient):
+    error_text = ""
+
+    async def post(self, url: str, *, headers: dict[str, str], json: dict[str, Any]) -> _ErrorHttpResponse:
+        self.posts.append({"url": url, "headers": headers, "json": json})
+        return _ErrorHttpResponse(self.error_text)
 
 
 # ───────────────────────── 辅助 ─────────────────────────
@@ -219,6 +275,36 @@ async def test_classifier_rejects_hallucinated_fields():
 
 
 @pytest.mark.asyncio
+async def test_classifier_filters_fields_not_allowed_for_intent():
+    """协议中存在但不属于当前动作的字段也必须过滤。"""
+    from semantics.classifier import SemanticClassifier
+
+    protocol = _load_protocol()
+    fake = FakeModelClient(response={
+        "intent": "ticket.complete",
+        "confidence": 0.9,
+        "fields": {"cancel_reason": "偷偷取消", "completion_note": "已修复"},
+    })
+    classifier = SemanticClassifier(client=fake, protocol=protocol)
+    result = await classifier.classify(_make_message(), candidates=[])
+    assert "cancel_reason" not in result.fields
+    assert result.fields["completion_note"] == "已修复"
+
+
+@pytest.mark.asyncio
+async def test_classifier_rejects_non_object_response():
+    """模型客户端即使返回非对象 JSON，classifier 也应安全降级。"""
+    from semantics.classifier import SemanticClassifier
+
+    protocol = _load_protocol()
+    fake = FakeModelClient(response=["not", "an", "object"])  # type: ignore[arg-type]
+    classifier = SemanticClassifier(client=fake, protocol=protocol)
+    result = await classifier.classify(_make_message(), candidates=[])
+    assert result.intent == "chat.ignore"
+    assert "response_error" in result.evidence[0]
+
+
+@pytest.mark.asyncio
 async def test_classifier_strips_unsafe_sla():
     """模型返回非法 SLA 枚举 → 移入 missing_fields。"""
     from semantics.classifier import SemanticClassifier
@@ -340,6 +426,77 @@ async def test_classifier_filters_candidate_scores_outside_group():
 
 
 @pytest.mark.asyncio
+async def test_classifier_rejects_target_ticket_outside_candidates():
+    """模型不能选择当前候选集合外的目标工单。"""
+    from semantics.classifier import SemanticClassifier
+    from semantics.types import TicketCandidate
+
+    protocol = _load_protocol()
+    candidates = [
+        TicketCandidate(
+            ticket_id=1, ticket_no="T001", group_id="g-test",
+            subject="门", location="大厅", problem_summary="下沉",
+            status="ACTIVE", version=3,
+        )
+    ]
+    fake = FakeModelClient(response={
+        "intent": "ticket.complete",
+        "confidence": 0.95,
+        "fields": {},
+        "ticket_no": "OTHER-GROUP-9",
+    })
+    classifier = SemanticClassifier(client=fake, protocol=protocol)
+    result = await classifier.classify(_make_message(), candidates=candidates)
+    assert result.target_ticket_no is None
+    assert "ticket_no" in result.missing_fields
+
+
+@pytest.mark.asyncio
+async def test_classifier_payload_contains_protocol_candidates_and_pending_context():
+    """模型输入包含受限协议、候选快照和待确认动作上下文。"""
+    from semantics.classifier import SemanticClassifier
+    from semantics.types import PendingAction, PendingActionStatus, TicketCandidate
+
+    protocol = _load_protocol()
+    fake = FakeModelClient(response={
+        "intent": "chat.ignore", "confidence": 1.0, "fields": {}
+    })
+    candidates = [
+        TicketCandidate(
+            ticket_id=1, ticket_no="T001", group_id="g-test",
+            subject="门", location="大厅", problem_summary="门体下沉",
+            status="ACTIVE", version=3,
+        )
+    ]
+    pending = PendingAction(
+        id=9,
+        source_message_id="source-1",
+        group_id="g-test",
+        user_id="u-test",
+        intent="ticket.cancel",
+        candidate_ticket_ids=(1,),
+        fields={"cancel_reason": "误报"},
+        expected_ticket_versions={1: 3},
+        status=PendingActionStatus.WAITING,
+        version=2,
+        expires_at=datetime.now(),
+    )
+    classifier = SemanticClassifier(client=fake, protocol=protocol)
+    await classifier.classify(_make_message(sender_role="MANAGER"), candidates, pending)
+
+    payload = fake.last_payload
+    system_prompt = payload["messages"][0]["content"]
+    assert "发送人角色=MANAGER" in system_prompt
+    assert "target_policy=MUST_EXIST" in system_prompt
+    assert "confirmation_policy=" in system_prompt
+    assert "T001" in system_prompt
+    assert "门体下沉" in system_prompt
+    assert "version=3" in system_prompt
+    assert "pending_id=9" in system_prompt
+    assert "cancel_reason" in system_prompt
+
+
+@pytest.mark.asyncio
 async def test_classifier_single_http_call():
     """确认 classifier 只做单次 HTTP 调用，不内部重试（§8.1）。"""
     from semantics.classifier import SemanticClassifier
@@ -362,3 +519,98 @@ async def test_classifier_model_client_not_configured():
 
     client2 = OpenAICompatibleModelClient(api_key="sk-test")
     assert client2.is_configured
+
+
+def test_model_client_default_timeout_is_60_seconds(monkeypatch):
+    """Task 4 默认模型超时为 60 秒。"""
+    from semantics.model_client import OpenAICompatibleModelClient
+
+    monkeypatch.delenv("LLM_TIMEOUT_SECONDS", raising=False)
+    client = OpenAICompatibleModelClient(api_key="sk-test")
+    assert client.timeout_seconds == 60.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("base_url", "response_format", "expected_type"),
+    [
+        ("https://api.openai.com/v1", "json_schema", "json_schema"),
+        ("https://example.test/v1", "json_object", "json_object"),
+        ("https://api.openai.com/v1", "auto", "json_schema"),
+        ("https://example.test/v1", "auto", "json_object"),
+    ],
+)
+async def test_model_client_response_format_modes(
+    monkeypatch,
+    base_url: str,
+    response_format: str,
+    expected_type: str,
+):
+    """响应格式由配置决定，且每次 complete_json 只发送一次请求。"""
+    import httpx
+    from semantics.model_client import OpenAICompatibleModelClient
+
+    _CapturingAsyncClient.instances.clear()
+    monkeypatch.setattr(httpx, "AsyncClient", _CapturingAsyncClient)
+    client = OpenAICompatibleModelClient(
+        base_url=base_url,
+        api_key="sk-sensitive-test",
+        model="test-model",
+        response_format=response_format,
+    )
+    await client.complete_json(
+        payload={"messages": [{"role": "system", "content": "test"}]},
+        schema={"type": "object"},
+        idempotency_key="msg-1",
+    )
+
+    assert len(_CapturingAsyncClient.instances) == 1
+    instance = _CapturingAsyncClient.instances[0]
+    assert instance.timeout == 60.0
+    assert len(instance.posts) == 1
+    request_format = instance.posts[0]["json"]["response_format"]
+    assert request_format["type"] == expected_type
+    if expected_type == "json_schema":
+        assert request_format["json_schema"]["strict"] is True
+    else:
+        assert "json_schema" not in request_format
+
+
+def test_model_client_rejects_unknown_response_format():
+    """未知响应格式配置应在启动时失败。"""
+    from semantics.model_client import OpenAICompatibleModelClient
+
+    with pytest.raises(ValueError, match="LLM_RESPONSE_FORMAT"):
+        OpenAICompatibleModelClient(api_key="sk-test", response_format="xml")
+
+
+def test_extract_json_rejects_non_object():
+    """JSON 数组等非对象响应不符合模型契约。"""
+    from semantics.model_client import _extract_json
+
+    with pytest.raises(ModelResponseError, match="JSON 对象"):
+        _extract_json('["not", "object"]')
+
+
+@pytest.mark.asyncio
+async def test_model_client_redacts_api_key_from_http_error_log(monkeypatch, caplog):
+    """兼容服务回显请求凭据时，日志不得泄露 API Key。"""
+    import httpx
+    from semantics.model_client import OpenAICompatibleModelClient
+
+    secret = "sk-sensitive-do-not-log"
+    _ErrorAsyncClient.instances.clear()
+    _ErrorAsyncClient.error_text = f"invalid authorization Bearer {secret}"
+    monkeypatch.setattr(httpx, "AsyncClient", _ErrorAsyncClient)
+    client = OpenAICompatibleModelClient(
+        base_url="https://example.test/v1",
+        api_key=secret,
+        response_format="json_object",
+    )
+    with pytest.raises(ModelResponseError):
+        await client.complete_json(
+            payload={"messages": [{"role": "system", "content": "test"}]},
+            schema={"type": "object"},
+            idempotency_key="msg-1",
+        )
+    assert secret not in caplog.text

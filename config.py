@@ -125,7 +125,12 @@ import os as _os
 
 LLM_BASE_URL = _os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1")
 LLM_MODEL = _os.environ.get("LLM_MODEL", "gpt-4o-mini")
-LLM_TIMEOUT_SECONDS = float(_os.environ.get("LLM_TIMEOUT_SECONDS", "15"))
+LLM_TIMEOUT_SECONDS = float(_os.environ.get("LLM_TIMEOUT_SECONDS", "60"))
+LLM_RESPONSE_FORMAT = _os.environ.get("LLM_RESPONSE_FORMAT", "auto").lower()
+if LLM_RESPONSE_FORMAT not in {"auto", "json_schema", "json_object"}:
+    raise ValueError(
+        "LLM_RESPONSE_FORMAT 必须是 auto、json_schema 或 json_object"
+    )
 LLM_MAX_ATTEMPTS = int(_os.environ.get("LLM_MAX_ATTEMPTS", "3"))
 LLM_RETRY_DELAYS_SECONDS = [2, 10]  # 计划书 §10.3
 

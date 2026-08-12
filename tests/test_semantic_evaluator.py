@@ -239,6 +239,16 @@ def test_blind_dataset_structure():
         assert "expected_intent" in c
 
 
+def test_blind_role_restricted_actions_have_allowed_role():
+    """盲测中的角色受限动作必须提供与协议一致的发送人角色。"""
+    blind = _load_dataset("semantic_cases.blind.json")
+    diagnosis = next(
+        case for case in blind
+        if case["expected_intent"] == "ticket.diagnosis.submit"
+    )
+    assert diagnosis.get("sender_role") == "ENGINEER"
+
+
 def test_blind_dataset_labels_are_frozen():
     """盲测文本和标签摘要固定，修改时必须显式更新冻结基线。"""
     import hashlib
@@ -275,6 +285,62 @@ def test_evaluator_module_cli_outputs_report():
     assert completed.returncode == 0, completed.stderr
     assert "intent_accuracy" in completed.stdout
     assert "routing_precision" in completed.stdout
+
+
+def test_evaluator_module_cli_accepts_live_model_option():
+    """Task 4 规定的真实模型 CLI 参数应被识别。"""
+    import subprocess
+    import sys
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "semantics.evaluator", "--help"],
+        cwd=Path(__file__).resolve().parent.parent,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0
+    assert "--live-model" in completed.stdout
+
+
+@pytest.mark.asyncio
+async def test_live_model_evaluator_uses_classifier_predictions():
+    """真实模型模式把 classifier 决策转换为统一评测报告。"""
+    from semantics.evaluator import _run_live_model
+    from semantics.types import SemanticDecision
+
+    class FakeClassifier:
+        async def classify(self, message, candidates):
+            assert message.sender_role == "ENGINEER"
+            assert [candidate.ticket_no for candidate in candidates] == ["T001"]
+            return SemanticDecision(
+                protocol_version="4.0.0",
+                source="SEMANTIC_MODEL",
+                intent="ticket.complete",
+                target_ticket_no="T001",
+                intent_confidence=0.95,
+                fields={},
+            )
+
+    dataset = [{
+        "id": "live-1",
+        "text": "已经修好了",
+        "sender_role": "ENGINEER",
+        "expected_intent": "ticket.complete",
+        "expected_fields": {},
+        "expected_ticket_no": "T001",
+        "candidates": [{
+            "ticket_no": "T001",
+            "subject": "门下沉",
+            "location": "大厅",
+            "problem_summary": "门体下沉",
+            "status": "ACTIVE",
+            "version": 3,
+        }],
+    }]
+    report = await _run_live_model(dataset, classifier=FakeClassifier())
+    assert report.intent_accuracy == 1.0
+    assert report.routing_precision == 1.0
 
 
 # ───────────────────────── 关键词匹配器评测 ─────────────────────────

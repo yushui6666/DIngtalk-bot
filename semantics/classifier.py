@@ -37,6 +37,19 @@ _KNOWN_FIELDS: frozenset[str] = frozenset({
     "clarification_reason", "ticket_no", "content", "attachments",
 })
 
+_INTENT_FIELD_OVERRIDES: dict[str, frozenset[str]] = {
+    "ticket.create": frozenset({"device", "urgency", "attachments"}),
+    "ticket.add_detail": frozenset({
+        "subject", "location", "problem_description", "device", "urgency",
+        "attachments", "content",
+    }),
+    "ticket.diagnosis.submit": frozenset({"diagnosis_items"}),
+    "ticket.repair_plan.submit": frozenset({"repair_method", "order_no"}),
+    "ticket.timeout_reason.submit": frozenset({"timeout_reason"}),
+    "ticket.complete": frozenset({"completion_note"}),
+    "system.correct_pending_action": _KNOWN_FIELDS - {"ticket_no"},
+}
+
 # 允许的 SLA 枚举值（§4.5）
 _ALLOWED_SLA = frozenset({"1天", "3天", "7天"})
 
@@ -132,6 +145,14 @@ class SemanticClassifier:
             logger.warning("模型调用失败 message_id=%s err=%s", message.message_id, exc)
             return _fallback_decision(self._protocol, message.message_id, "network_error")
 
+        if not isinstance(raw, dict):
+            logger.warning(
+                "模型响应不是 JSON 对象 message_id=%s type=%s",
+                message.message_id,
+                type(raw).__name__,
+            )
+            return _fallback_decision(self._protocol, message.message_id, "response_error")
+
         # 4. 校验 intent 在协议白名单内（§10.4 提示注入防护）
         intent = raw.get("intent", "")
         known_intents = {a.intent_id for a in self._protocol.actions}
@@ -143,11 +164,22 @@ class SemanticClassifier:
             )
             return _fallback_decision(self._protocol, message.message_id, "unknown_intent")
 
+        action = self._protocol.get_action(intent)
+        if action is None:
+            return _fallback_decision(self._protocol, message.message_id, "unknown_intent")
+
         # 5. 过滤幻觉字段（§10.4：模型不能创造新字段）
         raw_fields = raw.get("fields", {}) or {}
+        if not isinstance(raw_fields, dict):
+            return _fallback_decision(self._protocol, message.message_id, "response_error")
+        allowed_fields = (
+            set(action.required_fields)
+            | set(action.optional_fields)
+            | set(_INTENT_FIELD_OVERRIDES.get(intent, ()))
+        )
         safe_fields: dict[str, Any] = {}
         for key, value in raw_fields.items():
-            if key in _KNOWN_FIELDS:
+            if key == "ticket_no" or key in allowed_fields:
                 safe_fields[key] = value
             else:
                 logger.debug(
@@ -184,13 +216,23 @@ class SemanticClassifier:
 
         # 提取工单编号
         ticket_no = safe_fields.pop("ticket_no", None) or raw.get("ticket_no")
+        if ticket_no is not None:
+            ticket_no = str(ticket_no).strip() or None
+        candidate_nos = {candidate.ticket_no for candidate in candidates}
+        if ticket_no and ticket_no not in candidate_nos:
+            logger.debug(
+                "过滤候选集合外目标 ticket_no=%s message_id=%s",
+                ticket_no,
+                message.message_id,
+            )
+            ticket_no = None
+            missing.append("ticket_no")
 
         # 候选评分（模型可选返回）
         candidate_scores: tuple[TicketScore, ...] = ()
         raw_scores = raw.get("candidate_scores")
         if isinstance(raw_scores, list):
             valid_scores: list[TicketScore] = []
-            candidate_nos = {c.ticket_no for c in candidates}
             for item in raw_scores:
                 if isinstance(item, dict):
                     tn = item.get("ticket_no", "")
@@ -271,6 +313,10 @@ def _build_payload(
         summary = (
             f"- {a.intent_id}: {a.display_name}。"
             f"允许角色={list(a.allowed_roles)}。"
+            f"必填字段={list(a.required_fields)}。"
+            f"可选字段={list(a.optional_fields)}。"
+            f"target_policy={a.target_ticket_policy}。"
+            f"confirmation_policy={a.confirmation_policy}。"
         )
         if a.positive_examples:
             summary += f"正例: {a.positive_examples[0]}"
@@ -283,20 +329,23 @@ def _build_payload(
         for c in candidates:
             candidate_lines += (
                 f"  - {c.ticket_no}: {c.subject} @ {c.location} "
-                f"({c.status})\n"
+                f"summary={c.problem_summary} status={c.status} version={c.version}\n"
             )
 
     # 待确认动作上下文
     pending_line = ""
     if pending_action is not None:
         pending_line = (
-            f"\n当前待确认动作: intent={pending_action.intent} "
-            f"candidates={pending_action.candidate_ticket_ids}\n"
+            f"\n当前待确认动作: pending_id={pending_action.id} "
+            f"intent={pending_action.intent} "
+            f"candidates={pending_action.candidate_ticket_ids} "
+            f"fields={pending_action.fields} version={pending_action.version}\n"
         )
 
     system_prompt = (
         "你是钉钉群报修工单的语义分析助手。"
         "根据用户消息判断意图(intent)和抽取字段(fields)。\n\n"
+        f"发送人角色={message.sender_role}。协议版本={protocol.protocol_version}。\n"
         "可用的意图(id)：\n"
         + "\n".join(action_summaries)
         + "\n\n规则：\n"

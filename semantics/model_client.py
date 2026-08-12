@@ -1,8 +1,8 @@
 """OpenAI-compatible 云端模型客户端（计划书 Task 4 §10）。
 
 核心约束（计划书 §10.1~10.4）：
-- 单次 HTTP 调用，15 秒超时；
-- 结构化 JSON Schema 强制输出；
+- 单次 HTTP 调用，默认 60 秒超时；
+- 支持 JSON Schema 和兼容 JSON mode；
 - 不记录 API Key（只从环境变量注入）；
 - 重试由 Task 6 收件箱 Worker 统一管理，客户端不做内部重试；
 - 用户消息作为不可信数据字段传入，模型不配置数据库或发送工具；
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from typing import Any
 
@@ -64,6 +65,7 @@ class OpenAICompatibleModelClient:
         api_key: str | None = None,
         model: str | None = None,
         timeout_seconds: float | None = None,
+        response_format: str | None = None,
     ) -> None:
         # 优先使用显式参数，其次环境变量
         self.base_url = (
@@ -81,8 +83,17 @@ class OpenAICompatibleModelClient:
         self.timeout_seconds = (
             timeout_seconds
             if timeout_seconds is not None
-            else float(os.environ.get("LLM_TIMEOUT_SECONDS", "15"))
+            else float(os.environ.get("LLM_TIMEOUT_SECONDS", "60"))
         )
+        configured_format = (
+            response_format
+            or os.environ.get("LLM_RESPONSE_FORMAT", "auto")
+        ).lower()
+        if configured_format not in {"auto", "json_schema", "json_object"}:
+            raise ValueError(
+                "LLM_RESPONSE_FORMAT 必须是 auto、json_schema 或 json_object"
+            )
+        self.response_format = configured_format
 
     @property
     def is_configured(self) -> bool:
@@ -136,25 +147,33 @@ class OpenAICompatibleModelClient:
             "X-Request-Trace-Id": request_trace_id,
         }
 
-        request_body: dict[str, Any] = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": 0.0,
-            "max_tokens": 1024,
-            "response_format": {
+        resolved_format = self._resolved_response_format()
+        response_format_body: dict[str, Any]
+        if resolved_format == "json_schema":
+            response_format_body = {
                 "type": "json_schema",
                 "json_schema": {
                     "name": "semantic_intent",
                     "strict": True,
                     "schema": schema,
                 },
-            },
+            }
+        else:
+            response_format_body = {"type": "json_object"}
+
+        request_body: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.0,
+            "max_tokens": 1024,
+            "response_format": response_format_body,
         }
 
         logger.info(
-            "模型请求 trace=%s model=%s idempotency=%s msg_count=%d",
+            "模型请求 trace=%s model=%s format=%s idempotency=%s msg_count=%d",
             request_trace_id,
             self.model,
+            resolved_format,
             idempotency_key,
             len(request_body["messages"]),
         )
@@ -169,11 +188,12 @@ class OpenAICompatibleModelClient:
         # 非 2xx → 非法响应
         if response.status_code >= 400:
             # 不记录 Authorization 头
+            body_preview = _redact_secrets(response.text[:200], self._api_key)
             logger.warning(
                 "模型 HTTP 错误 trace=%s status=%d body_preview=%s",
                 request_trace_id,
                 response.status_code,
-                response.text[:200],
+                body_preview,
             )
             raise ModelResponseError(
                 f"模型 HTTP {response.status_code}"
@@ -202,6 +222,16 @@ class OpenAICompatibleModelClient:
         )
 
         return result
+
+    def _resolved_response_format(self) -> str:
+        """解析 auto 模式，不通过试错请求进行运行时降级。"""
+        if self.response_format != "auto":
+            return self.response_format
+        return (
+            "json_schema"
+            if self.base_url.startswith("https://api.openai.com/")
+            else "json_object"
+        )
 
 
 def _extract_json(content: str) -> dict[str, Any]:
@@ -232,7 +262,7 @@ def _extract_json(content: str) -> dict[str, Any]:
 
     # 尝试直接解析
     try:
-        return json.loads(text)
+        return _require_json_object(json.loads(text))
     except json.JSONDecodeError:
         pass
 
@@ -240,7 +270,7 @@ def _extract_json(content: str) -> dict[str, Any]:
     decoder = json.JSONDecoder()
     try:
         result, _ = decoder.raw_decode(text)
-        return result
+        return _require_json_object(result)
     except json.JSONDecodeError:
         pass
 
@@ -250,13 +280,26 @@ def _extract_json(content: str) -> dict[str, Any]:
     if first_brace >= 0 and last_brace > first_brace:
         candidate = text[first_brace : last_brace + 1]
         try:
-            return json.loads(candidate)
+            return _require_json_object(json.loads(candidate))
         except json.JSONDecodeError:
             pass
         try:
             result, _ = decoder.raw_decode(text[first_brace:])
-            return result
+            return _require_json_object(result)
         except json.JSONDecodeError:
             pass
 
     raise ModelResponseError(f"模型 content 不是有效 JSON: {content[:200]}")
+
+
+def _require_json_object(value: Any) -> dict[str, Any]:
+    """模型结构化输出的根节点必须是 JSON 对象。"""
+    if not isinstance(value, dict):
+        raise ModelResponseError("模型 content 必须是 JSON 对象")
+    return value
+
+
+def _redact_secrets(text: str, api_key: str) -> str:
+    """脱敏供应商错误正文中的当前密钥和 Bearer Token。"""
+    redacted = text.replace(api_key, "<redacted>") if api_key else text
+    return re.sub(r"(?i)Bearer\s+[^\s,;]+", "Bearer <redacted>", redacted)

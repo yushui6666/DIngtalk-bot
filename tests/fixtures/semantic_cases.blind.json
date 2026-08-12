@@ -27,6 +27,7 @@
     "expected_fields": {
       "diagnosis_items": ["灯管烧毁", "镇流器异响", "线路接触不良"]
     },
+    "sender_role": "ENGINEER",
     "has_keyword": false
   }
 ]

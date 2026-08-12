@@ -7,8 +7,11 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
+import os
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -214,12 +217,109 @@ def _run_keyword_baseline(dataset: list[dict[str, Any]]) -> EvaluationReport:
     return evaluate(cases, predictions)
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="运行确定性关键词语义离线评测")
-    parser.add_argument("--dataset", type=Path, required=True, help="标注数据集 JSON 路径")
-    args = parser.parse_args(argv)
-    report = _run_keyword_baseline(_load_dataset(args.dataset))
-    print(json.dumps({
+def _to_labeled_cases(dataset: list[dict[str, Any]]) -> list[LabeledCase]:
+    return [
+        LabeledCase(
+            id=raw_case["id"],
+            text=raw_case["text"],
+            expected_intent=raw_case["expected_intent"],
+            expected_fields=raw_case.get("expected_fields", {}),
+            expected_ticket_no=raw_case.get("expected_ticket_no"),
+        )
+        for raw_case in dataset
+    ]
+
+
+def _load_env_file(path: Path) -> None:
+    """加载简单 KEY=VALUE 配置，不覆盖进程已有环境变量。"""
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key:
+            os.environ.setdefault(key, value)
+
+
+def _make_live_message(raw_case: dict[str, Any]) -> Any:
+    from models import NormalizedMessage
+
+    return NormalizedMessage(
+        message_id=raw_case["id"],
+        group_id=raw_case.get("group_id", "eval-group"),
+        sender_id=raw_case.get("sender_id", "eval-sender"),
+        sender_name=raw_case.get("sender_name", "评测用户"),
+        content=raw_case["text"],
+        sent_at=datetime.now(),
+        sender_role=raw_case.get("sender_role", "MANAGER"),
+    )
+
+
+def _make_live_candidates(raw_case: dict[str, Any]) -> list[Any]:
+    from semantics.types import TicketCandidate
+
+    group_id = raw_case.get("group_id", "eval-group")
+    candidates: list[TicketCandidate] = []
+    for index, raw_candidate in enumerate(raw_case.get("candidates", []), 1):
+        candidates.append(
+            TicketCandidate(
+                ticket_id=int(raw_candidate.get("ticket_id", index)),
+                ticket_no=str(raw_candidate["ticket_no"]),
+                group_id=str(raw_candidate.get("group_id", group_id)),
+                subject=str(raw_candidate.get("subject", "")),
+                location=str(raw_candidate.get("location", "")),
+                problem_summary=str(
+                    raw_candidate.get("problem_summary", raw_candidate.get("summary", ""))
+                ),
+                status=str(raw_candidate.get("status", "ACTIVE")),
+                version=int(raw_candidate.get("version", 1)),
+            )
+        )
+    return candidates
+
+
+async def _run_live_model(
+    dataset: list[dict[str, Any]],
+    *,
+    classifier: Any | None = None,
+) -> EvaluationReport:
+    """调用已配置模型生成预测，并复用统一评测指标。"""
+    if classifier is None:
+        from semantics.classifier import SemanticClassifier
+        from semantics.model_client import OpenAICompatibleModelClient
+        from semantics.protocol_loader import load_protocol
+
+        project_root = Path(__file__).resolve().parent.parent
+        _load_env_file(project_root / ".env")
+        client = OpenAICompatibleModelClient()
+        if not client.is_configured:
+            raise RuntimeError("未配置 LLM_API_KEY，无法运行真实模型评测")
+        protocol = load_protocol(project_root / "protocols" / "ticket_semantics.v4.json")
+        classifier = SemanticClassifier(client=client, protocol=protocol)
+
+    predictions: list[EvalPrediction] = []
+    for raw_case in dataset:
+        decision = await classifier.classify(
+            _make_live_message(raw_case),
+            _make_live_candidates(raw_case),
+        )
+        predictions.append(
+            EvalPrediction(
+                id=raw_case["id"],
+                predicted_intent=decision.intent,
+                predicted_fields=dict(decision.fields),
+                predicted_ticket_no=decision.target_ticket_no,
+            )
+        )
+    return evaluate(_to_labeled_cases(dataset), predictions)
+
+
+def _report_dict(report: EvaluationReport) -> dict[str, Any]:
+    return {
         "total_cases": report.total_cases,
         "matched_cases": report.matched_cases,
         "intent_accuracy": report.intent_accuracy,
@@ -230,7 +330,21 @@ def main(argv: list[str] | None = None) -> int:
         "routing_precision": report.routing_precision,
         "ambiguity_clarification_rate": report.ambiguity_clarification_rate,
         "per_class": report.per_class,
-    }, ensure_ascii=False, indent=2, sort_keys=True))
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="运行关键词或真实模型语义离线评测")
+    parser.add_argument("--dataset", type=Path, required=True, help="标注数据集 JSON 路径")
+    parser.add_argument("--live-model", action="store_true", help="调用已配置云端模型")
+    args = parser.parse_args(argv)
+    dataset = _load_dataset(args.dataset)
+    report = (
+        asyncio.run(_run_live_model(dataset))
+        if args.live_model
+        else _run_keyword_baseline(dataset)
+    )
+    print(json.dumps(_report_dict(report), ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 
 
