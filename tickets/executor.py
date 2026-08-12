@@ -56,6 +56,10 @@ class TicketCommandExecutor:
             logger.info("执行记录已应用，跳过 message_id=%s", command.message_id)
             return CommandResult(RESULT_OK, command.target_ticket_id, None, ())
 
+        logger.info(
+            "动作执行开始 msg=%s intent=%s target_ticket_id=%s expected_version=%s",
+            command.message_id, command.intent, command.target_ticket_id, command.expected_ticket_version,
+        )
         try:
             with self._db.transaction(f"execute:{command.intent}"):
                 inserted = self._db.insert_execution(

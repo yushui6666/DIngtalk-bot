@@ -96,8 +96,14 @@ class MessageProcessingPipeline:
         """处理一条收件箱消息，返回最终收件箱状态。"""
         msg = _row_to_message(item)
         self._db.inbox_set_status(msg.message_id, "PROCESSING")
+        logger.info(
+            "消息处理开始 msg=%s group=%s sender=%s role=%s type=%s",
+            msg.message_id, msg.group_id, msg.sender_id[:8], msg.sender_role, msg.message_type,
+        )
         try:
-            return await self._handle(msg, item)
+            status = await self._handle(msg, item)
+            logger.info("消息处理完成 msg=%s status=%s", msg.message_id, status)
+            return status
         except Exception as exc:
             logger.exception("消息处理异常 message_id=%s err=%s", msg.message_id, exc)
             return self._retry_or_dead(item, msg, str(exc))
@@ -113,6 +119,11 @@ class MessageProcessingPipeline:
         pending = self._pending.get_waiting(msg.group_id, msg.sender_id)
 
         decision = await self._decide(msg)
+        logger.info(
+            "语义决策 msg=%s source=%s intent=%s conf=%.2f target_no=%s missing=%s",
+            msg.message_id, decision.source, decision.intent, decision.intent_confidence,
+            decision.target_ticket_no, decision.missing_fields or "-",
+        )
         if pending is not None:
             resolved = await self._resolve_pending_reply(item, msg, pending, decision)
             if resolved is not None:
@@ -146,6 +157,11 @@ class MessageProcessingPipeline:
             quoted_ticket_id=self._quoted_ticket_id(msg),
             selected_ticket_id=self._context.get_active(msg.group_id, msg.sender_id, datetime.now()),
         )
+        logger.info(
+            "消息路由 msg=%s route=%s link=%s target_ticket_id=%s candidates=%d",
+            msg.message_id, route.decision.value, route.link_type,
+            route.target_ticket_id, len(route.candidate_ticket_ids),
+        )
 
         if route.decision == RouteDecision.CLARIFY:
             return self._create_clarify_pending(item, msg, decision, candidates, route)
@@ -168,6 +184,10 @@ class MessageProcessingPipeline:
         status, cmd, errors = validate_decision(
             decision, message=msg, candidates=validate_candidates, protocol=self._protocol
         )
+        logger.info(
+            "消息校验 msg=%s status=%s errors=%s",
+            msg.message_id, status.value, "；".join(errors) if errors else "-",
+        )
         if status == DecisionStatus.VALIDATION_REJECTED:
             return self._reject(item, msg, errors)
         if status == DecisionStatus.IGNORE:
@@ -187,6 +207,10 @@ class MessageProcessingPipeline:
 
         # 执行
         result = self._executor.execute(cmd, message=msg)
+        logger.info(
+            "动作执行 msg=%s intent=%s result=%s ticket_id=%s version=%s",
+            msg.message_id, cmd.intent, result.status, result.ticket_id, result.ticket_version,
+        )
         self._complete(item, msg, "EXECUTED" if result.status == RESULT_OK else result.status)
         if result.status == RESULT_OK:
             # 维修方式带订单号 → 触发快递签收确认（询问发起人）
@@ -216,6 +240,10 @@ class MessageProcessingPipeline:
         result = match_reply(msg.content)
         if result is None:
             return None
+        logger.info(
+            "快递签收回复命中 msg=%s order_no=%s result=%s",
+            msg.message_id, waiting["order_no"], result,
+        )
         if not self._delivery.resolve(waiting["id"], result, msg.message_id):
             return self._complete(item, msg, "REJECTED")
         reply = "已记录：快递已签收 ✅" if result == STATUS_SIGNED else "已记录：快递尚未签收"
@@ -249,8 +277,10 @@ class MessageProcessingPipeline:
     async def _decide(self, msg: NormalizedMessage) -> SemanticDecision:
         keyword = match_keyword(msg.content, self._protocol)
         if keyword is not None:
+            logger.info("关键词快路径命中 msg=%s intent=%s", msg.message_id, keyword.intent)
             return keyword
         if not self._llm_enabled:
+            logger.info("模型未启用 msg=%s 走降级 ignore", msg.message_id)
             return SemanticDecision(
                 protocol_version=self._protocol.protocol_version,
                 source="local",
@@ -261,6 +291,7 @@ class MessageProcessingPipeline:
             )
         candidates = self._repo.snapshot_candidates(msg.group_id)
         pending = self._pending.get_waiting(msg.group_id, msg.sender_id)
+        logger.info("调用云端模型 msg=%s candidates=%d", msg.message_id, len(candidates))
         return await self._classifier.classify(msg, candidates=candidates, pending_action=pending)
 
     def _save_decision(self, msg: NormalizedMessage, decision: SemanticDecision) -> None:
@@ -284,10 +315,13 @@ class MessageProcessingPipeline:
         self, item: dict[str, Any], msg: NormalizedMessage, pending: Any, decision: SemanticDecision
     ) -> str | None:
         if decision.intent == "system.confirm_pending_action":
+            logger.info("待确认动作确认 msg=%s pending=%s intent=%s", msg.message_id, pending.id, pending.intent)
             return self._confirm_pending(item, msg, pending)
         if decision.intent == "system.reject_pending_action":
+            logger.info("待确认动作拒绝 msg=%s pending=%s intent=%s", msg.message_id, pending.id, pending.intent)
             return self._reject_pending(item, msg, pending)
         if decision.intent == "system.correct_pending_action":
+            logger.info("待确认动作修正 msg=%s pending=%s intent=%s", msg.message_id, pending.id, pending.intent)
             return self._correct_pending(item, msg, pending, decision)
         return None
 
