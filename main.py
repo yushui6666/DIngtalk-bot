@@ -147,7 +147,12 @@ async def main(mode: str, duration: int | None, group_filter: str | None) -> Non
         groups = [g for g in GROUPS if g["store_name"] == group_filter]
     load_groups()
 
-    worker = InboxWorker(db=db, pipeline=pipeline, notifier=notifier)
+    worker = InboxWorker(
+        db=db,
+        pipeline=pipeline,
+        notifier=notifier,
+        group_ids=[g["group_id"] for g in groups],
+    )
 
     tasks = [
         asyncio.create_task(run_listeners(groups, inbox_handler)),

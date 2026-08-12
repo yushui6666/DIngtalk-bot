@@ -501,6 +501,27 @@ class Database:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def inbox_next_due_for_group(
+        self, group_id: str, limit: int = 20, *, now: str | None = None
+    ) -> list[dict[str, Any]]:
+        """取某群可处理消息（RECEIVED 或已到期 RETRY_PENDING），群内按顺序。"""
+        now = now or _now_str()
+        rows = self.connect().execute(
+            """SELECT * FROM inbox_messages
+               WHERE group_id=? AND status IN ('RECEIVED', 'RETRY_PENDING')
+                 AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+               ORDER BY sent_at, message_id LIMIT ?""",
+            (group_id, now, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_group_ids(self) -> list[str]:
+        """所有已配置群 ID（供 Worker 按群并行）。"""
+        rows = self.connect().execute(
+            "SELECT group_id FROM groups ORDER BY group_id"
+        ).fetchall()
+        return [r["group_id"] for r in rows]
+
     def inbox_set_status(
         self,
         message_id: str,
