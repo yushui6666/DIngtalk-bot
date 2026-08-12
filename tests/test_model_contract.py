@@ -487,8 +487,9 @@ async def test_classifier_payload_contains_protocol_candidates_and_pending_conte
     payload = fake.last_payload
     system_prompt = payload["messages"][0]["content"]
     assert "发送人角色=MANAGER" in system_prompt
-    assert "target_policy=MUST_EXIST" in system_prompt
-    assert "confirmation_policy=" in system_prompt
+    # 精简 prompt：动作摘要含 intent_id + 必填字段 + 正例（target_policy/confirmation_policy 由本地校验兜底）
+    assert "ticket.cancel" in system_prompt
+    assert "必填:ticket_no,cancel_reason" in system_prompt
     assert "T001" in system_prompt
     assert "门体下沉" in system_prompt
     assert "version=3" in system_prompt

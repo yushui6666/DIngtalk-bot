@@ -339,29 +339,27 @@ def _build_payload(
 ) -> dict[str, Any]:
     """组装模型请求 payload（§10.2 模型输入）。
 
-    只发送当前判断需要的最少信息：
-    - 当前消息
-    - 当前用户角色
-    - 协议子集（semantic_enabled 动作）
-    - 少量候选工单摘要
-    - 固定输出 Schema
+    精简策略（2026-08-12 优化，降低模型延迟）：
+    - 动作摘要去掉 display_name / 可选字段 / target_policy / confirmation_policy
+      （分类不需要，本地校验兜底）；
+    - 按发送人角色裁剪动作子集（system.* 无角色限制始终保留）；
+    - 每个动作只保留必填字段 + 一条截断正例。
     """
-    # 构建动作列表（只包含 semantic_enabled=True 的动作）
-    action_summaries = []
+    sender_role = message.sender_role
+    action_summaries: list[str] = []
     for a in protocol.actions:
         if not a.semantic_enabled:
             continue
-        summary = (
-            f"- {a.intent_id}: {a.display_name}。"
-            f"允许角色={list(a.allowed_roles)}。"
-            f"必填字段={list(a.required_fields)}。"
-            f"可选字段={list(a.optional_fields)}。"
-            f"target_policy={a.target_ticket_policy}。"
-            f"confirmation_policy={a.confirmation_policy}。"
-        )
-        if a.positive_examples:
-            summary += f"正例: {a.positive_examples[0]}"
-        action_summaries.append(summary)
+        # 角色裁剪：无角色限制（system.*）保留；否则只保留该角色可触发的动作
+        if a.allowed_roles and sender_role not in a.allowed_roles:
+            continue
+        parts = [f"- {a.intent_id}"]
+        if a.required_fields:
+            parts.append("必填:" + ",".join(a.required_fields))
+        example = next((e for e in a.positive_examples if e), "")
+        if example:
+            parts.append("例:" + example.replace("\n", " ")[:48])
+        action_summaries.append(" ".join(parts))
 
     # 候选工单摘要（§6.2：只发编号/主题/位置/状态/进展）
     candidate_lines = ""
@@ -386,7 +384,7 @@ def _build_payload(
     system_prompt = (
         "你是钉钉群报修工单的语义分析助手。"
         "根据用户消息判断意图(intent)和抽取字段(fields)。\n\n"
-        f"发送人角色={message.sender_role}。协议版本={protocol.protocol_version}。\n"
+        f"发送人角色={sender_role}。协议版本={protocol.protocol_version}。\n"
         "可用的意图(id)：\n"
         + "\n".join(action_summaries)
         + "\n\n规则：\n"

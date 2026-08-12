@@ -165,7 +165,7 @@ class OpenAICompatibleModelClient:
             "model": self.model,
             "messages": messages,
             "temperature": 0.0,
-            "max_tokens": 1024,
+            "max_tokens": 512,
             "response_format": response_format_body,
         }
 
