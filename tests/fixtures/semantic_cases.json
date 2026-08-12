@@ -1,0 +1,115 @@
+[
+  {
+    "_说明": "人工标签语义测试集（Task 3）。覆盖 12 种场景：报修/诊断/维修方式/超时原因/完毕/取消/重开/补充/澄清/闲聊/越权/字段缺失。2026-08-12：全部改为不带 # 的自然语言，用于评测云端模型路径。",
+    "id": "C01",
+    "text": "博物馆奇妙夜第一个房间的门下沉明显，开门时发生剐蹭，希望3天内能修好",
+    "expected_intent": "ticket.create",
+    "expected_fields": {
+      "subject": "博物馆奇妙夜",
+      "location": "第一个房间的门",
+      "problem_description": "门下沉明显，开门时发生剐蹭",
+      "sla": "3天"
+    },
+    "has_keyword": false,
+    "notes": "自然语言报修（原 #报修 用例）"
+  },
+  {
+    "id": "C02",
+    "text": "我检查了一下，判断是门体明显下沉，另外上侧合页也存在松动",
+    "expected_intent": "ticket.diagnosis.submit",
+    "expected_fields": {
+      "diagnosis_items": ["门体明显下沉", "上侧合页存在松动"]
+    },
+    "has_keyword": false,
+    "notes": "自然语言故障判断（原 #故障判断 用例）"
+  },
+  {
+    "id": "C03",
+    "text": "这个门我们打算淘宝采购后自行维修，订单号是TB-2024-001",
+    "expected_intent": "ticket.repair_plan.submit",
+    "expected_fields": {
+      "repair_method": "淘宝采购后自行维修",
+      "order_no": "TB-2024-001"
+    },
+    "has_keyword": false,
+    "notes": "自然语言维修方式含订单号（原 #维修方式 用例）"
+  },
+  {
+    "id": "C04",
+    "text": "这次没按时完成是因为新合页物流延迟，未能按期到货",
+    "expected_intent": "ticket.timeout_reason.submit",
+    "expected_fields": {
+      "timeout_reason": "新合页物流延迟，未能按期到货"
+    },
+    "has_keyword": false,
+    "notes": "自然语言超时原因（原 #超时原因 用例）"
+  },
+  {
+    "id": "C05",
+    "text": "维修已经完成了，今天测试一切正常",
+    "expected_intent": "ticket.complete",
+    "expected_fields": {},
+    "has_keyword": false,
+    "notes": "自然语言完毕（原 #完毕 用例）"
+  },
+  {
+    "id": "C06",
+    "text": "这个工单取消吧，是误报，实际没有故障",
+    "expected_intent": "ticket.cancel",
+    "expected_fields": {
+      "cancel_reason": "误报，实际无故障"
+    },
+    "has_keyword": false,
+    "notes": "自然语言取消（原 #取消工单 用例）"
+  },
+  {
+    "id": "C07",
+    "text": "门又下沉了，需要重新维修，把工单重开吧",
+    "expected_intent": "ticket.reopen",
+    "expected_fields": {
+      "reopen_reason": "门再次下沉，需要重新维修"
+    },
+    "has_keyword": false,
+    "notes": "自然语言重开（原 #重开工单 用例）"
+  },
+  {
+    "id": "C08",
+    "text": "帮我查一下现在的工单是什么状态",
+    "expected_intent": "ticket.query",
+    "expected_fields": {},
+    "has_keyword": false,
+    "notes": "自然语言查询（原 #查询工单 用例）"
+  },
+  {
+    "id": "C09",
+    "text": "今天天气真好啊",
+    "expected_intent": "chat.ignore",
+    "expected_fields": {},
+    "has_keyword": false,
+    "notes": "闲聊——应忽略"
+  },
+  {
+    "id": "C10",
+    "text": "门坏了，能不能修一下",
+    "expected_intent": "ticket.create",
+    "expected_fields": {},
+    "has_keyword": false,
+    "notes": "疑问句但含明确故障描述（门坏了）→ 应建单（与 N10 标签一致）"
+  },
+  {
+    "id": "C11",
+    "text": "门坏了，位置在大厅，3天时效，先报修，修好之后就直接完毕",
+    "expected_intent": "system.clarify",
+    "expected_fields": {},
+    "has_keyword": false,
+    "notes": "自然语言双意图冲突（报修+完毕，原 #报修+#完毕 用例）→ system.clarify"
+  },
+  {
+    "id": "C12",
+    "text": "我要投诉！你们必须赔偿我的损失，给我补偿",
+    "expected_intent": "chat.ignore",
+    "expected_fields": {},
+    "has_keyword": false,
+    "notes": "协议外诉求（索赔/补偿，原 #补偿 用例）——不应命中任何 intent"
+  }
+]
