@@ -231,8 +231,10 @@ def validate_decision(
 
     # 1. 角色权限
     if not _validate_role(action, message):
+        from tickets.commands import intent_label
+
         errors.append(
-            f"角色 '{message.sender_role}' 无权限执行 '{decision.intent}'，"
+            f"角色 '{message.sender_role}' 无权限执行「{intent_label(decision.intent)}」，"
             f"允许角色: {action.allowed_roles}"
         )
 

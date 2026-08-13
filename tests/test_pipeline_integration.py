@@ -228,6 +228,26 @@ async def test_model_cancel_still_requires_confirmation(env):
         "SELECT processed_result FROM inbox_messages WHERE message_id='m2'").fetchone()
     assert row["processed_result"] == "WAITING_CONFIRMATION"
     assert _ticket(env.db, t1["ticket_no"])["status"] == "ACTIVE"
+    # 确认提示用中文可读文案，不暴露 intent ID
+    assert any("确认执行「取消工单」" in s for s in env.sent)
+    assert not any("ticket.cancel" in s for s in env.sent)
+
+
+@pytest.mark.asyncio
+async def test_system_clarify_shows_readable_message(env):
+    """system.clarify（消息有歧义）→ 直接可读澄清提示，不建「确认执行」待办。"""
+    env.classifier.responses["m1"] = SemanticDecision(
+        protocol_version="4.0.0", source="SEMANTIC_MODEL", intent="system.clarify",
+        target_ticket_no=None, intent_confidence=0.9,
+        evidence=("报修", "完毕"))
+    await env.process("先报修一下门坏了，然后又完毕了", "m1")
+    row = env.db.connect().execute(
+        "SELECT processed_result FROM inbox_messages WHERE message_id='m1'").fetchone()
+    assert row["processed_result"] == "CLARIFY"
+    # 不创建待确认，也不出现「确认执行：system.clarify」
+    assert env.db.get_waiting_pending("G1", "uid-mgr") is None
+    assert any("有歧义" in s for s in env.sent)
+    assert not any("system.clarify" in s for s in env.sent)
 
 
 @pytest.mark.asyncio

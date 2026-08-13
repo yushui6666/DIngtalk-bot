@@ -132,6 +132,10 @@ class MessageProcessingPipeline:
         if decision.intent == "chat.ignore":
             return self._complete(item, msg, "IGNORED")
 
+        # 需要澄清：消息有歧义（如同时含多个业务动作）→ 直接问用户，不建待确认
+        if decision.intent == "system.clarify":
+            return self._handle_clarify(item, msg, decision)
+
         candidates = self._repo.snapshot_candidates(msg.group_id)
 
         # 选择工单：建立用户上下文（不走执行器）
@@ -410,6 +414,17 @@ class MessageProcessingPipeline:
         return self._complete(item, msg, "EXECUTED")
 
     # ─────────────────────── 澄清/确认待办 ───────────────────────
+    def _handle_clarify(
+        self, item: dict[str, Any], msg: NormalizedMessage, decision: SemanticDecision
+    ) -> str:
+        """消息有歧义 → 用可读文案直接请用户澄清，不建待确认。"""
+        text = "⚠️ 这条消息有歧义，我无法确定你要做什么。"
+        if decision.evidence:
+            text += f"\n涉及：{'、'.join(decision.evidence)}"
+        text += "\n请明确说明要执行的操作（如「报修」「完成」「取消」等）。"
+        self._notifier.send_group_now(msg.group_id, text, message_id=msg.message_id)
+        return self._complete(item, msg, "CLARIFY")
+
     def _create_clarify_pending(
         self,
         item: dict[str, Any],
@@ -457,8 +472,11 @@ class MessageProcessingPipeline:
         )
         self._pending.create_or_supersede(draft, datetime.now())
         ticket_no = decision.target_ticket_no or (target.ticket_no if target else "该工单")
+        from tickets.commands import intent_label
+
+        label = intent_label(decision.intent)
         self._notifier.send_group_now(
-            msg.group_id, f"确认执行：{decision.intent}（{ticket_no}）？回复「确认」继续。",
+            msg.group_id, f"确认执行「{label}」（{ticket_no}）？回复「确认」继续。",
             message_id=msg.message_id,
         )
         return self._complete(item, msg, "WAITING_CONFIRMATION")

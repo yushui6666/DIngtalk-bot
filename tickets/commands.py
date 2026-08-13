@@ -16,6 +16,30 @@ ALLOWED_EXECUTORS = frozenset({
     "correct_pending_action", "ignore_message",
 })
 
+# 意图 → 中文可读文案（用户看到的提示/回执用，避免出现 system.clarify 这类英文 ID）
+INTENT_LABELS: dict[str, str] = {
+    "ticket.create": "报修建单",
+    "ticket.add_detail": "补充工单信息",
+    "ticket.diagnosis.submit": "记录故障判断",
+    "ticket.repair_plan.submit": "提交维修方式/订单号",
+    "ticket.timeout_reason.submit": "提交超时原因",
+    "ticket.complete": "完成工单",
+    "ticket.cancel": "取消工单",
+    "ticket.reopen": "重开工单",
+    "ticket.query": "查询工单",
+    "ticket.select": "选择工单",
+    "system.clarify": "需要您澄清",
+    "system.confirm_pending_action": "确认待办",
+    "system.reject_pending_action": "拒绝待办",
+    "system.correct_pending_action": "修正待办",
+    "chat.ignore": "忽略（闲聊）",
+}
+
+
+def intent_label(intent: str) -> str:
+    """意图 ID → 中文文案；未映射时原样返回。"""
+    return INTENT_LABELS.get(intent, intent)
+
 
 def reply_text(intent: str, ticket: dict[str, Any] | None, fields: dict[str, Any]) -> str:
     """根据意图与执行后的工单生成群内回复。"""
