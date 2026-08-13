@@ -147,6 +147,35 @@ async def test_bare_order_number_registers_and_extends(env):
 
 
 @pytest.mark.asyncio
+async def test_multiple_orders_with_diagnosis_registered(env):
+    """「估计是铰链坏了，采购了2个，单号是X和Y」→ 全部订单登记+延期 + 记录诊断。"""
+    ticket = await _create_ticket(env)
+    before = ticket["current_deadline_at"]
+    msg = NormalizedMessage(
+        message_id="r-multi", group_id="G1", sender_id="eng", sender_name="工程师",
+        content="估计是铰链坏了，采购了2个，单号是5127629004214178517和5127628896203022943",
+        message_type="text", sent_at=datetime.now(), sender_role="ENGINEER",
+    )
+    env.db.enqueue_message(msg)
+    row = env.db.connect().execute("SELECT * FROM inbox_messages WHERE message_id='r-multi'").fetchone()
+    await env.pipeline.process(dict(row))
+    # 两个订单都登记
+    assert env.db.get_order_monitor("5127629004214178517") is not None
+    assert env.db.get_order_monitor("5127628896203022943") is not None
+    # 工单延期 +6 天（每单 +3）
+    fresh = env.db.get_ticket(ticket["id"])
+    expected = (datetime.strptime(before, "%Y-%m-%d %H:%M:%S") + timedelta(days=6)).strftime("%Y-%m-%d %H:%M:%S")
+    assert fresh["current_deadline_at"] == expected
+    # 诊断一并记录
+    diag = env.db.connect().execute(
+        "SELECT items_json FROM diagnosis_versions WHERE ticket_id=? AND is_current=1", (ticket["id"],)
+    ).fetchone()
+    assert diag is not None and "铰链" in diag["items_json"]
+    # 回执包含两个订单号
+    assert any("5127629004214178517" in s and "5127628896203022943" in s for s in env.sent)
+
+
+@pytest.mark.asyncio
 async def test_duplicate_order_no_single_extension(env):
     ticket = await _create_ticket(env)
     await _submit_order(env, "TB-2024-0001", "r1")

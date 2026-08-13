@@ -157,9 +157,15 @@ class TicketCommandExecutor:
                     ticket["id"], command.message_id,
                     repair_method, fields.get("order_no"), command.actor_id)
             else:
-                # 只发订单号（无维修方式，如裸单号消息）：不写空的维修方式版本，
+                # 只发订单号（无维修方式，如裸单号/诊断+订单消息）：不写空的维修方式版本，
                 # 也不发「已记录维修方式」通知（订单登记+延期由 pipeline 负责并已回执）
                 suppress_notify = True
+            # 同一消息顺带提交了故障判断（如「估计是铰链坏了，单号是…」）→ 一并记录
+            diagnosis_items = fields.get("diagnosis_items")
+            if diagnosis_items:
+                self._db.add_diagnosis_version(
+                    ticket["id"], command.message_id,
+                    [str(x) for x in diagnosis_items], command.actor_id)
         elif kind == "timeout":
             self._db.add_timeout_cycle_reason(ticket["id"], command.message_id,
                                               fields.get("timeout_reason", ""), command.actor_id)

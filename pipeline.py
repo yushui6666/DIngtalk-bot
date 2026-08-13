@@ -231,44 +231,55 @@ class MessageProcessingPipeline:
 
         if cmd.intent != "ticket.repair_plan.submit" or result.status != RESULT_OK:
             return
-        order_no = cmd.fields.get("order_no")
-        if not order_no or result.ticket_id is None:
+        order_nos = cmd.fields.get("order_nos") or [cmd.fields.get("order_no")]
+        order_nos = [str(o).strip() for o in order_nos if str(o).strip()]
+        if not order_nos or result.ticket_id is None:
             return
         ticket = self._db.get_ticket(result.ticket_id)
         if ticket is None:
             return
 
-        # 已登记过 → 每单只延期一次，不重复
-        if self._db.get_order_monitor(order_no) is not None:
-            logger.info("订单已登记过，跳过延期 order=%s ticket=%s", order_no, ticket["ticket_no"])
-            return
+        registered: list[str] = []
+        days = 0
+        for order_no in order_nos:
+            # 已登记过 → 每单只延期一次，不重复
+            if self._db.get_order_monitor(order_no) is not None:
+                logger.info("订单已登记过，跳过 order=%s ticket=%s", order_no, ticket["ticket_no"])
+                continue
+            current = self._db.get_ticket(result.ticket_id)
+            extended = self._db.extend_ticket_deadline(
+                result.ticket_id, current["version"], ORDER_EXTEND_DAYS
+            )
+            if not extended:
+                logger.warning("工单延期失败（版本冲突）order=%s ticket=%s", order_no, ticket["ticket_no"])
+            self._db.upsert_order_monitor(
+                order_id=order_no, ticket_id=result.ticket_id,
+                store=ticket["store_name"], ticket_no=ticket["ticket_no"],
+            )
+            append_order_row(
+                ORDER_STORE_TABLE_PATH, order_id=order_no,
+                store=ticket["store_name"], ticket_no=ticket["ticket_no"],
+            )
+            registered.append(order_no)
+            days += ORDER_EXTEND_DAYS
 
-        extended = self._db.extend_ticket_deadline(
-            result.ticket_id, ticket["version"], ORDER_EXTEND_DAYS
-        )
-        if not extended:
-            logger.warning("工单延期失败（版本冲突）order=%s ticket=%s", order_no, ticket["ticket_no"])
-        self._db.upsert_order_monitor(
-            order_id=order_no, ticket_id=result.ticket_id,
-            store=ticket["store_name"], ticket_no=ticket["ticket_no"],
-        )
-        append_order_row(
-            ORDER_STORE_TABLE_PATH, order_id=order_no,
-            store=ticket["store_name"], ticket_no=ticket["ticket_no"],
-        )
+        if not registered:
+            return  # 全部已登记过，无需再回复
 
-        fresh = self._db.get_ticket(result.ticket_id) if extended else ticket
+        fresh = self._db.get_ticket(result.ticket_id)
+        order_text = "、".join(registered)
         text = (
-            f"📦 订单 {order_no} 已登记，工单 {ticket['ticket_no']} "
-            f"自动延期 {ORDER_EXTEND_DAYS} 天（新截止 {fresh['current_deadline_at']}）。"
+            f"📦 订单 {order_text} 已登记，工单 {ticket['ticket_no']} "
+            f"自动延期 {days} 天（新截止 {fresh['current_deadline_at']}）。"
         )
-        # 若对账表已导入该订单，附注收货地址（增强）
-        order = self._db.get_taobao_order(order_no) if hasattr(self._db, "get_taobao_order") else None
+        # 若对账表已导入首个订单，附注收货地址（增强）
+        order = self._db.get_taobao_order(registered[0]) if hasattr(self._db, "get_taobao_order") else None
         if order and order.get("address"):
             text += f"\n📍 收货地址：{order['address']}"
         self._notifier.send_group_now(msg.group_id, text, message_id=msg.message_id)
         logger.info(
-            "订单已登记+延期 order=%s ticket=%s days=%d", order_no, ticket["ticket_no"], ORDER_EXTEND_DAYS
+            "订单已登记+延期 orders=%s ticket=%s days=%d",
+            order_text, ticket["ticket_no"], days,
         )
 
     # ─────────────────────── 决策 ───────────────────────
@@ -277,18 +288,28 @@ class MessageProcessingPipeline:
         if keyword is not None:
             logger.info("关键词快路径命中 msg=%s intent=%s", msg.message_id, keyword.intent)
             return keyword
-        # 订单号快路径：消息基本就是一个淘宝订单号（如「单号 5125…」）→ 视为提交订单
-        order_no = _extract_bare_order_no(msg.content)
-        if order_no:
-            logger.info("订单号快路径命中 msg=%s order_no=%s", msg.message_id, order_no)
+        # 订单号快路径：消息里含订单号（可混有故障判断）→ 视为提交订单，全部登记
+        order_numbers = _extract_order_numbers(msg.content)
+        if order_numbers:
+            fields: dict[str, Any] = {
+                "order_no": order_numbers[0],
+                "order_nos": order_numbers,
+            }
+            diagnosis = _extract_diagnosis_text(msg.content, order_numbers)
+            if diagnosis:
+                fields["diagnosis_items"] = [diagnosis]
+            logger.info(
+                "订单号快路径命中 msg=%s orders=%s diagnosis=%s",
+                msg.message_id, order_numbers, bool(diagnosis),
+            )
             return SemanticDecision(
                 protocol_version=self._protocol.protocol_version,
                 source="local",
                 intent="ticket.repair_plan.submit",
                 target_ticket_no=None,
                 intent_confidence=1.0,
-                fields={"order_no": order_no},
-                evidence=("bare_order_no",),
+                fields=fields,
+                evidence=("order_numbers",),
             )
         if not self._llm_enabled:
             logger.info("模型未启用 msg=%s 走降级 ignore", msg.message_id)
@@ -584,24 +605,38 @@ class MessageProcessingPipeline:
 
 # ─────────────────────── 工具 ───────────────────────
 
-# 裸订单号识别：消息基本就是一个淘宝订单号（可能带「单号/订单号」前缀）
-_ORDER_PREFIXES = ("淘宝订单号", "订单号", "快递单号", "物流单号", "单号")
-_ORDER_NO_RE = re.compile(r"^[A-Za-z0-9-]{6,64}$")
+# 订单号识别：从消息中提取全部淘宝订单号（纯数字 15+ 位，或含字母连字符的订单串）
+_ORDER_NO_RE = re.compile(r"(?<![A-Za-z0-9-])[A-Za-z0-9-]{6,64}(?![A-Za-z0-9-])")
 _STRIP_PUNCT = "，。！？、；：…,.;:!? "
 
+# 诊断提示词：判断消息其余部分像不像故障判断
+_DIAGNOSIS_CUES = ("判断", "估计", "应该", "可能", "坏", "故障", "漏", "打不开", "不亮", "失灵", "松动", "断开", "断")
 
-def _extract_bare_order_no(content: str) -> str | None:
-    """消息内容几乎只含一个订单号时返回它，否则返回 None。"""
-    text = content.strip().strip(_STRIP_PUNCT)
-    for prefix in _ORDER_PREFIXES:
-        if text.startswith(prefix):
-            text = text[len(prefix):].strip().strip(_STRIP_PUNCT)
-            break
-    if not text or not _ORDER_NO_RE.match(text):
-        return None
-    # 至少含 6 个数字，避免把短文本/编号误判成订单号
-    digits = sum(ch.isdigit() for ch in text)
-    return text if digits >= 6 else None
+
+def _extract_order_numbers(content: str) -> list[str]:
+    """从消息中提取全部订单号（去重、保序）。至少含 6 个数字才算。"""
+    result: list[str] = []
+    for token in _ORDER_NO_RE.findall(content or ""):
+        if sum(ch.isdigit() for ch in token) >= 6 and token not in result:
+            result.append(token)
+    return result
+
+
+def _extract_diagnosis_text(content: str, order_numbers: list[str]) -> str | None:
+    """从消息里剥离订单号/采购表述后，按标点切段，保留像故障判断的段落。"""
+    text = content or ""
+    for ono in order_numbers:
+        text = text.replace(ono, " ")
+    for word in ("淘宝订单号", "订单号", "单号", "采购", "买了", "购买", "下单"):
+        text = text.replace(word, " ")
+    segments = re.split(r"[，。！？、；：,\n]", text)
+    kept = [
+        seg.strip(_STRIP_PUNCT)
+        for seg in segments
+        if len(seg.strip(_STRIP_PUNCT)) >= 2
+        and any(cue in seg for cue in _DIAGNOSIS_CUES)
+    ]
+    return "；".join(kept) if kept else None
 
 
 def _row_to_message(row: dict[str, Any]) -> NormalizedMessage:
