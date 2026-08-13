@@ -311,6 +311,24 @@ class MessageProcessingPipeline:
                 fields=fields,
                 evidence=("order_numbers",),
             )
+        # 候选选择快路径：消息是「2」「选2」「第二个」→ 选第 N 个活动工单
+        selection_no = _extract_selection_number(msg.content)
+        if selection_no is not None:
+            candidates = self._repo.snapshot_candidates(msg.group_id)
+            if 1 <= selection_no <= len(candidates):
+                target = candidates[selection_no - 1]
+                logger.info(
+                    "选择快路径命中 msg=%s no=%d → %s",
+                    msg.message_id, selection_no, target.ticket_no,
+                )
+                return SemanticDecision(
+                    protocol_version=self._protocol.protocol_version,
+                    source="local",
+                    intent="ticket.select",
+                    target_ticket_no=target.ticket_no,
+                    intent_confidence=1.0,
+                    evidence=(f"selection:{selection_no}",),
+                )
         if not self._llm_enabled:
             logger.info("模型未启用 msg=%s 走降级 ignore", msg.message_id)
             return SemanticDecision(
@@ -323,8 +341,14 @@ class MessageProcessingPipeline:
             )
         candidates = self._repo.snapshot_candidates(msg.group_id)
         pending = self._pending.get_waiting(msg.group_id, msg.sender_id)
-        logger.info("调用云端模型 msg=%s candidates=%d", msg.message_id, len(candidates))
-        return await self._classifier.classify(msg, candidates=candidates, pending_action=pending)
+        history = self._db.list_recent_group_messages(
+            msg.group_id, limit=8, exclude_message_id=msg.message_id
+        )
+        logger.info("调用云端模型 msg=%s candidates=%d history=%d",
+                    msg.message_id, len(candidates), len(history))
+        return await self._classifier.classify(
+            msg, candidates=candidates, pending_action=pending, history=history
+        )
 
     def _save_decision(self, msg: NormalizedMessage, decision: SemanticDecision) -> None:
         try:
@@ -637,6 +661,28 @@ def _extract_diagnosis_text(content: str, order_numbers: list[str]) -> str | Non
         and any(cue in seg for cue in _DIAGNOSIS_CUES)
     ]
     return "；".join(kept) if kept else None
+
+
+_CHINESE_DIGITS = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+                   "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+
+
+def _extract_selection_number(content: str) -> int | None:
+    """消息是否是一个候选序号选择（如「2」「选2」「2号」「第二个」），是则返回序号。"""
+    text = (content or "").strip()
+    m = re.fullmatch(r"(?:选|选择|第)?\s*(\d{1,2})\s*(?:号|个|张)?", text)
+    if m:
+        n = int(m.group(1))
+        if 1 <= n <= 20:
+            return n
+    m = re.fullmatch(r"(?:选|选择|第)?\s*([一二两三四五六七八九十]{1,2})\s*(?:号|个|张)?", text)
+    if m:
+        digits = [d for d in m.group(1) if d in _CHINESE_DIGITS]
+        if len(digits) == 1:
+            n = _CHINESE_DIGITS[digits[0]]
+            if 1 <= n <= 20:
+                return n
+    return None
 
 
 def _row_to_message(row: dict[str, Any]) -> NormalizedMessage:

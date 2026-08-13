@@ -35,7 +35,7 @@ class FakeClassifier:
     def __init__(self) -> None:
         self.responses: dict[str, SemanticDecision] = {}
 
-    async def classify(self, message, candidates=None, pending_action=None) -> SemanticDecision:
+    async def classify(self, message, candidates=None, pending_action=None, history=None) -> SemanticDecision:
         return self.responses.get(
             message.message_id,
             SemanticDecision(protocol_version="4.0.0", source="SEMANTIC_MODEL",
@@ -78,7 +78,7 @@ def env(tmp_path):
 
     yield SimpleNamespace(
         db=db, sent=sent, classifier=classifier, process=process,
-        make_pipeline=make_pipeline,
+        make_pipeline=make_pipeline, context=context,
     )
     db.close()
 
@@ -230,6 +230,23 @@ async def test_suffix_number_routes_to_correct_ticket(env):
     assert _ticket(env.db, t002["ticket_no"])["status"] == "COMPLETED"
     other = next(t for t in act if t["id"] != t002["id"])
     assert _ticket(env.db, other["ticket_no"])["status"] == "ACTIVE"
+
+
+@pytest.mark.asyncio
+async def test_number_reply_selects_nth_candidate_locally(env):
+    """AI 列候选后回「2」→ 本地直接选第 2 个候选，不调模型（2026-08-13）。"""
+    await env.process("#报修\n主题：博物馆奇妙夜\n位置：一楼\n问题描述：门坏了\n时效：1天", "m1")
+    await env.process("#报修\n主题：博物馆奇妙夜\n位置：二楼\n问题描述：门又坏了\n时效：3天", "m2")
+    act = _active(env.db)
+    assert len(act) == 2
+    await env.process("2", "m3")
+    ctx = env.context.get_active("G1", "uid-mgr", datetime.now())
+    assert ctx == act[1]["id"]  # 第 2 个候选
+    assert any(f"已切换到工单 {act[1]['ticket_no']}" in s for s in env.sent)
+    # 中文「第二个」同样生效
+    await env.process("第一个", "m4")
+    ctx2 = env.context.get_active("G1", "uid-mgr", datetime.now())
+    assert ctx2 == act[0]["id"]
 
 
 @pytest.mark.asyncio

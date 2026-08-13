@@ -101,12 +101,13 @@ class SemanticClassifier:
         message: NormalizedMessage,
         candidates: list[TicketCandidate] | None = None,
         pending_action: PendingAction | None = None,
+        history: list[dict[str, Any]] | None = None,
     ) -> SemanticDecision:
         """对自然语言消息做语义分类。
 
         流程（§7 消息处理流程）：
         1. 关键词已命中 → 跳过模型（source 标记 keyword_already_matched）；
-        2. 组装 prompt + schema；
+        2. 组装 prompt + schema（含最近群消息上下文）；
         3. 单次 HTTP 调用模型；
         4. 校验 intent 在协议内；
         5. 过滤幻觉字段 + 枚举值校验；
@@ -116,10 +117,8 @@ class SemanticClassifier:
             message: 标准化群消息。
             candidates: 当前群的活动工单候选列表（多工单路由）。
             pending_action: 当前待确认动作（用于上下文）。
-
-        Returns:
-            SemanticDecision。失败时降级为 ``chat.ignore``，
-            不抛异常（上层 Inbox Worker 决定重试策略）。
+            history: 该群最近消息（时间正序），供模型理解「2」「005完成了」等
+                依赖上文的表达。
         """
         candidates = candidates or []
 
@@ -154,7 +153,7 @@ class SemanticClassifier:
             )
 
         # 2. 组装 prompt 和 schema
-        payload = _build_payload(message, candidates, pending_action, self._protocol)
+        payload = _build_payload(message, candidates, pending_action, self._protocol, history=history)
         schema = _build_output_schema(self._protocol)
 
         # 3. 调用模型（单次，不内部重试）
@@ -337,6 +336,7 @@ def _build_payload(
     candidates: list[TicketCandidate],
     pending_action: PendingAction | None,
     protocol: TicketProtocol,
+    history: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """组装模型请求 payload（§10.2 模型输入）。
 
@@ -345,6 +345,9 @@ def _build_payload(
       （分类不需要，本地校验兜底）；
     - 按发送人角色裁剪动作子集（system.* 无角色限制始终保留）；
     - 每个动作只保留必填字段 + 一条截断正例。
+
+    上下文（2026-08-13）：附带最近群消息，帮助模型理解「2」「005完成了」等
+    依赖上文的表达。
     """
     sender_role = message.sender_role
     action_summaries: list[str] = []
@@ -405,6 +408,15 @@ def _build_payload(
         system_prompt += candidate_lines
     if pending_line:
         system_prompt += pending_line
+
+    # 最近群消息上下文（供模型理解「2」「005完成了」「第二个」等依赖上文的表达）
+    if history:
+        history_lines = "\n最近群消息（供理解上下文，勿直接引用，当前消息是最后一句）：\n"
+        for h in history:
+            sender = h.get("sender_name") or h.get("sender_role") or h.get("sender_id") or "?"
+            content = str(h.get("content") or "")[:120]
+            history_lines += f"[{sender}] {content}\n"
+        system_prompt += history_lines
 
     # 用户消息作为不可信数据字段（§10.4 提示注入防护）
     return {

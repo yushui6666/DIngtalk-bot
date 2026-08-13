@@ -562,6 +562,26 @@ class Database:
         ).fetchall()
         return [r["group_id"] for r in rows]
 
+    def list_recent_group_messages(
+        self, group_id: str, limit: int = 8, exclude_message_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """取某群最近 N 条消息（含系统回执），时间正序，供模型理解上下文。
+
+        从收件箱取（含忽略/澄清消息），排除当前这条；按 (sent_at, message_id) 取最近 N 条。
+        """
+        exclude = "AND message_id != ?" if exclude_message_id else ""
+        params: list[Any] = [group_id]
+        if exclude_message_id:
+            params.append(exclude_message_id)
+        rows = self.connect().execute(
+            f"""SELECT message_id, sender_id, sender_role, content, sent_at
+                FROM inbox_messages
+                WHERE group_id=? {exclude}
+                ORDER BY sent_at DESC, message_id DESC LIMIT ?""",
+            (*params, limit),
+        ).fetchall()
+        return [dict(r) for r in reversed(rows)]
+
     def inbox_set_status(
         self,
         message_id: str,

@@ -43,7 +43,7 @@ class SlowClassifier:
         self.active = 0
         self.max_active = 0
 
-    async def classify(self, message, candidates=None, pending_action=None) -> SemanticDecision:
+    async def classify(self, message, candidates=None, pending_action=None, history=None) -> SemanticDecision:
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         try:

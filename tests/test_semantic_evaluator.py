@@ -398,7 +398,7 @@ async def test_live_model_evaluator_uses_classifier_predictions():
     from semantics.types import SemanticDecision
 
     class FakeClassifier:
-        async def classify(self, message, candidates):
+        async def classify(self, message, candidates, history=None):
             assert message.sender_role == "ENGINEER"
             assert [candidate.ticket_no for candidate in candidates] == ["T001"]
             return SemanticDecision(
@@ -438,7 +438,7 @@ async def test_run_eval_passes_dataset_candidates_to_classifier():
     from semantics.types import SemanticDecision
 
     class FakeClassifier:
-        async def classify(self, message, candidates):
+        async def classify(self, message, candidates, history=None):
             assert message.sender_role == "MANAGER"
             assert [candidate.ticket_no for candidate in candidates] == ["T001", "T002"]
             return SemanticDecision(
