@@ -106,6 +106,20 @@ async def test_order_submit_extends_ticket_and_registers(env):
 
 
 @pytest.mark.asyncio
+async def test_order_submit_by_any_role(env):
+    """订单号人人可发（店长/工程师/其他成员），不只工程师（2026-08-12）。"""
+    await _create_ticket(env)
+    msg = NormalizedMessage(message_id="r-staff", group_id="G1", sender_id="staff", sender_name="店员",
+                            content="#维修方式\n维修方式：淘宝采购后自行维修\n订单号：TB-ANY-0001",
+                            message_type="text", sent_at=datetime.now(), sender_role="OTHER")
+    env.db.enqueue_message(msg)
+    row = env.db.connect().execute("SELECT * FROM inbox_messages WHERE message_id='r-staff'").fetchone()
+    await env.pipeline.process(dict(row))
+    assert env.db.get_order_monitor("TB-ANY-0001") is not None
+    assert any("已登记" in s for s in env.sent)
+
+
+@pytest.mark.asyncio
 async def test_duplicate_order_no_single_extension(env):
     ticket = await _create_ticket(env)
     await _submit_order(env, "TB-2024-0001", "r1")

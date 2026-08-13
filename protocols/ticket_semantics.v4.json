@@ -2,7 +2,7 @@
   "protocol_version": "4.0.0",
   "compiled_at": "2026-08-12T10:19:26+08:00",
   "compiled_by": "protocol_compiler",
-  "source_sha256": "df7e03ef1ec31b257ad7b45ae109fdffa39d420e4d759839502732f6e3b6adfd",
+  "source_sha256": "b82c9eac59e68e6ae28e06524be7cf0b35304991967b060170c0e80a48ef7e51",
   "actions": [
     {
       "intent_id": "ticket.add_detail",
@@ -428,7 +428,9 @@
       ],
       "semantic_enabled": true,
       "allowed_roles": [
-        "ENGINEER"
+        "ENGINEER",
+        "MANAGER",
+        "OTHER"
       ],
       "allowed_ticket_states": [
         "ACTIVE",
