@@ -165,7 +165,7 @@ class OpenAICompatibleModelClient:
             "model": self.model,
             "messages": messages,
             "temperature": 0.0,
-            "max_tokens": 512,
+            "max_tokens": 1024,  # build 类完整 JSON 含多字段，512 会截断
             "response_format": response_format_body,
         }
 
