@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import replace
 from datetime import datetime
 from enum import StrEnum
@@ -272,6 +273,19 @@ class MessageProcessingPipeline:
         if keyword is not None:
             logger.info("关键词快路径命中 msg=%s intent=%s", msg.message_id, keyword.intent)
             return keyword
+        # 订单号快路径：消息基本就是一个淘宝订单号（如「单号 5125…」）→ 视为提交订单
+        order_no = _extract_bare_order_no(msg.content)
+        if order_no:
+            logger.info("订单号快路径命中 msg=%s order_no=%s", msg.message_id, order_no)
+            return SemanticDecision(
+                protocol_version=self._protocol.protocol_version,
+                source="local",
+                intent="ticket.repair_plan.submit",
+                target_ticket_no=None,
+                intent_confidence=1.0,
+                fields={"order_no": order_no},
+                evidence=("bare_order_no",),
+            )
         if not self._llm_enabled:
             logger.info("模型未启用 msg=%s 走降级 ignore", msg.message_id)
             return SemanticDecision(
@@ -551,6 +565,25 @@ class MessageProcessingPipeline:
 
 
 # ─────────────────────── 工具 ───────────────────────
+
+# 裸订单号识别：消息基本就是一个淘宝订单号（可能带「单号/订单号」前缀）
+_ORDER_PREFIXES = ("淘宝订单号", "订单号", "快递单号", "物流单号", "单号")
+_ORDER_NO_RE = re.compile(r"^[A-Za-z0-9-]{6,64}$")
+_STRIP_PUNCT = "，。！？、；：…,.;:!? "
+
+
+def _extract_bare_order_no(content: str) -> str | None:
+    """消息内容几乎只含一个订单号时返回它，否则返回 None。"""
+    text = content.strip().strip(_STRIP_PUNCT)
+    for prefix in _ORDER_PREFIXES:
+        if text.startswith(prefix):
+            text = text[len(prefix):].strip().strip(_STRIP_PUNCT)
+            break
+    if not text or not _ORDER_NO_RE.match(text):
+        return None
+    # 至少含 6 个数字，避免把短文本/编号误判成订单号
+    digits = sum(ch.isdigit() for ch in text)
+    return text if digits >= 6 else None
 
 
 def _row_to_message(row: dict[str, Any]) -> NormalizedMessage:

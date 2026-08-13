@@ -120,6 +120,31 @@ async def test_order_submit_by_any_role(env):
 
 
 @pytest.mark.asyncio
+async def test_bare_order_number_registers_and_extends(env):
+    """群里只发一个订单号（如「单号 5125…」）→ 视为提交订单：登记+延期（2026-08-13）。"""
+    ticket = await _create_ticket(env)
+    before = ticket["current_deadline_at"]
+    msg = NormalizedMessage(message_id="r-bare", group_id="G1", sender_id="eng", sender_name="工程师",
+                            content="单号 5125938806116169335",
+                            message_type="text", sent_at=datetime.now(), sender_role="ENGINEER")
+    env.db.enqueue_message(msg)
+    row = env.db.connect().execute("SELECT * FROM inbox_messages WHERE message_id='r-bare'").fetchone()
+    await env.pipeline.process(dict(row))
+    # 订单登记 + 工单延期
+    monitor = env.db.get_order_monitor("5125938806116169335")
+    assert monitor is not None and monitor["ticket_id"] == ticket["id"]
+    fresh = env.db.get_ticket(ticket["id"])
+    expected = (datetime.strptime(before, "%Y-%m-%d %H:%M:%S") + timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S")
+    assert fresh["current_deadline_at"] == expected
+    # 不写空的维修方式版本
+    rows = env.db.connect().execute(
+        "SELECT COUNT(*) FROM repair_method_versions WHERE ticket_id=?", (ticket["id"],)
+    ).fetchone()[0]
+    assert rows == 0
+    assert any("已登记" in s for s in env.sent)
+
+
+@pytest.mark.asyncio
 async def test_duplicate_order_no_single_extension(env):
     ticket = await _create_ticket(env)
     await _submit_order(env, "TB-2024-0001", "r1")

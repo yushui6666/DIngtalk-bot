@@ -150,9 +150,13 @@ class TicketCommandExecutor:
             self._db.add_diagnosis_version(ticket["id"], command.message_id,
                                            list(fields.get("diagnosis_items", [])), command.actor_id)
         elif kind == "repair":
-            self._db.add_repair_method_version(
-                ticket["id"], command.message_id,
-                fields.get("repair_method", ""), fields.get("order_no"), command.actor_id)
+            repair_method = fields.get("repair_method", "")
+            if repair_method:
+                self._db.add_repair_method_version(
+                    ticket["id"], command.message_id,
+                    repair_method, fields.get("order_no"), command.actor_id)
+            # 只发订单号（无维修方式，如裸单号消息）时：不写空的维修方式版本，
+            # 订单登记+延期由 pipeline 的 _handle_order_submitted 负责。
         elif kind == "timeout":
             self._db.add_timeout_cycle_reason(ticket["id"], command.message_id,
                                               fields.get("timeout_reason", ""), command.actor_id)
