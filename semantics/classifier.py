@@ -397,8 +397,8 @@ def _build_payload(
         "- 用户从候选工单中明确选择编号或序号时，返回 ticket.select\n"
         "- 工程师使用‘可能’‘应该是’等保留表达给出具体故障判断时，仍可返回 ticket.diagnosis.submit，但应降低置信度\n"
         "- 疑问句但明确描述故障（含设备/位置/问题）时，仍返回 ticket.create；纯笼统询问、否定句返回 chat.ignore\n"
-        "- 完成工单(ticket.complete)、取消工单(ticket.cancel)、"
-        "重开工单(ticket.reopen) 只在用户非常确定时才返回\n"
+        "- 用户表示问题已解决、恢复正常、可以使用（如「正常了」「搞定了」「弄好了」「没问题了」「修好了」）→ 返回 ticket.complete\n"
+        "- 取消工单(ticket.cancel)、重开工单(ticket.reopen) 只在用户非常确定时才返回\n"
     )
 
     if candidate_lines:
