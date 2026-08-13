@@ -365,13 +365,13 @@ def _build_payload(
             parts.append("例:" + example.replace("\n", " ")[:48])
         action_summaries.append(" ".join(parts))
 
-    # 候选工单摘要（§6.2：只发编号/主题/位置/状态/进展）
+    # 候选工单摘要（§6.2：只发编号/主题/位置/状态/进展，带序号供「第N个」引用）
     candidate_lines = ""
     if candidates:
-        candidate_lines = "\n当前活动工单：\n"
-        for c in candidates:
+        candidate_lines = "\n当前活动工单（用户说「第N个」即指下面的第 N 项）：\n"
+        for i, c in enumerate(candidates, 1):
             candidate_lines += (
-                f"  - {c.ticket_no}: {c.subject} @ {c.location} "
+                f"  {i}. {c.ticket_no}: {c.subject} @ {c.location} "
                 f"summary={c.problem_summary} status={c.status} version={c.version}\n"
             )
 
@@ -398,6 +398,7 @@ def _build_payload(
         "- 如果消息没有明确报修/诊断/完成等意图，返回 chat.ignore\n"
         "- 同一消息包含两个或更多业务动作时，即使后一个动作是未来或条件动作，也返回 system.clarify\n"
         "- 用户从候选工单中明确选择编号或序号时，返回 ticket.select\n"
+        "- 用户说「第N个/第一个/第二个」指候选工单列表的第 N 项：据此确定目标工单，把该项的完整工单编号填入 ticket_no 字段，并返回用户实际意图（如「第一个完成了」→ ticket.complete 且 ticket_no=第1项编号）\n"
         "- 工程师使用‘可能’‘应该是’等保留表达给出具体故障判断时，仍可返回 ticket.diagnosis.submit，但应降低置信度\n"
         "- 疑问句但明确描述故障（含设备/位置/问题）时，仍返回 ticket.create；纯笼统询问、否定句返回 chat.ignore\n"
         "- 用户表示问题已解决、恢复正常、可以使用（如「正常了」「搞定了」「弄好了」「没问题了」「修好了」）→ 返回 ticket.complete\n"
