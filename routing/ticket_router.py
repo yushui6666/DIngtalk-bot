@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from models import NormalizedMessage
@@ -24,6 +25,7 @@ from semantics.types import (
 # 消息归属 link_type（§11.5 扩展）
 LINK_EXPLICIT = "EXPLICIT"
 LINK_QUOTE = "QUOTE"
+LINK_SUFFIX = "SUFFIX"
 LINK_CONTEXT = "CONTEXT"
 LINK_SEMANTIC = "SEMANTIC"
 LINK_SINGLE = "SINGLE"
@@ -72,6 +74,11 @@ class TicketRouter:
         if quoted_ticket_id is not None and quoted_ticket_id in id_map:
             return RouteResult(RouteDecision.ROUTED, quoted_ticket_id, candidate_ids, LINK_QUOTE, 1.0)
 
+        # 2.5 短编号后缀匹配：消息里的数字（如「005」「5号」）唯一对应某候选工单 → 归属
+        suffix_target = self._route_by_suffix(message, decision, group_candidates)
+        if suffix_target is not None:
+            return RouteResult(RouteDecision.ROUTED, suffix_target.ticket_id, candidate_ids, LINK_SUFFIX, 1.0)
+
         # 3. 用户短期选择上下文
         if selected_ticket_id is not None and selected_ticket_id in id_map:
             return RouteResult(RouteDecision.ROUTED, selected_ticket_id, candidate_ids, LINK_CONTEXT, 1.0)
@@ -92,6 +99,29 @@ class TicketRouter:
 
         # 7. 歧义 → 澄清
         return RouteResult(RouteDecision.CLARIFY, None, candidate_ids, None, 0.0)
+
+    def _route_by_suffix(
+        self,
+        message: NormalizedMessage,
+        decision: SemanticDecision,
+        group_candidates: list[TicketCandidate],
+    ) -> TicketCandidate | None:
+        """消息中的短编号（如「005」）唯一对应某候选工单的后缀 → 归属它。
+
+        只对需要既有工单的动作生效（排除新建）；数字至少 2 位，避免「3天内」
+        的「3」误命中「-003」。工单号形如 店名-主题-时效-005，取末段做后缀。
+        """
+        if decision.intent == "ticket.create":
+            return None
+        for num in re.findall(r"\d{2,}", message.content or ""):
+            normalized = num.lstrip("0")
+            matches = [
+                c for c in group_candidates
+                if c.ticket_no.rsplit("-", 1)[-1].lstrip("0") == normalized
+            ]
+            if len(matches) == 1:
+                return matches[0]
+        return None
 
     def _route_by_scores(
         self,

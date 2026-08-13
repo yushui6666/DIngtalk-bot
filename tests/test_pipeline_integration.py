@@ -215,6 +215,24 @@ async def test_model_complete_executes_directly(env):
 
 
 @pytest.mark.asyncio
+async def test_suffix_number_routes_to_correct_ticket(env):
+    """同群多张同主题工单时，消息里的短编号（如「002」）归到对应那张（2026-08-13）。"""
+    await env.process("#报修\n主题：博物馆奇妙夜\n位置：一楼\n问题描述：门坏了\n时效：1天", "m1")
+    await env.process("#报修\n主题：博物馆奇妙夜\n位置：二楼\n问题描述：门又坏了\n时效：3天", "m2")
+    act = _active(env.db)
+    assert len(act) == 2
+    t002 = next(t for t in act if t["ticket_no"].endswith("-002"))
+    # 模型识别为完成但没带编号；消息里的「002」应路由到 3天-002
+    env.classifier.responses["m3"] = SemanticDecision(
+        protocol_version="4.0.0", source="SEMANTIC_MODEL", intent="ticket.complete",
+        target_ticket_no=None, intent_confidence=0.95)
+    await env.process("002完成了", "m3")
+    assert _ticket(env.db, t002["ticket_no"])["status"] == "COMPLETED"
+    other = next(t for t in act if t["id"] != t002["id"])
+    assert _ticket(env.db, other["ticket_no"])["status"] == "ACTIVE"
+
+
+@pytest.mark.asyncio
 async def test_model_cancel_still_requires_confirmation(env):
     """取消/重开仍保持确认策略（高危误操作防护）。"""
     await env.process("#报修\n主题：收银机\n位置：前台\n问题描述：死机\n时效：1天", "m1")
