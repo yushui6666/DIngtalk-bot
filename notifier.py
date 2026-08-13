@@ -55,6 +55,25 @@ class Notifier:
         except Exception as exc:
             logger.warning("即时回复发送失败 group=%s err=%s", group_id, exc)
 
+    def send_deduped_group(self, group_id: str, text: str, *, dedupe_key: str) -> bool:
+        """按 dedupe_key 去重的群消息（同一 key 只发一次，用于定时提醒）。"""
+        notification_id = self._db.insert_notification(
+            dedupe_key=dedupe_key,
+            ticket_id=None,
+            notification_type="sla_remind",
+            target_type="group",
+            target_id=group_id,
+        )
+        if not notification_id:
+            return False
+        try:
+            self._sender(group_id, text)
+            self._db.mark_notification(notification_id, "SENT")
+            return True
+        except Exception as exc:
+            logger.warning("去重群消息发送失败 group=%s err=%s", group_id, exc)
+            return False
+
     def _build_text(self, item: dict[str, Any]) -> str:
         ticket = None
         if item["ticket_id"] is not None:

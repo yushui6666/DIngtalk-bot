@@ -125,27 +125,10 @@ def _build_pipeline(mode: str):
     return db, pipeline, notifier
 
 
-async def _scheduler(db) -> None:
-    """周期任务：待确认动作过期。"""
-    from routing.pending_actions import PendingActionService
-    from datetime import datetime
-
-    pending_service = PendingActionService(db)
-    while True:
-        try:
-            await asyncio.sleep(60)
-            expired = pending_service.expire_due(datetime.now())
-            if expired:
-                logger.info("待确认动作过期清理 count=%d", expired)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning("调度器异常 err=%s", exc)
-
-
 async def main(mode: str, duration: int | None, group_filter: str | None) -> None:
     from event_listener import run_listeners
     from workers.inbox_worker import InboxWorker
+    from workers.scheduler import SchedulerWorker
 
     db, pipeline, notifier = _build_pipeline(mode)
 
@@ -165,11 +148,12 @@ async def main(mode: str, duration: int | None, group_filter: str | None) -> Non
         notifier=notifier,
         group_ids=[g["group_id"] for g in groups],
     )
+    scheduler = SchedulerWorker(db=db, notifier=notifier)
 
     tasks = [
         asyncio.create_task(run_listeners(groups, inbox_handler)),
         asyncio.create_task(worker.run()),
-        asyncio.create_task(_scheduler(db)),
+        asyncio.create_task(scheduler.run()),
     ]
     logger.info("系统启动 mode=%s groups=%d", mode, len(groups))
 
