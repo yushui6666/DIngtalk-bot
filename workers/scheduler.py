@@ -55,6 +55,63 @@ class SchedulerWorker:
         """执行一轮周期任务。"""
         self.scan_pending_expiry(now)
         self.scan_sla_reminders(now)
+        self.scan_order_status()
+
+    def scan_order_status(self) -> int:
+        """读订单↔门店共享表，检测状态变化并群内通知一次。
+
+        通知规则（用户业务决策）：
+        - 状态变为「卖家已发货」→ 提醒一次「订单已发货」（不再问签收）；
+        - 状态变为「关闭」（如未付款关闭）→ 提醒一次「订单因未付款已关闭」。
+        """
+        from config import ORDER_STORE_TABLE_PATH
+        from reconciling.order_store import read_order_rows
+
+        notified = 0
+        for row in read_order_rows(ORDER_STORE_TABLE_PATH):
+            order_id = str(row.get("order_id") or "").strip()
+            status = str(row.get("status") or "").strip()
+            if not order_id or not status:
+                continue
+            monitor = self._db.get_order_monitor(order_id)
+            if monitor is None:
+                continue  # 非本系统提交的订单，跳过
+            if status == monitor["last_status"]:
+                continue  # 状态未变，不重复通知
+
+            ticket = self._db.get_ticket(monitor["ticket_id"])
+            ticket_no = monitor["ticket_no"]
+            if ticket is None:
+                logger.warning("订单对应工单不存在 order=%s ticket_id=%s", order_id, monitor["ticket_id"])
+                self._db.update_order_status(order_id, status)
+                continue
+            group_id = ticket["group_id"]
+
+            if "发货" in status and not monitor["shipped_notified"]:
+                tracking = row.get("tracking_number")
+                text = (
+                    f"📦 订单 {order_id} 已发货，工单 {ticket_no} 请留意收货。"
+                    + (f"\n物流单号：{tracking}" if tracking else "")
+                )
+                if group_id:
+                    self._notifier.send_group_now(group_id, text, message_id=f"order-shipped:{order_id}")
+                notified += 1
+                self._db.update_order_status(order_id, status, shipped_notified=True)
+                logger.info("订单已发货通知 order=%s ticket=%s", order_id, ticket_no)
+            elif "关闭" in status and not monitor["closed_notified"]:
+                text = (
+                    f"⚠️ 订单 {order_id} 因未付款已关闭，工单 {ticket_no} "
+                    f"请及时处理（重新下单或更换维修方式）。"
+                )
+                if group_id:
+                    self._notifier.send_group_now(group_id, text, message_id=f"order-closed:{order_id}")
+                notified += 1
+                self._db.update_order_status(order_id, status, closed_notified=True)
+                logger.info("订单关闭通知 order=%s ticket=%s", order_id, ticket_no)
+            else:
+                # 其他状态变化（如付款/待发货）只更新 last_status，不通知
+                self._db.update_order_status(order_id, status)
+        return notified
 
     def scan_pending_expiry(self, now: datetime) -> int:
         """待确认动作超时置 EXPIRED。"""

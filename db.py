@@ -307,6 +307,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_one_waiting
     ON delivery_confirmations(ticket_id, order_no) WHERE status = 'WAITING';
 CREATE INDEX IF NOT EXISTS idx_delivery_status ON delivery_confirmations(status);
 
+-- ─────────────────────── order_monitor（订单↔工单监控） ───────────────────────
+CREATE TABLE IF NOT EXISTS order_monitor (
+    order_id          TEXT PRIMARY KEY,
+    ticket_id         INTEGER NOT NULL,
+    store             TEXT,
+    ticket_no         TEXT,
+    last_status       TEXT NOT NULL DEFAULT '',
+    shipped_notified  INTEGER NOT NULL DEFAULT 0,
+    closed_notified   INTEGER NOT NULL DEFAULT 0,
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL
+);
+
 -- ─────────────────────── taobao_orders（淘宝对账表导入） ───────────────────────
 CREATE TABLE IF NOT EXISTS taobao_orders (
     order_id        TEXT PRIMARY KEY,
@@ -1046,3 +1059,73 @@ class Database:
             "SELECT * FROM taobao_orders WHERE order_id=?", (order_no,)
         ).fetchone()
         return dict(row) if row else None
+
+    # ─────────────────────── 订单监控 order_monitor ───────────────────────
+    def upsert_order_monitor(
+        self,
+        *,
+        order_id: str,
+        ticket_id: int,
+        store: str,
+        ticket_no: str,
+    ) -> None:
+        """登记一个报修工单提交的订单（首次提交时调用，标记已延期）。"""
+        with self.transaction("upsert_order_monitor"):
+            self._conn.execute(
+                """INSERT INTO order_monitor
+                       (order_id, ticket_id, store, ticket_no, last_status,
+                        shipped_notified, closed_notified, created_at, updated_at)
+                   VALUES (?,?,?,?, '', 0, 0, ?, ?)
+                   ON CONFLICT(order_id) DO UPDATE SET
+                       ticket_id=excluded.ticket_id, store=excluded.store,
+                       ticket_no=excluded.ticket_no, updated_at=excluded.updated_at""",
+                (order_id, ticket_id, store, ticket_no, _now_str(), _now_str()),
+            )
+
+    def get_order_monitor(self, order_id: str) -> dict[str, Any] | None:
+        row = self.connect().execute(
+            "SELECT * FROM order_monitor WHERE order_id=?", (order_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_order_status(
+        self,
+        order_id: str,
+        status: str,
+        *,
+        shipped_notified: bool | None = None,
+        closed_notified: bool | None = None,
+    ) -> None:
+        """更新订单 last_status 与通知标记（状态变化检测 + 一次性通知）。"""
+        sets = ["last_status=?", "updated_at=?"]
+        params: list[Any] = [status, _now_str()]
+        if shipped_notified is not None:
+            sets.append("shipped_notified=?")
+            params.append(1 if shipped_notified else 0)
+        if closed_notified is not None:
+            sets.append("closed_notified=?")
+            params.append(1 if closed_notified else 0)
+        params.append(order_id)
+        self._conn.execute(
+            f"UPDATE order_monitor SET {', '.join(sets)} WHERE order_id=?", params
+        )
+
+    def extend_ticket_deadline(self, ticket_id: int, expected_version: int, days: int) -> bool:
+        """工单截止时间顺延 N 天（乐观版本 CAS，业务在收到订单号后调用）。"""
+        from datetime import datetime, timedelta
+
+        row = self._conn.execute(
+            "SELECT current_deadline_at FROM tickets WHERE id=?", (ticket_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        new_deadline = (
+            datetime.strptime(row["current_deadline_at"], "%Y-%m-%d %H:%M:%S")
+            + timedelta(days=days)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        cur = self._conn.execute(
+            "UPDATE tickets SET current_deadline_at=?, version=version+1"
+            " WHERE id=? AND version=?",
+            (new_deadline, ticket_id, expected_version),
+        )
+        return cur.rowcount > 0

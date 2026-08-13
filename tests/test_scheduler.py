@@ -18,10 +18,11 @@ NOW = datetime(2026, 8, 12, 12, 0, 0)
 
 
 @pytest.fixture()
-def env(tmp_path):
+def env(tmp_path, monkeypatch):
     db = Database(tmp_path / "sched.db")
     db.init_schema()
     db.upsert_group(GROUP)
+    monkeypatch.setattr("config.ORDER_STORE_TABLE_PATH", tmp_path / "空.xlsx")  # 隔离共享表
     sent: list[str] = []
     notifier = Notifier(db, lambda target, text: sent.append(text))
     worker = SchedulerWorker(db=db, notifier=notifier, interval=60, remind_before_hours=6)

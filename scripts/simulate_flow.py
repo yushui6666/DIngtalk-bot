@@ -25,7 +25,6 @@ from db import Database  # noqa: E402
 from models import NormalizedMessage  # noqa: E402
 from notifier import Notifier  # noqa: E402
 from pipeline import MessageProcessingPipeline, RuntimeMode  # noqa: E402
-from routing.delivery import DeliveryConfirmService  # noqa: E402
 from routing.pending_actions import PendingActionService  # noqa: E402
 from routing.ticket_contexts import TicketContextStore  # noqa: E402
 from routing.ticket_router import TicketRouter  # noqa: E402
@@ -76,7 +75,6 @@ async def main() -> None:
     router = TicketRouter()
     context = TicketContextStore(db)
     pending = PendingActionService(db)
-    delivery = DeliveryConfirmService(db)
     executor = TicketCommandExecutor(db, repo)
     replies: list[str] = []
     notifier = Notifier(db, lambda target, text: replies.append("[群回执] " + text.replace("\n", " ⏎ ")))
@@ -84,7 +82,7 @@ async def main() -> None:
     pipeline = MessageProcessingPipeline(
         db=db, repo=repo, protocol=protocol, router=router, context=context,
         pending=pending, executor=executor, notifier=notifier,
-        classifier=classifier, delivery=delivery, mode=RuntimeMode.PRODUCTION,
+        classifier=classifier, mode=RuntimeMode.PRODUCTION,
     )
 
     def msg(message_id, text, actor):
@@ -122,8 +120,8 @@ async def main() -> None:
         repairs = db.connect().execute(
             "SELECT ticket_id, repair_method, order_no FROM repair_method_versions WHERE is_current=1"
         ).fetchall()
-        deliveries = db.connect().execute(
-            "SELECT order_no, status FROM delivery_confirmations ORDER BY id"
+        monitors = db.connect().execute(
+            "SELECT order_id, ticket_no, last_status FROM order_monitor ORDER BY order_id"
         ).fetchall()
         print(f"  --- {title} ---")
         print(f"    工单: {[dict(t) for t in tickets]}")
@@ -131,8 +129,8 @@ async def main() -> None:
             print(f"    当前诊断: {[dict(d) for d in diagnoses]}")
         if repairs:
             print(f"    当前维修方式: {[dict(r) for r in repairs]}")
-        if deliveries:
-            print(f"    快递确认: {[dict(x) for x in deliveries]}")
+        if monitors:
+            print(f"    订单登记: {[dict(x) for x in monitors]}")
         print()
 
     print("=" * 72)
@@ -169,17 +167,37 @@ async def main() -> None:
                                 {"diagnosis_items": ["门体下沉", "上侧合页松动"]}))
     db_summary("故障判断后")
 
-    # ── 4. 工程师维修方式 + 订单号 → 触发快递确认 ──
-    print("【4】工程师提交维修方式+淘宝订单号 → 触发快递签收确认")
+    # ── 4. 工程师维修方式 + 订单号 → 订单登记 + 工单延期 ──
+    print("【4】工程师提交维修方式+淘宝订单号 → 订单登记 + 工单自动延期 3 天")
     await send("m5", "这个门打算淘宝采购后自行维修，订单号TB-2024-0001", EG,
                preset=_decision("ticket.repair_plan.submit", {
                    "repair_method": "淘宝采购后自行维修", "order_no": "TB-2024-0001"}))
-    db_summary("维修方式 + 快递确认触发")
+    db_summary("订单登记 + 延期")
 
-    # ── 5. 发起人（报修的店员）回复签收 ──
-    print("【5】报修人回复快递已签收")
-    await send("m6", "快递已经签收了", OT)
-    db_summary("签收确认后")
+    # ── 4.5 模拟：另一个 AI 回传订单状态「卖家已发货」→ 调度器读表 → 群通知 ──
+    print("【4.5】另一个 AI 回传订单状态 → 调度器读到「已发货」→ 群内提醒一次")
+    replies.clear()
+    from reconciling.order_store import read_order_rows  # noqa: E402
+    from workers.scheduler import SchedulerWorker  # noqa: E402
+
+    # 模拟外部 AI 把共享表的 status 更新为已发货
+    import openpyxl  # noqa: E402
+    from config import ORDER_STORE_TABLE_PATH  # noqa: E402
+
+    _wb = openpyxl.load_workbook(ORDER_STORE_TABLE_PATH)
+    _ws = _wb.active
+    for _r in _ws.iter_rows(min_row=2):
+        if _r[0].value == "TB-2024-0001":
+            _r[3].value = "卖家已发货"
+            _r[4].value = "SF-1234567890"
+    _wb.save(ORDER_STORE_TABLE_PATH)
+    _wb.close()
+
+    sched = SchedulerWorker(db=db, notifier=notifier)
+    sched.scan_order_status()
+    for r in replies:
+        print(f"    {r}")
+    print()
 
     # ── 6. 店长切换到第二张工单，补充信息 ──
     print("【6】店长切换到第二张工单，补充钥匙也断了")

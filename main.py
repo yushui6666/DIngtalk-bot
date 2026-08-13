@@ -76,7 +76,6 @@ def _build_pipeline(mode: str):
     from db import Database
     from notifier import Notifier
     from pipeline import MessageProcessingPipeline, RuntimeMode
-    from routing.delivery import DeliveryConfirmService
     from routing.pending_actions import PendingActionService
     from routing.ticket_contexts import TicketContextStore
     from routing.ticket_router import TicketRouter
@@ -94,7 +93,6 @@ def _build_pipeline(mode: str):
     router = TicketRouter()
     context = TicketContextStore(db)
     pending = PendingActionService(db)
-    delivery = DeliveryConfirmService(db)
     executor = TicketCommandExecutor(db, repo)
     notifier = Notifier(db, _dws_sender)
 
@@ -119,7 +117,6 @@ def _build_pipeline(mode: str):
         executor=executor,
         notifier=notifier,
         classifier=classifier,
-        delivery=delivery,
         mode=RuntimeMode(mode),
     )
     return db, pipeline, notifier

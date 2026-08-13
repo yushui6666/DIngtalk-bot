@@ -1,7 +1,7 @@
-"""数据库层集成测试：18 张表、事务幂等、v4 多工单、upsert_group。
+"""数据库层集成测试：19 张表、事务幂等、v4 多工单、upsert_group。
 
 覆盖计划书 15 节数据模型 + Phase 1 清单：
-- 一次性建全 18 张表及索引、唯一约束；v4.0 Task 5 已移除
+- 一次性建全 19 张表及索引、唯一约束；v4.0 Task 5 已移除
   「每群最多一张非终态工单」部分唯一索引，支持同群多工单并行
 - processed_events 幂等表：业务处理与幂等写入同事务（回滚后不残留）
 - 群配置 upsert：覆盖更新保留 ticket_seq
@@ -15,7 +15,7 @@ from config import GROUPS, DB_PATH
 from db import Database
 from models import TICKET_ACTIVE, TICKET_COMPLETED, TICKET_OVERDUE
 
-# 期望的 18 张业务表
+# 期望的 19 张业务表
 EXPECTED_TABLES = {
     "groups",
     "tickets",
@@ -35,6 +35,7 @@ EXPECTED_TABLES = {
     "action_executions",
     "delivery_confirmations",
     "taobao_orders",
+    "order_monitor",
 }
 
 # 期望的关键索引（v4：无单活动工单唯一索引）
@@ -71,7 +72,7 @@ def db(tmp_path: Path) -> Database:
 
 # ─────────────────────── 1. schema 完整性 ───────────────────────
 
-def test_all_18_tables_created(db: Database):
+def test_all_19_tables_created(db: Database):
     tables = {
         r["name"] for r in db.connect().execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
@@ -105,7 +106,7 @@ def test_init_schema_idempotent(db: Database):
     tables = db.connect().execute(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
     ).fetchone()[0]
-    assert tables == 18
+    assert tables == 19
 
 
 # ─────────────────────── 2. 事务与幂等 ───────────────────────

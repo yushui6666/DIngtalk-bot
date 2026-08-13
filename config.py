@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import os as _os
 from pathlib import Path
 
 from logger import get_logger
@@ -24,6 +25,32 @@ STORE_TABLE_DIR = BASE_DIR / "data" / "stores"
 SUMMARY_OUTPUT_PATH = BASE_DIR / "data" / "summary" / "维修工单汇总.json"
 LOG_DIR = BASE_DIR / "logs"
 LOG_LEVEL = "INFO"
+
+# 淘宝对账导入源文件（「淘宝订单自动下载与地址对账」工具产出，可被环境变量覆盖）
+TAOBAO_ORDER_DETAIL_XLSX = Path(
+    _os.environ.get(
+        "TAOBAO_ORDER_DETAIL_XLSX",
+        "/Users/yushui/Desktop/淘宝对账/订单地址明细.xlsx",
+    )
+)
+TAOBAO_PENDING_XLSX = Path(
+    _os.environ.get(
+        "TAOBAO_PENDING_XLSX",
+        "/Users/yushui/Desktop/淘宝对账/待人工处理.xlsx",
+    )
+)
+
+# 订单↔门店共享表：报修工单提交订单号时写入，另一个 AI 每天回传订单状态
+# （可被环境变量 ORDER_STORE_TABLE_PATH 覆盖）
+ORDER_STORE_TABLE_PATH = Path(
+    _os.environ.get(
+        "ORDER_STORE_TABLE_PATH",
+        "/Users/yushui/Desktop/淘宝对账/订单门店状态表.xlsx",
+    )
+)
+
+# 识别到订单号后工单自动延期天数（每单一次）
+ORDER_EXTEND_DAYS = 3
 
 # ───────────────────────── 系统监听账号 ─────────────────────────
 # 工程部AI 的 openDingtalkId（Phase 0 实测）
