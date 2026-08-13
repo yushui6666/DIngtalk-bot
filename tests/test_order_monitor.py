@@ -141,7 +141,9 @@ async def test_bare_order_number_registers_and_extends(env):
         "SELECT COUNT(*) FROM repair_method_versions WHERE ticket_id=?", (ticket["id"],)
     ).fetchone()[0]
     assert rows == 0
+    # 只弹「订单已登记」，不再弹多余的「已记录维修方式」
     assert any("已登记" in s for s in env.sent)
+    assert not any("已记录维修方式" in s for s in env.sent)
 
 
 @pytest.mark.asyncio

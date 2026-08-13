@@ -146,6 +146,7 @@ class TicketCommandExecutor:
         if ticket is None:
             return CommandResult(RESULT_INTERNAL_ERROR, None, None, ())
         fields = command.fields
+        suppress_notify = False
         if kind == "diagnosis":
             self._db.add_diagnosis_version(ticket["id"], command.message_id,
                                            list(fields.get("diagnosis_items", [])), command.actor_id)
@@ -155,8 +156,10 @@ class TicketCommandExecutor:
                 self._db.add_repair_method_version(
                     ticket["id"], command.message_id,
                     repair_method, fields.get("order_no"), command.actor_id)
-            # 只发订单号（无维修方式，如裸单号消息）时：不写空的维修方式版本，
-            # 订单登记+延期由 pipeline 的 _handle_order_submitted 负责。
+            else:
+                # 只发订单号（无维修方式，如裸单号消息）：不写空的维修方式版本，
+                # 也不发「已记录维修方式」通知（订单登记+延期由 pipeline 负责并已回执）
+                suppress_notify = True
         elif kind == "timeout":
             self._db.add_timeout_cycle_reason(ticket["id"], command.message_id,
                                               fields.get("timeout_reason", ""), command.actor_id)
@@ -165,7 +168,7 @@ class TicketCommandExecutor:
         if not ok:
             return CommandResult(RESULT_REJECTED, ticket["id"], ticket["version"], ())
         updated = self._db.get_ticket(ticket["id"])
-        self._finalize(command, updated, LINK_EXECUTED, message)
+        self._finalize(command, updated, LINK_EXECUTED, message, notify=not suppress_notify)
         return CommandResult(RESULT_OK, updated["id"], updated["version"], ())
 
     def _execute_complete(self, command: ValidatedCommand, message: NormalizedMessage | None) -> CommandResult:
@@ -261,6 +264,7 @@ class TicketCommandExecutor:
         ticket: dict[str, Any],
         link_type: str,
         message: NormalizedMessage | None,
+        notify: bool = True,
     ) -> None:
         """消息归属 + 消息落库 + 幂等记录 + 通知预写（同事务）。"""
         self._db.link_message(command.message_id, ticket["id"], link_type, 0.0)
@@ -271,13 +275,14 @@ class TicketCommandExecutor:
                 message.sent_at.strftime("%Y-%m-%d %H:%M:%S"),
             )
         self._db.record_processed_event(command.message_id, command.group_id, "EXECUTED")
-        self._db.insert_notification(
-            dedupe_key=f"exec:{command.message_id}",
-            ticket_id=ticket["id"],
-            notification_type=command.intent,
-            target_type="group",
-            target_id=command.group_id,
-        )
+        if notify:
+            self._db.insert_notification(
+                dedupe_key=f"exec:{command.message_id}",
+                ticket_id=ticket["id"],
+                notification_type=command.intent,
+                target_type="group",
+                target_id=command.group_id,
+            )
 
     def _now(self) -> str:
         from datetime import datetime
