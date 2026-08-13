@@ -670,7 +670,13 @@ def _build_field_defs_from_source(intent_id: str, kw_def: dict[str, Any]) -> dic
     for source_name, validation in field_validation.items():
         fname = _translate_field_name(source_name)
         if fname not in field_defs:
-            entry = {"type": validation.get("类型", "text").replace("文本", "text"), "required": validation.get("必填", False)}
+            entry = {
+                "type": validation.get("类型", "text")
+                .replace("文本", "text")
+                .replace("枚举", "enum")
+                .replace("数组", "string[]"),
+                "required": validation.get("必填", False),
+            }
             if "允许值" in validation:
                 entry["allowed"] = validation["允许值"]
             field_defs[fname] = entry

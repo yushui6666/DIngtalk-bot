@@ -40,7 +40,7 @@ class TicketRepository:
 
         sla_label 为协议枚举（1天/3天/7天），sla_days 取对应天数。
         """
-        sla_days = _SLA_LABELS.get(sla_label, 3)
+        sla_days = _SLA_LABELS.get(sla_label, 1)  # 未识别标签兜底 1 天
         deadline = _add_days(now, sla_days)
         seq = self._db.next_ticket_seq(group["group_id"])
         store_name = group.get("store_name") or "门店"

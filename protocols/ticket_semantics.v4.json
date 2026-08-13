@@ -2,7 +2,7 @@
   "protocol_version": "4.0.0",
   "compiled_at": "2026-08-12T10:19:26+08:00",
   "compiled_by": "protocol_compiler",
-  "source_sha256": "f569fc0b3908f0762ca9d8c68702d77dbb77e17513ea649aa103329323c9cdb0",
+  "source_sha256": "df7e03ef1ec31b257ad7b45ae109fdffa39d420e4d759839502732f6e3b6adfd",
   "actions": [
     {
       "intent_id": "ticket.add_detail",
@@ -194,8 +194,7 @@
       "required_fields": [
         "subject",
         "location",
-        "problem_description",
-        "sla"
+        "problem_description"
       ],
       "optional_fields": [],
       "target_ticket_policy": "MUST_NOT_EXIST",
@@ -245,7 +244,7 @@
         },
         "sla": {
           "type": "enum",
-          "required": true,
+          "required": false,
           "allowed": [
             "1天",
             "3天",

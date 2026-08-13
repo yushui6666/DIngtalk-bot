@@ -109,7 +109,7 @@ class TicketCommandExecutor:
             subject=fields.get("subject") or "未命名",
             location=fields.get("location") or "",
             problem_description=fields.get("problem_description") or "",
-            sla_label=fields.get("sla") or "3天",
+            sla_label=fields.get("sla") or "1天",  # 未写时效默认 1 天（业务决策 2026-08-12）
             now=self._now(),
         )
         ticket = self._db.get_ticket(ticket_id)

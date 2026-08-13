@@ -38,7 +38,8 @@ _KNOWN_FIELDS: frozenset[str] = frozenset({
 })
 
 _INTENT_FIELD_OVERRIDES: dict[str, frozenset[str]] = {
-    "ticket.create": frozenset({"device", "urgency", "attachments"}),
+    # sla 已改为可选（默认 1 天），但模型仍可抽取，不能当幻觉过滤
+    "ticket.create": frozenset({"device", "urgency", "attachments", "sla"}),
     "ticket.add_detail": frozenset({
         "subject", "location", "problem_description", "device", "urgency",
         "attachments", "content",

@@ -111,6 +111,28 @@ async def test_create_ticket_via_keyword(env):
 
 
 @pytest.mark.asyncio
+async def test_create_defaults_sla_to_one_day(env):
+    """报修未写时效时默认 1 天（业务决策 2026-08-12）。"""
+    await env.process("#报修\n主题：收银机\n位置：前台\n问题描述：死机", "m1")
+    act = _active(env.db)
+    assert len(act) == 1
+    assert act[0]["sla_days"] == 1
+    # 截止 = 建单时间 + 1 天
+    from datetime import datetime, timedelta
+
+    expected = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+    assert act[0]["current_deadline_at"].startswith(expected)
+
+
+@pytest.mark.asyncio
+async def test_create_with_explicit_sla_respected(env):
+    """用户明确写时效时按用户值。"""
+    await env.process("#报修\n主题：收银机\n位置：前台\n问题描述：死机\n时效：7天", "m1")
+    act = _active(env.db)
+    assert act[0]["sla_days"] == 7
+
+
+@pytest.mark.asyncio
 async def test_engineer_create_rejected(env):
     await env.process("#报修\n主题：A\n位置：1\n问题描述：x\n时效：3天", "m1")
     status = await env.process("#报修\n主题：B\n位置：2\n问题描述：y\n时效：3天",
