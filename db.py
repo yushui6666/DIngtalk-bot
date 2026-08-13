@@ -306,6 +306,17 @@ CREATE TABLE IF NOT EXISTS delivery_confirmations (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_one_waiting
     ON delivery_confirmations(ticket_id, order_no) WHERE status = 'WAITING';
 CREATE INDEX IF NOT EXISTS idx_delivery_status ON delivery_confirmations(status);
+
+-- ─────────────────────── taobao_orders（淘宝对账表导入） ───────────────────────
+CREATE TABLE IF NOT EXISTS taobao_orders (
+    order_id        TEXT PRIMARY KEY,
+    product_summary TEXT,
+    tracking_number TEXT,
+    address         TEXT,
+    status          TEXT,
+    source          TEXT,
+    updated_at      TEXT
+);
 """
 
 
@@ -1003,3 +1014,35 @@ class Database:
                 (_now_str(), ticket_id),
             )
         return cur.rowcount
+
+    # ─────────────────────── 淘宝对账 taobao_orders ───────────────────────
+    def upsert_taobao_order(
+        self,
+        *,
+        order_id: str,
+        product_summary: str,
+        tracking_number: str | None,
+        address: str | None,
+        status: str | None,
+        source: str,
+    ) -> None:
+        with self.transaction("upsert_taobao_order"):
+            self._conn.execute(
+                """INSERT INTO taobao_orders
+                       (order_id, product_summary, tracking_number, address, status, source, updated_at)
+                   VALUES (?,?,?,?,?,?,?)
+                   ON CONFLICT(order_id) DO UPDATE SET
+                       product_summary=excluded.product_summary,
+                       tracking_number=excluded.tracking_number,
+                       address=excluded.address,
+                       status=excluded.status,
+                       source=excluded.source,
+                       updated_at=excluded.updated_at""",
+                (order_id, product_summary, tracking_number, address, status, source, _now_str()),
+            )
+
+    def get_taobao_order(self, order_no: str) -> dict[str, Any] | None:
+        row = self.connect().execute(
+            "SELECT * FROM taobao_orders WHERE order_id=?", (order_no,)
+        ).fetchone()
+        return dict(row) if row else None

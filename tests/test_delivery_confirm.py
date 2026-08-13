@@ -149,3 +149,32 @@ async def test_complete_expires_waiting_delivery(env):
         "SELECT status FROM delivery_confirmations WHERE order_no='TB-2024-0001'"
     ).fetchone()
     assert row["status"] == "EXPIRED"
+
+
+@pytest.mark.asyncio
+async def test_delivery_reply_enriched_with_taobao_order(env):
+    """对账表有该订单 → 快递确认带出订单状态/物流/收货地址。"""
+    env.db.upsert_taobao_order(
+        order_id="TB-2024-0001",
+        product_summary="合页×2",
+        tracking_number="79025196042648",
+        address="上海 黄浦区 人民大道221号",
+        status="卖家已发货",
+        source="测试",
+    )
+    await _create_ticket(env)
+    await _submit_repair_with_order(env)
+    assert any("订单状态：卖家已发货" in s for s in env.sent)
+    assert any("物流单号 79025196042648" in s for s in env.sent)
+    assert any("收货地址：上海 黄浦区" in s for s in env.sent)
+
+
+@pytest.mark.asyncio
+async def test_delivery_reply_warns_unknown_order(env):
+    """对账表没有该订单 → 提醒核对订单号。"""
+    await _create_ticket(env)
+    await env.process(
+        "#维修方式\n维修方式：淘宝采购后自行维修\n订单号：XYZ-NOT-FOUND-1",
+        "repair", role="ENGINEER", sender="uid-eng",
+    )
+    assert any("未在淘宝对账数据中找到该订单号" in s for s in env.sent)

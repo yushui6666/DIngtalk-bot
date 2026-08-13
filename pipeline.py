@@ -266,12 +266,20 @@ class MessageProcessingPipeline:
             result.ticket_id, order_no, msg.group_id, ticket["reporter_id"]
         )
         if confirmation_id:
-            self._notifier.send_group_now(
-                msg.group_id,
-                f"【快递签收确认】工单 {ticket['ticket_no']} 的淘宝订单 {order_no} "
-                f"已提交采购。请发起人回复「已签收」或「未收到」。",
-                message_id=msg.message_id,
-            )
+            # 淘宝对账校验 + 快递确认增强（reconciling 导入的数据）
+            text = f"【快递签收确认】工单 {ticket['ticket_no']} 的淘宝订单 {order_no} 已提交采购。"
+            order = self._db.get_taobao_order(order_no) if hasattr(self._db, "get_taobao_order") else None
+            if order and order.get("address"):
+                text += f"\n📦 订单状态：{order.get('status') or '未知'}"
+                if order.get("tracking_number"):
+                    text += f"，物流单号 {order['tracking_number']}"
+                text += f"\n📍 收货地址：{order['address']}"
+            elif order and order.get("status") == "待人工处理":
+                text += "\n⚠️ 该订单在淘宝对账中为「待人工处理」（地址待确认）。"
+            else:
+                text += "\n⚠️ 未在淘宝对账数据中找到该订单号，请核对；如无误请确认对账表已更新。"
+            text += "\n请发起人回复「已签收」或「未收到」。"
+            self._notifier.send_group_now(msg.group_id, text, message_id=msg.message_id)
 
     # ─────────────────────── 决策 ───────────────────────
     async def _decide(self, msg: NormalizedMessage) -> SemanticDecision:
