@@ -14,7 +14,14 @@ from typing import Any, Optional
 
 from config import LISTENER_USER_ID
 from logger import get_logger
-from models import MSG_FILE, MSG_IMAGE, MSG_RICH, MSG_TEXT, NormalizedMessage
+from models import (
+    MSG_FILE,
+    MSG_IMAGE,
+    MSG_RICH,
+    MSG_TEXT,
+    ImageAttachment,
+    NormalizedMessage,
+)
 from role_resolver import resolve_role
 
 logger = get_logger(__name__)
@@ -112,6 +119,127 @@ def _extract_reply_to(raw_event: dict[str, Any]) -> Optional[str]:
     return None
 
 
+# ─────────────────────── 图片附件提取（v4.1 Task 4A） ───────────────────────
+# 附件来源候选键（真实 dws 字段待样本验证，防御性探试）
+_ATTACHMENT_SOURCE_KEYS = (
+    "download_url", "url", "media_id", "picMediaId", "pictureUrl",
+    "photo_url", "image_url", "fileId",
+)
+# 结构化 content 中携带附件数组的常见键
+_ATTACHMENT_LIST_KEYS = ("attachments", "images", "files", "imageList", "mediaList")
+# 附件对象里的名称/类型候选键
+_ATTACHMENT_NAME_KEYS = ("file_name", "fileName", "name", "title")
+_ATTACHMENT_MIME_KEYS = ("mime_type", "mimeType", "content_type", "file_type", "fileType")
+
+
+def _as_json_dict(value: Any) -> Optional[dict[str, Any]]:
+    """content 可能是 dict 或 JSON 字符串，统一转 dict；非结构化返回 None。"""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        if s.startswith("{") and s.endswith("}"):
+            try:
+                obj = json.loads(s)
+            except json.JSONDecodeError:
+                return None
+            return obj if isinstance(obj, dict) else None
+    return None
+
+
+def _source_from_item(item: dict[str, Any], raw_event: dict[str, Any]) -> tuple[str, str]:
+    """从附件对象定位下载源，返回 (source_ref, source_type)。"""
+    for key in _ATTACHMENT_SOURCE_KEYS:
+        v = item.get(key)
+        if isinstance(v, str) and v.strip():
+            ref = v.strip()
+            if key in ("media_id", "picMediaId", "fileId"):
+                return ref, "dingtalk_media"
+            if ref.startswith("http://") or ref.startswith("https://"):
+                return ref, "remote_url"
+            return ref, "unknown"
+    for key in _ATTACHMENT_SOURCE_KEYS:
+        v = raw_event.get(key)
+        if isinstance(v, str) and v.strip():
+            ref = v.strip()
+            if key in ("media_id", "picMediaId", "fileId"):
+                return ref, "dingtalk_media"
+            if ref.startswith(("http://", "https://")):
+                return ref, "remote_url"
+            return ref, "unknown"
+    return "", ""
+
+
+def _extract_attachments(raw_event: dict[str, Any], message_type: str) -> list[ImageAttachment]:
+    """从图片/文件/富文本事件提取结构化附件（真实字段待样本验证，宽松兼容）。
+
+    - 结构化 content（dict/list/JSON 字符串）→ 逐项定位下载源；
+    - 纯文本 content（如 "[图片]"）→ 视为无附件，不产生记录；
+    - 富文本只在显式附件数组/来源键出现时才产生附件。
+    """
+    if message_type not in (MSG_IMAGE, MSG_FILE, MSG_RICH):
+        return []
+    content = raw_event.get("content")
+    candidates: list[Any] = []
+    structured = False
+    if isinstance(content, list):
+        candidates = [c for c in content if isinstance(c, dict)]
+        structured = True
+    else:
+        obj = _as_json_dict(content)
+        if obj is not None:
+            structured = True
+            for key in _ATTACHMENT_LIST_KEYS:
+                v = obj.get(key)
+                if isinstance(v, list):
+                    candidates = [c for c in v if isinstance(c, dict)]
+                    break
+            else:
+                candidates = [obj]
+    # 顶层事件字段直接携带来源（content 非结构化但事件有附件字段）
+    if not candidates and not structured:
+        for key in _ATTACHMENT_SOURCE_KEYS:
+            if isinstance(raw_event.get(key), str) and raw_event.get(key, "").strip():
+                candidates = [dict(raw_event)]
+                break
+
+    attachments: list[ImageAttachment] = []
+    seen: set[str] = set()
+    for item in candidates:
+        ref, source_type = _source_from_item(item, raw_event)
+        if not ref:
+            # 结构化但找不到来源：图片/文件保留原文待核对（宁可记录不丢数据）；
+            # 富文本只认显式附件来源，纯 markdown 不产生附件记录。
+            if structured and message_type in (MSG_IMAGE, MSG_FILE):
+                ref = json.dumps(item, ensure_ascii=False)
+                source_type = "unknown"
+            else:
+                continue
+        if ref in seen:
+            continue
+        seen.add(ref)
+        file_name = next(
+            (str(v) for k in _ATTACHMENT_NAME_KEYS
+             if isinstance((v := item.get(k)), str) and v.strip()),
+            None,
+        )
+        mime = next(
+            (str(v) for k in _ATTACHMENT_MIME_KEYS
+             if isinstance((v := item.get(k)), str) and v.strip()),
+            None,
+        )
+        attachments.append(
+            ImageAttachment(
+                attachment_index=len(attachments),
+                source_type=source_type,
+                source_ref=ref,
+                file_name=file_name,
+                declared_mime_type=mime,
+            )
+        )
+    return attachments
+
+
 def normalize_event(
     raw_event: dict[str, Any],
     group: Optional[dict] = None,
@@ -145,6 +273,7 @@ def normalize_event(
         content = raw_event.get("content") or ""
     sent_at = _parse_sent_at(raw_event.get("create_time") or raw_event.get("event_time"))
     reply_to_message_id = _extract_reply_to(raw_event)
+    attachments = _extract_attachments(raw_event, message_type)
 
     if sent_at is None:
         logger.warning(
@@ -164,6 +293,7 @@ def normalize_event(
         sent_at=sent_at,
         is_self=is_self,
         reply_to_message_id=reply_to_message_id,
+        attachments=attachments,
         raw_event=raw_event,
     )
     msg.sender_role = resolve_role(group, sender_id, id_map) if not is_self else "SYSTEM"

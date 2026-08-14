@@ -21,9 +21,10 @@ Sender = Callable[[str, str], None]
 
 
 class Notifier:
-    def __init__(self, db: Database, sender: Sender) -> None:
+    def __init__(self, db: Database, sender: Sender, *, enabled: bool = True) -> None:
         self._db = db
         self._sender = sender
+        self._enabled = enabled
 
     def flush(self) -> int:
         """投递所有 PENDING Outbox 通知，返回投递数。"""
@@ -31,8 +32,17 @@ class Notifier:
         for item in self._db.claim_pending_notifications(limit=50):
             try:
                 text = self._build_text(item)
-                self._sender(item["target_id"], text)
-                self._db.mark_notification(item["id"], "SENT")
+                if self._enabled:
+                    self._sender(item["target_id"], text)
+                    self._db.mark_notification(item["id"], "SENT")
+                else:
+                    # 影子模式：不投递，仅记审计状态，避免群内真实外发
+                    logger.info("影子模式：跳过通知投递 id=%s target=%s type=%s",
+                                item["id"], item["target_id"], item["notification_type"])
+                    self._db.mark_notification(item["id"], "SENT")
+                self._db.record_system_reply(
+                    item["target_id"], f"sys:notif:{item['id']}", text
+                )
                 delivered += 1
             except Exception as exc:
                 logger.warning("通知投递失败 id=%s err=%s", item["id"], exc)
@@ -40,7 +50,10 @@ class Notifier:
         return delivered
 
     def send_group_now(self, group_id: str, text: str, *, message_id: str) -> None:
-        """同步发送群文本回复，并落一条已投递的审计 Outbox 记录。"""
+        """同步发送群文本回复，并落一条已投递的审计 Outbox 记录。
+
+        同时把回执文本作为 SYSTEM 消息写入收件箱，作为群聊上文供模型理解。
+        """
         notification_id = self._db.insert_notification(
             dedupe_key=f"reply:{message_id}",
             ticket_id=None,
@@ -48,6 +61,11 @@ class Notifier:
             target_type="group",
             target_id=group_id,
         )
+        self._db.record_system_reply(group_id, f"sys:{message_id}", text)
+        if not self._enabled:
+            logger.info("影子模式：跳过即时回复 group=%s msg=%s text=%r",
+                        group_id, message_id, text[:60])
+            return
         try:
             self._sender(group_id, text)
             if notification_id:
@@ -57,6 +75,10 @@ class Notifier:
 
     def send_deduped_group(self, group_id: str, text: str, *, dedupe_key: str) -> bool:
         """按 dedupe_key 去重的群消息（同一 key 只发一次，用于定时提醒）。"""
+        if not self._enabled:
+            logger.info("影子模式：跳过去重群消息 group=%s key=%s text=%r",
+                        group_id, dedupe_key, text[:60])
+            return False
         notification_id = self._db.insert_notification(
             dedupe_key=dedupe_key,
             ticket_id=None,

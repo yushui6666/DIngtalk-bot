@@ -111,6 +111,8 @@ class SchedulerWorker:
             else:
                 # 其他状态变化（如付款/待发货）只更新 last_status，不通知
                 self._db.update_order_status(order_id, status)
+                logger.info("订单状态更新（不通知）order=%s old=%r new=%r ticket=%s",
+                            order_id, monitor["last_status"], status, ticket_no)
         return notified
 
     def scan_pending_expiry(self, now: datetime) -> int:

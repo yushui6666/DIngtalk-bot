@@ -26,6 +26,22 @@ SUMMARY_OUTPUT_PATH = BASE_DIR / "data" / "summary" / "维修工单汇总.json"
 LOG_DIR = BASE_DIR / "logs"
 LOG_LEVEL = "INFO"
 
+# 群与成员配置文件（50 群/几百人规模用，可被环境变量 GROUPS_CONFIG_PATH 覆盖）
+# - 生产：data/groups.json（全部门店群）
+# - 测试：data/group-test.json（测试群，通过 --test 或 GROUPS_CONFIG_PATH 切换）
+DEFAULT_GROUPS_CONFIG_PATH = Path(
+    _os.environ.get(
+        "GROUPS_CONFIG_PATH",
+        str(BASE_DIR / "data" / "groups.json"),
+    )
+)
+GROUPS_TEST_CONFIG_PATH = Path(
+    _os.environ.get(
+        "GROUPS_TEST_CONFIG_PATH",
+        str(BASE_DIR / "data" / "group-test.json"),
+    )
+)
+
 # 淘宝对账导入源文件（「淘宝订单自动下载与地址对账」工具产出，可被环境变量覆盖）
 TAOBAO_ORDER_DETAIL_XLSX = Path(
     _os.environ.get(
@@ -58,36 +74,60 @@ LISTENER_USER_ID = "DuT5LjNZRjS6gMdv9dii9LLC2iPTIiiIm8jw"
 LISTENER_USER_NAME = "工程部AI"
 
 # ───────────────────────── 群配置 ─────────────────────────
+# 群与成员配置独立保存在 JSON 文件（结构：{"groups":[...], "user_id_map":{...}}），
+# 便于 50 群/几百人规模维护；GROUPS 与 USER_ID_MAP 由此加载，保持导出名不变。
+# - 默认（生产）读取 data/groups.json
+# - 测试模式（main.py --test）读取 data/group-test.json
 # 角色分配（用户确认 2026-08-11）：聂宇清=工程师，暂代工程负责人+区域经理；yushui=店长
-# ⚠️ yushui 为外部测试账号，无真实 userId，使用测试占位 userId "yushui-external-test"
-#    仅用于测试阶段角色匹配；私聊发送通道对该账号不可达，正式环境替换为组织内店长。
+#   yushui 为外部测试账号，无真实 userId，使用测试占位 userId "yushui-external-test"
+# 测试群（用户确认 2026-08-13）：朱兴福=店长，聂宇清=工程师
 # 角色列表一律使用 userId；事件只提供 openDingtalkId，运行时经 USER_ID_MAP 映射后匹配。
-# 群成员（Phase 0 实测）：
-#   yushui（群主）  = 外部测试账号，未加入组织，无 userId → 店长（测试占位）
-#   聂宇清          openDingtalkId=DV2iipykTJciSappVW4GfsiSQii2iPTIiiIm8jw  userId=1785387642795212
-GROUPS = [
-    {
-        "group_id": "cidO+6f66Jja9EzGTFm3rra1Q==",
-        "store_name": "钉钉消息测试",  # 测试群即店名，正式环境替换为实际店名
-        "manager_ids": [
-            "yushui-external-test",  # yushui（外部账号，测试占位 userId）
-        ],
-        "engineer_ids": [
-            "1785387642795212",  # 聂宇清（工程师，暂代工程负责人+区域经理）
-        ],
-        "other_member_ids": [],
-        "engineering_leader_id": "1785387642795212",  # 聂宇清暂代（用户确认）
-        "regional_manager_id": "1785387642795212",  # 聂宇清暂代（用户确认）
-        "is_active": True,
-    }
-]
 
-# openDingtalkId → userId 静态映射（Phase 1 测试用）。
-# 正式环境启动流程调用通讯录自动解析并缓存，见 id_mapper.py TODO。
-USER_ID_MAP = {
-    "DV2iipykTJciSappVW4GfsiSQii2iPTIiiIm8jw": "1785387642795212",  # 聂宇清
-    "Dk7Rf4NfFahnD2MHQgAE3gy2iPTIiiIm8jw": "yushui-external-test",  # yushui（外部账号，测试占位）
-}
+# 当前生效的群配置文件（默认为生产配置；调用 set_groups_config() 可切换）
+GROUPS_CONFIG_PATH = DEFAULT_GROUPS_CONFIG_PATH
+
+# 是否处于测试模式（读取 group-test.json）
+_is_test_mode = False
+
+
+def _load_groups_config(path: Path | None = None) -> tuple[list[dict], dict[str, str]]:
+    """从群配置文件加载群配置与 userId 映射。"""
+    source = path or GROUPS_CONFIG_PATH
+    if not source.exists():
+        raise SystemExit(f"[config] 群配置文件缺失: {source}")
+    raw = json.loads(source.read_text(encoding="utf-8"))
+    groups = raw.get("groups") or []
+    user_id_map = raw.get("user_id_map") or {}
+    if not isinstance(groups, list) or not isinstance(user_id_map, dict):
+        raise SystemExit(f"[config] 群配置格式错误: {source}")
+    logger.info("群配置已从文件加载 path=%s groups=%d users=%d",
+                source, len(groups), len(user_id_map))
+    return groups, user_id_map
+
+
+def set_groups_config(*, test: bool = False, path: str | None = None) -> None:
+    """切换群配置来源。
+
+    Args:
+        test: True 使用测试配置文件 data/group-test.json。
+        path: 显式指定群配置文件路径（优先于 test）；
+              传空字符串/None 且非 test 时恢复默认生产配置。
+    """
+    global GROUPS_CONFIG_PATH, USER_ID_MAP, GROUPS, _is_test_mode
+    if path:
+        GROUPS_CONFIG_PATH = Path(path)
+    elif test:
+        GROUPS_CONFIG_PATH = GROUPS_TEST_CONFIG_PATH
+    else:
+        GROUPS_CONFIG_PATH = DEFAULT_GROUPS_CONFIG_PATH
+    _is_test_mode = test
+    GROUPS, USER_ID_MAP = _load_groups_config()
+    _validate_groups()
+    logger.info("群配置已切换 test=%s path=%s", _is_test_mode, GROUPS_CONFIG_PATH)
+
+
+GROUPS, USER_ID_MAP = _load_groups_config()
+
 # 备用：历史测试群成员（cidBkhYa...）通讯录已解析，正式角色配置时可参考：
 #   王建耀(中级工程师)  oid=DK5gfPiPQt9JhftbQjPTSmpGBeH1hOf3Al  userId=220039292529211921
 #   徐勇杰(中级工程师)  oid=DBurLHRPMVyAnblOOaHiPHO2BeH1hOf3Al  userId=16245203427839890
@@ -134,7 +174,7 @@ WEEKEND_ESCALATION_DEFER_HOUR = 9
 BACKGROUND_SCAN_INTERVAL_SECONDS = 60
 
 # SLA 提醒：时效临近到期前 N 小时提醒一次；超时后再提醒一次
-SLA_REMIND_BEFORE_HOURS = 6
+SLA_REMIND_BEFORE_HOURS = 1
 SLA_SCAN_INTERVAL_SECONDS = 60
 
 SLA_OPTIONS = {"1天": 1, "3天": 3, "7天": 7}
@@ -170,6 +210,23 @@ LLM_API_KEY = _os.environ.get("LLM_API_KEY", "")
 
 # 是否启用云端模型语义匹配（关闭时自然语言走降级路径）
 LLM_ENABLED = _os.environ.get("LLM_ENABLED", "true").lower() in ("true", "1", "yes")
+
+# ───────────────────────── 图片附件归档（计划书 §10.6 Task 4A · 存储层） ─────────────────────────
+# 消息到达时只归档图片、不调用视觉模型；工单结束后统一分析（用户决策 2026-08-14）。
+IMAGE_ARCHIVE_ENABLED = _os.environ.get("IMAGE_ARCHIVE_ENABLED", "true").lower() in ("true", "1", "yes")
+IMAGE_ARCHIVE_DIR = Path(_os.environ.get("IMAGE_ARCHIVE_DIR", str(ARCHIVE_DIR / "attachments")))
+IMAGE_MAX_BYTES = int(_os.environ.get("IMAGE_MAX_BYTES", str(10 * 1024 * 1024)))
+IMAGE_MAX_COUNT_PER_MESSAGE = int(_os.environ.get("IMAGE_MAX_COUNT_PER_MESSAGE", "3"))
+IMAGE_DOWNLOAD_TIMEOUT_SECONDS = float(_os.environ.get("IMAGE_DOWNLOAD_TIMEOUT_SECONDS", "15"))
+IMAGE_ALLOWED_MIME_TYPES = tuple(
+    m.strip()
+    for m in _os.environ.get(
+        "IMAGE_ALLOWED_MIME_TYPES", "image/jpeg,image/png,image/webp,image/gif,image/bmp"
+    ).split(",")
+    if m.strip()
+)
+# 测试/开发可允许本地文件路径作为图片来源；生产保持拒绝
+IMAGE_ALLOW_LOCAL_SOURCES = _os.environ.get("IMAGE_ALLOW_LOCAL_SOURCES", "false").lower() in ("true", "1", "yes")
 
 
 def load_groups() -> list[dict]:

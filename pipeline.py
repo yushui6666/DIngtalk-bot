@@ -72,6 +72,7 @@ class MessageProcessingPipeline:
         executor: TicketCommandExecutor,
         notifier: Any,
         classifier: Any | None = None,
+        archiver: Any | None = None,
         mode: RuntimeMode = RuntimeMode.PRODUCTION,
         llm_enabled: bool = LLM_ENABLED,
         max_attempts: int = LLM_MAX_ATTEMPTS,
@@ -86,6 +87,7 @@ class MessageProcessingPipeline:
         self._executor = executor
         self._notifier = notifier
         self._classifier = classifier
+        self._archiver = archiver
         self._mode = mode
         self._llm_enabled = llm_enabled and classifier is not None
         self._max_attempts = max_attempts
@@ -99,6 +101,7 @@ class MessageProcessingPipeline:
             "消息处理开始 msg=%s group=%s sender=%s role=%s type=%s",
             msg.message_id, msg.group_id, msg.sender_id[:8], msg.sender_role, msg.message_type,
         )
+        await self._archive_attachments(msg)
         try:
             status = await self._handle(msg, item)
             logger.info("消息处理完成 msg=%s status=%s", msg.message_id, status)
@@ -176,6 +179,10 @@ class MessageProcessingPipeline:
             if target_candidate is not None:
                 decision = replace(decision, target_ticket_no=target_candidate.ticket_no)
 
+        # 新建动作：不绑定任何既有工单（模型可能因候选列表而误带 target）
+        if route.decision == RouteDecision.CREATE and decision.target_ticket_no is not None:
+            decision = replace(decision, target_ticket_no=None)
+
         # 校验
         validate_candidates = [c for c in candidates if c.ticket_id == route.target_ticket_id]
         status, cmd, errors = validate_decision(
@@ -240,11 +247,13 @@ class MessageProcessingPipeline:
             return
 
         registered: list[str] = []
+        already_registered: list[str] = []
         days = 0
         for order_no in order_nos:
             # 已登记过 → 每单只延期一次，不重复
             if self._db.get_order_monitor(order_no) is not None:
                 logger.info("订单已登记过，跳过 order=%s ticket=%s", order_no, ticket["ticket_no"])
+                already_registered.append(order_no)
                 continue
             current = self._db.get_ticket(result.ticket_id)
             extended = self._db.extend_ticket_deadline(
@@ -264,7 +273,14 @@ class MessageProcessingPipeline:
             days += ORDER_EXTEND_DAYS
 
         if not registered:
-            return  # 全部已登记过，无需再回复
+            # 全部订单已登记过 → 回执说明，不静默
+            if already_registered:
+                self._notifier.send_group_now(
+                    msg.group_id,
+                    f"📦 订单 {'、'.join(already_registered)} 已在其他工单登记过，无需重复登记。",
+                    message_id=msg.message_id,
+                )
+            return
 
         fresh = self._db.get_ticket(result.ticket_id)
         order_text = "、".join(registered)
@@ -272,6 +288,8 @@ class MessageProcessingPipeline:
             f"📦 订单 {order_text} 已登记，工单 {ticket['ticket_no']} "
             f"自动延期 {days} 天（新截止 {fresh['current_deadline_at']}）。"
         )
+        if already_registered:
+            text += f"\n注：订单 {'、'.join(already_registered)} 已在其他工单登记过，未重复延期。"
         # 若对账表已导入首个订单，附注收货地址（增强）
         order = self._db.get_taobao_order(registered[0]) if hasattr(self._db, "get_taobao_order") else None
         if order and order.get("address"):
@@ -350,6 +368,17 @@ class MessageProcessingPipeline:
             msg, candidates=candidates, pending_action=pending, history=history
         )
 
+    async def _archive_attachments(self, msg: NormalizedMessage) -> None:
+        """归档消息图片（存储层）。失败只记日志，绝不阻塞业务处理。"""
+        if self._archiver is None:
+            return
+        try:
+            archived = await self._archiver.archive_message(msg.message_id)
+            if archived:
+                logger.info("消息图片归档完成 msg=%s archived=%d", msg.message_id, archived)
+        except Exception as exc:
+            logger.warning("消息图片归档异常 msg=%s err=%s", msg.message_id, exc)
+
     def _save_decision(self, msg: NormalizedMessage, decision: SemanticDecision) -> None:
         try:
             self._db.save_semantic_decision(
@@ -379,7 +408,51 @@ class MessageProcessingPipeline:
         if decision.intent == "system.correct_pending_action":
             logger.info("待确认动作修正 msg=%s pending=%s intent=%s", msg.message_id, pending.id, pending.intent)
             return self._correct_pending(item, msg, pending, decision)
+        # 归属问询 pending：用户在「请选择工单」后回复数字/编号 → 归属到所选工单执行
+        if len(pending.candidate_ticket_ids) > 1 and decision.intent == "ticket.select":
+            logger.info("归属选择 msg=%s pending=%s target=%s",
+                        msg.message_id, pending.id, decision.target_ticket_no)
+            return self._assign_pending_target(item, msg, pending, decision)
         return None
+
+    def _assign_pending_target(
+        self, item: dict[str, Any], msg: NormalizedMessage, pending: Any, decision: SemanticDecision
+    ) -> str:
+        """归属问询后用户选择工单：把待归属动作落到所选工单执行。"""
+        target_id = None
+        target_no = decision.target_ticket_no
+        if target_no:
+            target_id = next(
+                (tid for tid in pending.candidate_ticket_ids
+                 if self._db.get_ticket(tid)["ticket_no"] == target_no),
+                None,
+            )
+        if target_id is None:
+            self._notifier.send_group_now(
+                msg.group_id, "没有找到对应工单，请重新选择。", message_id=msg.message_id
+            )
+            return self._complete(item, msg, "REJECTED")
+        ticket = self._db.get_ticket(target_id)
+        expected = pending.expected_ticket_versions.get(target_id)
+        if expected is not None and ticket["version"] != expected:
+            self._notifier.send_group_now(
+                msg.group_id, "该工单状态已更新，请重新选择。", message_id=msg.message_id
+            )
+            return self._complete(item, msg, "REJECTED")
+        if not self._pending.resolve(
+            pending.id, pending.version, PendingActionStatus.CONFIRMED,
+            msg.message_id, now=datetime.now()
+        ):
+            return self._complete(item, msg, "REJECTED")
+
+        cmd = _command_from_pending(msg, pending, target_id)
+        result = self._executor.execute(
+            cmd, message=msg, pending_action_id=pending.id, pending_version=pending.version
+        )
+        if result.status == RESULT_OK:
+            self._handle_order_submitted(cmd, result, msg)
+            self._notifier.flush()
+        return self._complete(item, msg, "EXECUTED" if result.status == RESULT_OK else result.status)
 
     def _confirm_pending(self, item: dict[str, Any], msg: NormalizedMessage, pending: Any) -> str:
         """确认待执行动作：校验工单版本未变后执行。"""
@@ -481,9 +554,22 @@ class MessageProcessingPipeline:
         ids = tuple(c.ticket_id for c in candidates)
         if not ids:
             text = "当前没有可操作的活动工单，请先创建工单。"
-        else:
-            lines = "\n".join(f"{i + 1}. {c.ticket_no}（{c.subject}）" for i, c in enumerate(candidates))
-            text = f"消息对应多张工单，请选择或提供编号：\n{lines}"
+            self._notifier.send_group_now(msg.group_id, text, message_id=msg.message_id)
+            return self._complete(item, msg, "CLARIFY")
+        # 多候选归属问询 → 建立 pending，记录待归属动作与候选工单，
+        # 使后续用户回复数字/编号能被识别为「归属选择」而非选单上下文。
+        versions = {c.ticket_id: c.version for c in candidates}
+        draft = PendingActionDraft(
+            source_message_id=msg.message_id,
+            group_id=msg.group_id,
+            user_id=msg.sender_id,
+            decision=decision,
+            expected_ticket_versions=versions,
+            expires_at=datetime.now(),
+        )
+        self._pending.create_or_supersede(draft, datetime.now())
+        lines = "\n".join(f"{i + 1}. {c.ticket_no}（{c.subject}）" for i, c in enumerate(candidates))
+        text = f"消息对应多张工单，请选择或提供编号：\n{lines}"
         self._notifier.send_group_now(msg.group_id, text, message_id=msg.message_id)
         return self._complete(item, msg, "CLARIFY")
 

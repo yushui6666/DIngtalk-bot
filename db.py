@@ -243,6 +243,32 @@ CREATE TABLE IF NOT EXISTS message_ticket_links (
 );
 CREATE INDEX IF NOT EXISTS idx_links_ticket ON message_ticket_links(ticket_id);
 
+-- ─────────────────────── message_attachments（v4.1 Task 4A 图片附件存储） ───────────────────────
+-- 消息到达时写元数据（source 信息），归档成功后回填 stored_path/sha256 等；
+-- 工单归属后回填 ticket_id；工单结束后由分析层消费。
+CREATE TABLE IF NOT EXISTS message_attachments (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id          TEXT NOT NULL,
+    attachment_index    INTEGER NOT NULL,
+    ticket_id           INTEGER,
+    source_type         TEXT NOT NULL,
+    source_ref          TEXT NOT NULL,
+    file_name           TEXT,
+    declared_mime_type  TEXT,
+    stored_path         TEXT,
+    sha256              TEXT,
+    byte_size           INTEGER,
+    mime_type           TEXT,
+    analyzed_status     TEXT NOT NULL DEFAULT 'PENDING',
+    vision_result_json  TEXT,
+    analyzed_at         TEXT,
+    error               TEXT,
+    created_at          TEXT NOT NULL,
+    UNIQUE (message_id, attachment_index)
+);
+CREATE INDEX IF NOT EXISTS idx_attachments_ticket ON message_attachments(ticket_id, analyzed_status);
+CREATE INDEX IF NOT EXISTS idx_attachments_msg ON message_attachments(message_id);
+
 -- ─────────────────────── ticket_contexts（v4.0 Task 7） ───────────────────────
 CREATE TABLE IF NOT EXISTS ticket_contexts (
     group_id   TEXT NOT NULL,
@@ -513,7 +539,10 @@ class Database:
 
     # ─────────────────────── 收件箱 inbox_messages ───────────────────────
     def enqueue_message(self, msg: Any) -> bool:
-        """消息入箱（幂等：message_id 已存在返回 False）。"""
+        """消息入箱（幂等：message_id 已存在返回 False）。
+
+        同一事务写入图片附件元数据（真实字节由归档层补齐）。
+        """
         with self.transaction("inbox_enqueue"):
             cur = self._conn.execute(
                 """INSERT OR IGNORE INTO inbox_messages (
@@ -527,7 +556,98 @@ class Database:
                     _now_str(),
                 ),
             )
+            if cur.rowcount > 0:
+                self._insert_attachment_metadata(
+                    self._conn, msg.message_id, getattr(msg, "attachments", ())
+                )
         return cur.rowcount > 0
+
+    # ─────────────────────── 图片附件 message_attachments（v4.1 Task 4A） ───────────────────────
+    def _insert_attachment_metadata(
+        self, conn: sqlite3.Connection, message_id: str, attachments: Any, *, now: str | None = None
+    ) -> None:
+        """附件元数据幂等写入（同 message_id+index 已存在跳过）。"""
+        now = now or _now_str()
+        for att in attachments:
+            conn.execute(
+                """INSERT OR IGNORE INTO message_attachments
+                       (message_id, attachment_index, source_type, source_ref,
+                        file_name, declared_mime_type, created_at)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (
+                    message_id, att.attachment_index, att.source_type, att.source_ref,
+                    att.file_name, att.declared_mime_type, now,
+                ),
+            )
+
+    def list_attachment_rows(self, message_id: str) -> list[dict[str, Any]]:
+        """某条消息的全部附件记录（含未归档/失败的），供归档与分析层消费。"""
+        rows = self.connect().execute(
+            "SELECT * FROM message_attachments WHERE message_id=? ORDER BY attachment_index",
+            (message_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_attachment_archived(
+        self, attachment_id: int, *, stored_path: str, sha256: str, byte_size: int, mime_type: str
+    ) -> None:
+        """归档成功：回填存储字段（error 清零）。"""
+        with self.transaction("attachment_archived"):
+            self._conn.execute(
+                """UPDATE message_attachments
+                   SET stored_path=?, sha256=?, byte_size=?, mime_type=?, error=NULL
+                   WHERE id=?""",
+                (stored_path, sha256, byte_size, mime_type, attachment_id),
+            )
+
+    def mark_attachment_failed(self, attachment_id: int, error: str) -> None:
+        """归档失败：置 SKIPPED 并记录原因（不删除 source_ref，可人工/脚本重试）。"""
+        with self.transaction("attachment_failed"):
+            self._conn.execute(
+                "UPDATE message_attachments SET error=?, analyzed_status='SKIPPED' WHERE id=?",
+                (error, attachment_id),
+            )
+
+    def backfill_attachment_ticket(self, message_id: str, ticket_id: int) -> None:
+        """消息归属工单后回填附件 ticket_id（link_message 内已自动调用，此为显式入口）。"""
+        with self.transaction("attachment_backfill"):
+            self._conn.execute(
+                "UPDATE message_attachments SET ticket_id=? WHERE message_id=? AND ticket_id IS NULL",
+                (ticket_id, message_id),
+            )
+
+    def list_ticket_attachments(self, ticket_id: int, *, only_archived: bool = True) -> list[dict[str, Any]]:
+        """某工单的全部附件（工单结束后统一分析层使用）。"""
+        sql = "SELECT * FROM message_attachments WHERE ticket_id=?"
+        params: list[Any] = [ticket_id]
+        if only_archived:
+            sql += " AND stored_path IS NOT NULL AND analyzed_status != 'SKIPPED'"
+        sql += " ORDER BY id"
+        rows = self.connect().execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def record_system_reply(
+        self, group_id: str, message_id: str, text: str, *, sent_at: str | None = None
+    ) -> None:
+        """记录系统回执消息到收件箱（sender_role=SYSTEM，状态直接 COMPLETED）。
+
+        目的：作为群聊上文供模型理解（用户回复「2」「报修」常是对系统
+        刚才给出的选项/澄清的回答）；SYSTEM 消息不会被业务 Worker 再次处理。
+        """
+        from models import ROLE_SYSTEM
+
+        sent_at = sent_at or _now_str()
+        with self.transaction("record_system_reply"):
+            self._conn.execute(
+                """INSERT OR IGNORE INTO inbox_messages (
+                       message_id, group_id, sender_id, sender_role, content,
+                       message_type, reply_to_message_id, sent_at, received_at, status)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    message_id, group_id, "", ROLE_SYSTEM, text,
+                    "text", None, sent_at, _now_str(), "COMPLETED",
+                ),
+            )
 
     def inbox_next_due(self, limit: int = 20, *, now: str | None = None) -> list[dict[str, Any]]:
         """取可处理消息（RECEIVED 或已到期的 RETRY_PENDING），按 (group, sent_at, message_id) 排序。"""
@@ -574,7 +694,10 @@ class Database:
         if exclude_message_id:
             params.append(exclude_message_id)
         rows = self.connect().execute(
-            f"""SELECT message_id, sender_id, sender_role, content, sent_at
+            f"""SELECT message_id, sender_id, sender_role,
+                       CASE WHEN sender_role='SYSTEM' THEN '系统'
+                            ELSE sender_id END AS sender_name,
+                       content, sent_at
                 FROM inbox_messages
                 WHERE group_id=? {exclude}
                 ORDER BY sent_at DESC, message_id DESC LIMIT ?""",
@@ -662,12 +785,19 @@ class Database:
     def link_message(
         self, message_id: str, ticket_id: int, link_type: str, routing_score: float = 0.0
     ) -> None:
-        """记录消息最终归属（在业务事务内调用）。"""
+        """记录消息最终归属（在业务事务内调用）。
+
+        同时回填 message_attachments 的 ticket_id（图片可能先于建单出现）。
+        """
         self._conn.execute(
             """INSERT OR REPLACE INTO message_ticket_links
                    (message_id, ticket_id, link_type, routing_score, linked_at)
                VALUES (?,?,?,?,?)""",
             (message_id, ticket_id, link_type, routing_score, _now_str()),
+        )
+        self._conn.execute(
+            "UPDATE message_attachments SET ticket_id=? WHERE message_id=? AND ticket_id IS NULL",
+            (ticket_id, message_id),
         )
 
     def get_message_link(self, message_id: str) -> dict[str, Any] | None:

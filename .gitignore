@@ -33,10 +33,8 @@ htmlcov/
 .vscode/
 *.swp
 
-# ---- 数据库与运行时数据 ----
-data/*.db
-data/*.db-wal
-data/*.db-shm
+# ---- 数据库与运行时数据（含群配置、导出、归档图片，严禁提交） ----
+data/
 logs/
 archives/
 

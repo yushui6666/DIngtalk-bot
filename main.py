@@ -52,12 +52,14 @@ def _load_env_file() -> None:
 # 模块加载即加载 .env，保证 config 能读到 LLM_API_KEY 等环境变量
 _load_env_file()
 
+import config as _config  # noqa: E402  — 需在 _load_env_file 之后导入
 from config import (  # noqa: E402  — 需在 _load_env_file 之后导入
     GROUPS,
     LLM_API_KEY,
     LLM_ENABLED,
     LOG_DIR,
     load_groups,
+    set_groups_config,
 )
 
 
@@ -94,7 +96,17 @@ def _build_pipeline(mode: str):
     context = TicketContextStore(db)
     pending = PendingActionService(db)
     executor = TicketCommandExecutor(db, repo)
-    notifier = Notifier(db, _dws_sender)
+    notifier = Notifier(
+        db, _dws_sender,
+        enabled=mode != "SHADOW",
+    )
+
+    archiver = None
+    if _config.IMAGE_ARCHIVE_ENABLED:
+        from images.archive import AttachmentArchiver
+
+        archiver = AttachmentArchiver(db=db)
+        logger.info("图片附件归档已启用 max_bytes=%d", _config.IMAGE_MAX_BYTES)
 
     classifier = None
     if LLM_ENABLED and LLM_API_KEY:
@@ -117,27 +129,46 @@ def _build_pipeline(mode: str):
         executor=executor,
         notifier=notifier,
         classifier=classifier,
+        archiver=archiver,
         mode=RuntimeMode(mode),
     )
-    return db, pipeline, notifier
+    return db, pipeline, notifier, archiver
 
 
-async def main(mode: str, duration: int | None, group_filter: str | None) -> None:
+async def main(
+    mode: str,
+    duration: int | None,
+    group_filter: str | None,
+    *,
+    test_config: bool = False,
+    groups_config: str | None = None,
+) -> None:
     from event_listener import run_listeners
     from workers.inbox_worker import InboxWorker
     from workers.scheduler import SchedulerWorker
 
-    db, pipeline, notifier = _build_pipeline(mode)
+    # 群配置切换（--test 用测试群配置，--groups-config 指定文件）
+    if test_config or groups_config:
+        set_groups_config(test=test_config, path=groups_config)
+
+    db, pipeline, notifier, archiver = _build_pipeline(mode)
 
     async def inbox_handler(msg) -> None:
         """监听回调：快速入箱，不在回调内调用模型。"""
         enqueued = db.enqueue_message(msg)
         logger.info("消息入箱 %s enqueued=%s", msg.brief(), enqueued)
 
-    groups = GROUPS
+    import config as _config
+
+    groups = _config.GROUPS
     if group_filter:
-        groups = [g for g in GROUPS if g["store_name"] == group_filter]
+        groups = [g for g in _config.GROUPS if g["store_name"] == group_filter]
     load_groups()
+
+    # 把配置群同步到数据库（幂等，工单序号 ticket_seq 保留），
+    # 保证建单时 executor 的 db.get_group() 能取到群配置
+    for g in groups:
+        db.upsert_group(g)
 
     worker = InboxWorker(
         db=db,
@@ -163,6 +194,8 @@ async def main(mode: str, duration: int | None, group_filter: str | None) -> Non
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        if archiver is not None:
+            await archiver.aclose()
         db.close()
         logger.info("系统停止")
 
@@ -173,10 +206,18 @@ if __name__ == "__main__":
                         default="PRODUCTION", help="运行模式")
     parser.add_argument("--duration", type=int, default=None, help="运行秒数（默认长驻）")
     parser.add_argument("--group", default=None, help="仅监听指定群名")
+    parser.add_argument("--test", action="store_true",
+                        help="使用测试群配置 data/group-test.json（与 --groups-config 互斥）")
+    parser.add_argument("--groups-config", default=None,
+                        help="指定群配置文件路径（优先于 --test）")
     args = parser.parse_args()
 
     setup_logging(level="INFO", log_dir=LOG_DIR)
     try:
-        asyncio.run(main(args.mode, args.duration, args.group))
+        asyncio.run(main(
+            args.mode, args.duration, args.group,
+            test_config=args.test,
+            groups_config=args.groups_config,
+        ))
     except KeyboardInterrupt:
         sys.exit(0)

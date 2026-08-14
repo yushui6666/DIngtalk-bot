@@ -193,6 +193,29 @@ class SemanticClassifier:
             )
             return _fallback_decision(self._protocol, message.message_id, "unknown_intent")
 
+        # 4.5 业务动作词兜底：消息明确是单个业务动作（如「报修」「报修一下」），
+        #     但模型误判为 chat.ignore → 返回该业务动作，缺失字段交给 validator 引导补全。
+        if intent == "chat.ignore" and len(action_cues) == 1:
+            cue_intent, _cues = action_cues[0]
+            if cue_intent in {a.intent_id for a in self._protocol.actions}:
+                logger.info(
+                    "业务动作词兜底 message_id=%s cue_intent=%s（模型判 ignore）",
+                    message.message_id, cue_intent,
+                )
+                return SemanticDecision(
+                    protocol_version=self._protocol.protocol_version,
+                    source="SEMANTIC_MODEL",
+                    intent=cue_intent,
+                    target_ticket_no=None,
+                    intent_confidence=0.6,
+                    fields={},
+                    missing_fields=tuple(
+                        f for f in self._protocol.get_action(cue_intent).required_fields
+                        if f != "ticket_no"
+                    ),
+                    evidence=tuple(_cues),
+                )
+
         action = self._protocol.get_action(intent)
         if action is None:
             return _fallback_decision(self._protocol, message.message_id, "unknown_intent")
@@ -360,6 +383,8 @@ def _build_payload(
         parts = [f"- {a.intent_id}"]
         if a.required_fields:
             parts.append("必填:" + ",".join(a.required_fields))
+        if a.optional_fields:
+            parts.append("可选:" + ",".join(a.optional_fields))
         example = next((e for e in a.positive_examples if e), "")
         if example:
             parts.append("例:" + example.replace("\n", " ")[:48])
@@ -395,6 +420,10 @@ def _build_payload(
         "- 只抽取用户明确表达的信息\n"
         "- 不要猜测位置、设备名称等\n"
         "- 字段键名使用英文字段名\n"
+        "- 报修时字段拆分：subject=场馆/空间名（如「博物馆奇妙夜」），"
+        "location=更具体的发生位置（如「里面的那间房子」「一楼大厅」），"
+        "device=具体损坏的物品（如「风扇」「消防门」），problem_description=故障描述。"
+        "不要把整串修饰语都塞进 location，也不要把损坏物品当 subject\n"
         "- 如果消息没有明确报修/诊断/完成等意图，返回 chat.ignore\n"
         "- 同一消息包含两个或更多业务动作时，即使后一个动作是未来或条件动作，也返回 system.clarify\n"
         "- 用户从候选工单中明确选择编号或序号时，返回 ticket.select\n"

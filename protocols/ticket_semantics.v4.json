@@ -2,7 +2,7 @@
   "protocol_version": "4.0.0",
   "compiled_at": "2026-08-12T10:19:26+08:00",
   "compiled_by": "protocol_compiler",
-  "source_sha256": "b82c9eac59e68e6ae28e06524be7cf0b35304991967b060170c0e80a48ef7e51",
+  "source_sha256": "5687e936efa4feff3f072275506f20d2363bfc2033f59debc7fc8aeeaaf4fff7",
   "actions": [
     {
       "intent_id": "ticket.add_detail",
@@ -241,6 +241,10 @@
         "problem_description": {
           "type": "text",
           "required": true
+        },
+        "device": {
+          "type": "text",
+          "required": false
         },
         "sla": {
           "type": "enum",

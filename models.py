@@ -18,6 +18,20 @@ ROLE_OTHER = "OTHER"            # 其他成员（只归档）
 ROLE_SYSTEM = "SYSTEM"          # 系统监听账号
 ROLE_UNKNOWN = "UNKNOWN"        # 未在群配置中的发送人
 
+# 角色 → 中文（用于群内回执展示，内部存储仍用英文枚举）
+ROLE_LABELS = {
+    ROLE_MANAGER: "店长",
+    ROLE_ENGINEER: "工程师",
+    ROLE_OTHER: "其他成员",
+    ROLE_SYSTEM: "系统",
+    ROLE_UNKNOWN: "未识别成员",
+}
+
+
+def role_label(role: str) -> str:
+    """角色枚举 → 中文；未映射时原样返回。"""
+    return ROLE_LABELS.get(role, role)
+
 # 工单状态
 TICKET_ACTIVE = "ACTIVE"
 TICKET_OVERDUE = "ACTIVE_OVERDUE"
@@ -51,6 +65,28 @@ NOTIFY_SENT = "SENT"
 NOTIFY_FAILED = "FAILED"
 NOTIFY_CANCELLED = "CANCELLED"
 
+# 图片附件来源类型（Task 4A）
+ATT_SOURCE_REMOTE_URL = "remote_url"        # 受信任 HTTPS 临时 URL
+ATT_SOURCE_DINGTALK_MEDIA = "dingtalk_media"  # 钉钉媒体 ID（真实下载接口待接入）
+ATT_SOURCE_DATA_URL = "data_url"            # data:image/...;base64,...（测试用）
+ATT_SOURCE_LOCAL_PATH = "local_path"        # 本地文件（仅测试/开发允许）
+ATT_SOURCE_UNKNOWN = "unknown"              # 无法定位下载源，保留原文待核对
+
+
+@dataclass(frozen=True)
+class ImageAttachment:
+    """标准化时从事件提取的图片附件（Task 4A）。
+
+    存储字段（stored_path/sha256 等）由 ImageArchiveStore 归档后回填到
+    message_attachments 表，不在事件标准化阶段生成。
+    """
+
+    attachment_index: int
+    source_type: str
+    source_ref: str
+    file_name: str | None = None
+    declared_mime_type: str | None = None
+
 
 @dataclass
 class NormalizedMessage:
@@ -71,6 +107,7 @@ class NormalizedMessage:
     sender_role: str = ROLE_UNKNOWN
     is_self: bool = False
     reply_to_message_id: Optional[str] = None  # v4.0: 钉钉回复/引用目标消息 ID
+    attachments: list[ImageAttachment] = field(default_factory=list)  # v4.1: 图片附件
     raw_event: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:

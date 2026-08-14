@@ -20,7 +20,7 @@ from semantics.types import (
     ValidatedCommand,
 )
 
-from models import NormalizedMessage
+from models import NormalizedMessage, role_label
 
 # 订单号占位值（v3.0 遗留规则，仍适用）
 _ORDER_NO_PLACEHOLDERS = frozenset({"无", "暂无", "稍后补", "不知道"})
@@ -39,6 +39,43 @@ _ALLOWED_REPAIR_METHODS = frozenset({
 
 # SLA 允许值
 _ALLOWED_SLA = frozenset({"1天", "3天", "7天"})
+
+# 字段名 → 中文（与协议 field_definitions 的 aliases 对齐，用于回执展示）
+_FIELD_LABELS = {
+    "ticket_no": "工单编号",
+    "subject": "主题",
+    "location": "位置",
+    "problem_description": "问题描述",
+    "device": "设备",
+    "urgency": "紧急程度",
+    "attachments": "附件",
+    "sla": "时效",
+    "diagnosis_items": "故障判断",
+    "repair_method": "维修方式",
+    "order_no": "订单号",
+    "timeout_reason": "未完成原因",
+    "completion_note": "完成说明",
+    "cancel_reason": "取消原因",
+    "reopen_reason": "重开原因",
+}
+
+# 工单状态枚举 → 中文
+_TICKET_STATUS_LABELS = {
+    "ACTIVE": "进行中",
+    "ACTIVE_OVERDUE": "已超时",
+    "COMPLETED": "已完成",
+    "CANCELLED": "已取消",
+}
+
+
+def _field_label(field_name: str) -> str:
+    """字段名 → 中文；未映射时原样返回。"""
+    return _FIELD_LABELS.get(field_name, field_name)
+
+
+def _ticket_status_label(status: str) -> str:
+    """工单状态 → 中文；未映射时原样返回。"""
+    return _TICKET_STATUS_LABELS.get(status, status)
 
 
 def _validate_role(action: Any, message: NormalizedMessage) -> bool:
@@ -74,7 +111,7 @@ def _validate_enum(field_name: str, value: Any, action: Any) -> str | None:
     allowed = fd.get("allowed")
     if allowed and isinstance(allowed, list):
         if value not in allowed:
-            return f"'{field_name}' 值 '{value}' 不在允许范围 {allowed}"
+            return f"{_field_label(field_name)} '{value}' 无效，可选：{('、'.join(str(a) for a in allowed))}"
     return None
 
 
@@ -173,8 +210,8 @@ def _resolve_target_candidate(
 
     if target and action.allowed_ticket_states and target.status not in action.allowed_ticket_states:
         errors.append(
-            f"目标工单状态 '{target.status}' 不允许执行 '{decision.intent}'，"
-            f"允许状态: {action.allowed_ticket_states}"
+            f"该工单当前状态「{_ticket_status_label(target.status)}」，不能执行「{decision.intent}」，"
+            f"仅限状态为 {('、'.join(_ticket_status_label(s) for s in action.allowed_ticket_states))} 的工单"
         )
 
     return target, errors
@@ -233,15 +270,16 @@ def validate_decision(
     if not _validate_role(action, message):
         from tickets.commands import intent_label
 
+        allowed = [role_label(r) for r in action.allowed_roles]
         errors.append(
-            f"角色 '{message.sender_role}' 无权限执行「{intent_label(decision.intent)}」，"
-            f"允许角色: {action.allowed_roles}"
+            f"{role_label(message.sender_role)}没有「{intent_label(decision.intent)}」权限，"
+            f"该操作仅限{('、'.join(allowed))}执行"
         )
 
     # 2. 必填字段
     missing = _validate_required_fields(action, fields, decision.target_ticket_no)
     for mf in missing:
-        errors.append(f"缺少必填字段 '{mf}'")
+        errors.append(f"缺少{_field_label(mf)}，请在消息中说明")
 
     # 3. 枚举值校验
     for fname, fvalue in fields.items():
@@ -252,13 +290,13 @@ def validate_decision(
     # SLA 特殊枚举校验（字段名可能在不同 action 中）
     if "sla" in fields and fields["sla"] not in _ALLOWED_SLA:
         if "sla" not in [f for f in errors if "sla" in f]:
-            errors.append(f"时效 '{fields['sla']}' 不在允许范围 ['1天', '3天', '7天']")
+            errors.append(f"时效 '{fields['sla']}' 无效，可选：1天、3天、7天")
 
     # 维修方式枚举校验
     if "repair_method" in fields:
         if fields["repair_method"] not in _ALLOWED_REPAIR_METHODS:
             if "repair_method" not in [f for f in errors if "repair_method" in f]:
-                errors.append(f"维修方式 '{fields['repair_method']}' 不在允许的 5 种方式中")
+                errors.append(f"维修方式 '{fields['repair_method']}' 无效，可选：{('、'.join(_ALLOWED_REPAIR_METHODS))}")
 
     # 4. 订单号校验（淘宝采购特例）
     if fields.get("repair_method") == "淘宝采购后自行维修":

@@ -79,12 +79,19 @@ class TicketRouter:
         if suffix_target is not None:
             return RouteResult(RouteDecision.ROUTED, suffix_target.ticket_id, candidate_ids, LINK_SUFFIX, 1.0)
 
-        # 3. 用户短期选择上下文
-        if selected_ticket_id is not None and selected_ticket_id in id_map:
+        # 3. 用户短期选择上下文。
+        #    注意：ticket.create（新建工单）不受选单上下文影响——用户选过工单后再发
+        #    新报修，语义是新建而非补充到已选工单（否则会触发「不得绑定既有目标工单」）。
+        #    故 ticket.create 跳过本步，直接走第 5 步 _route_create。
+        if (
+            decision.intent != "ticket.create"
+            and selected_ticket_id is not None
+            and selected_ticket_id in id_map
+        ):
             return RouteResult(RouteDecision.ROUTED, selected_ticket_id, candidate_ids, LINK_CONTEXT, 1.0)
 
         # 4. 语义候选匹配（多候选评分）
-        if decision.candidate_scores and group_candidates:
+        if decision.intent != "ticket.create" and decision.candidate_scores and group_candidates:
             routed = self._route_by_scores(decision.candidate_scores, id_map, no_map)
             if routed is not None:
                 return routed

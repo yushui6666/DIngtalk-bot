@@ -1,0 +1,342 @@
+"""按模版导出工单为 Markdown 记录，保存到 工单记录/ 目录。
+
+用法::
+
+    python scripts/export_tickets_md.py                    # 导出全部工单
+    python scripts/export_tickets_md.py --group 测试群      # 只导某个群
+    python scripts/export_tickets_md.py --ticket 编号       # 只导某张工单
+
+输出目录：/Users/yushui/Desktop/钉钉消息/工单记录/（可用 --out 覆盖）
+每个工单一个 .md 文件，文件名 = 工单编号.md。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import datetime
+from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from config import GROUPS, USER_ID_MAP  # noqa: E402
+from db import Database  # noqa: E402
+
+# 内置兜底映射（测试账号等未出现在门店 CSV 中的成员）
+NAME_MAP: dict[str, str] = {
+    "Dk7Rf4NfFahnD2MHQgAE3gy2iPTIiiIm8jw": "yushui",
+    "DV2iipykTJciSappVW4GfsiSQii2iPTIiiIm8jw": "聂宇清",
+    "DuT5LjNZRjS4FEpdu6iiiiBAsCVtyPWXcbW": "朱兴福",
+}
+
+# 门店成员姓名映射文件（openDingtalkId → 姓名，含店长/区域负责人/工程师等）
+_STORE_CSV = Path("/Users/yushui/WorkBuddy/2026-08-13-16-38-27/dingtalk_stores/门店群数据汇总_v2.csv")
+
+
+def _load_store_name_map() -> dict[str, str]:
+    """从门店 CSV 提取 openDingtalkId → 姓名 映射。"""
+    import csv
+
+    mapping: dict[str, str] = {}
+    if not _STORE_CSV.exists():
+        return mapping
+    with open(_STORE_CSV, encoding="utf-8-sig") as fh:
+        for row in csv.DictReader(fh):
+            for name_col, oid_col in [
+                ("店长姓名", "店长openDingtalkId"),
+                ("区域负责人姓名", "区域负责人openDingtalkId"),
+                ("总工程师姓名", "总工程师openDingtalkId"),
+                ("工程师姓名", "工程师openDingtalkId"),
+            ]:
+                names = [n.strip() for n in (row.get(name_col) or "").split(";") if n.strip()]
+                oids = [o.strip() for o in (row.get(oid_col) or "").split(";") if o.strip()]
+                for name, oid in zip(names, oids):
+                    if name and oid:
+                        mapping[oid] = name
+    return mapping
+
+
+NAME_MAP = {**_load_store_name_map(), **NAME_MAP}
+
+_ROLE_LABELS = {
+    "MANAGER": "店长",
+    "ENGINEER": "工程师",
+    "OTHER": "其他成员",
+    "SYSTEM": "系统",
+}
+
+_STATUS_LABELS = {
+    "ACTIVE": "进行中",
+    "ACTIVE_OVERDUE": "已超时",
+    "COMPLETED": "已完成",
+    "CANCELLED": "已取消",
+}
+
+
+def _name(oid: str) -> str:
+    return NAME_MAP.get(oid, oid[:8] + "…")
+
+
+def _fmt(dt: str) -> str:
+    return (dt or "")[:16]
+
+
+def _status_text(t: dict) -> str:
+    return _STATUS_LABELS.get(t["status"], t["status"])
+
+
+def _diagnosis_current(conn, ticket_id: int) -> list[str]:
+    row = conn.execute(
+        "SELECT items_json FROM diagnosis_versions WHERE ticket_id=? AND is_current=1 "
+        "ORDER BY id DESC LIMIT 1", (ticket_id,)
+    ).fetchone()
+    if not row:
+        return []
+    try:
+        return list(json.loads(row["items_json"]))
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def _diagnosis_history(conn, ticket_id: int) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM diagnosis_versions WHERE ticket_id=? ORDER BY id", (ticket_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _repair_current(conn, ticket_id: int) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM repair_method_versions WHERE ticket_id=? AND is_current=1 "
+        "ORDER BY id DESC LIMIT 1", (ticket_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def _repair_history(conn, ticket_id: int) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM repair_method_versions WHERE ticket_id=? ORDER BY id", (ticket_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _timeout_history(conn, ticket_id: int) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM timeout_cycles WHERE ticket_id=? ORDER BY cycle_no", (ticket_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _messages(conn, ticket_id: int) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM messages WHERE ticket_id=? ORDER BY sent_at, id", (ticket_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def render_ticket(t: dict, conn) -> str:
+    tid = t["id"]
+    lines: list[str] = []
+
+    # 标题
+    lines.append(f"# {t['ticket_no']}\n")
+    lines.append("| 字段 | 内容 |")
+    lines.append("|------|------|")
+    lines.append(f"| 工单命名 | {t['ticket_no']} |")
+    lines.append(f"| 店铺 | {t['store_name']} |")
+    lines.append(f"| 状态 | {_status_text(t)} |")
+    lines.append(f"| 报修人 | {_name(t['reporter_id'])} |")
+    lines.append(f"| 主题 | {t['subject']} |")
+    lines.append(f"| 位置 | {t['location']} |")
+    lines.append(f"| 问题描述 | {(t['problem_description'] or '').replace(chr(10), ' ') } |")
+    lines.append(f"| 时效 | {t['sla_days']}天 |")
+    lines.append(f"| 报修时间 | {_fmt(t['created_at'])} |")
+    lines.append(f"| 初始截止时间 | {_fmt(t['initial_deadline_at'])} |")
+    lines.append(f"| 最终截止时间 | {_fmt(t['current_deadline_at'])} |")
+
+    # 关闭信息（若已关闭/取消）
+    if t["status"] in ("COMPLETED", "CANCELLED"):
+        lines.append(f"| 关闭人 | {_name(t.get('cancelled_by') or '') if t['status']=='CANCELLED' else _closer_name(conn, tid, t)} |")
+        lines.append(f"| 关闭角色 | {_closer_role(conn, tid, t)} |")
+        lines.append(f"| 关闭时间 | {_fmt(t['closed_at'] or t['cancelled_at'])} |")
+        if t.get("cancel_reason"):
+            lines.append(f"| 取消原因 | {(t['cancel_reason'] or '').replace(chr(10), ' ')} |")
+    lines.append("")
+
+    # 当前故障判断
+    diag = _diagnosis_current(conn, tid)
+    lines.append("## 当前故障判断\n")
+    if diag:
+        for d in diag:
+            lines.append(f"- {d}")
+    else:
+        lines.append("- （暂无）")
+    lines.append("")
+
+    # 故障判断历史
+    dhis = _diagnosis_history(conn, tid)
+    lines.append("## 故障判断历史\n")
+    for i, v in enumerate(dhis, 1):
+        try:
+            items = list(json.loads(v["items_json"]))
+        except (json.JSONDecodeError, TypeError):
+            items = []
+        lines.append(f"### 第 {i} 版 — {_name(v['engineer_id'])}（{_fmt(v['submitted_at'])}）\n")
+        for it in items:
+            lines.append(f"- {it}")
+        lines.append("")
+    if not dhis:
+        lines.append("- （无）\n")
+
+    # 当前维修方式
+    rcur = _repair_current(conn, tid)
+    lines.append("## 当前维修方式\n")
+    if rcur:
+        lines.append(f"维修方式：{rcur['repair_method']}\n")
+        if rcur.get("order_no"):
+            lines.append(f"当前订单号：{rcur['order_no']}\n")
+    else:
+        lines.append("- （暂无）\n")
+    lines.append("")
+
+    # 维修方式历史
+    rhis = _repair_history(conn, tid)
+    lines.append("## 维修方式历史\n")
+    for i, v in enumerate(rhis, 1):
+        lines.append(f"### 第 {i} 版 — {_name(v['engineer_id'])}（{_fmt(v['submitted_at'])}）\n")
+        lines.append(f"维修方式：{v['repair_method']}\n")
+        if v.get("order_no"):
+            lines.append(f"订单号：{v['order_no']}\n")
+        lines.append("")
+    if not rhis:
+        lines.append("- （无）\n")
+
+    # 超时与延期记录
+    touts = _timeout_history(conn, tid)
+    lines.append("## 超时与延期记录\n")
+    if touts:
+        lines.append("| 轮次 | 旧截止时间 | 超时原因 | 提交人 | 提交时间 | 新截止时间 |")
+        lines.append("|------|-----------|----------|--------|----------|-----------|")
+        for v in touts:
+            lines.append(
+                f"| {v['cycle_no']} | {_fmt(v['old_deadline_at'])} | "
+                f"{(v['reason'] or '').replace(chr(10), ' ')} | "
+                f"{_name(v['reason_engineer_id'])} | {_fmt(v['reason_submitted_at'])} | "
+                f"{_fmt(v['new_deadline_at'])} |"
+            )
+        lines.append("")
+    else:
+        lines.append("- （无）\n")
+
+    # 报修内容
+    msgs = _messages(conn, tid)
+    create_msg = next((m for m in msgs if m["sender_role"] == "MANAGER" and "报修" in (m["content"] or "")), msgs[0] if msgs else None)
+    lines.append("## 报修内容\n")
+    if create_msg:
+        lines.append("```\n" + create_msg["content"].strip() + "\n```\n")
+    lines.append("")
+
+    # 处理过程
+    lines.append("## 处理过程\n")
+    lines.append("> 以下按消息发送时间顺序排列。\n")
+    for m in msgs:
+        role = _ROLE_LABELS.get(m["sender_role"], m["sender_role"])
+        sender = _name(m["sender_id"])
+        lines.append(f"**{sender}**（{role}）{_fmt(m['sent_at'])}")
+        content = m["content"].strip()
+        for seg in content.split("\n"):
+            lines.append(f"> {seg}")
+        lines.append("")
+    if not msgs:
+        lines.append("- （无消息记录）\n")
+
+    # 关闭信息
+    lines.append("## 关闭信息\n")
+    if t["status"] == "COMPLETED":
+        lines.append(f"- 关闭人：{_closer_name(conn, tid, t)}（{_closer_role(conn, tid, t)}）")
+        lines.append(f"- 关闭时间：{_fmt(t['closed_at'])}")
+        close_msg = _completion_message(conn, tid, t)
+        if close_msg:
+            lines.append(f"- 关闭消息：{close_msg['content'].strip()}")
+    elif t["status"] == "CANCELLED":
+        lines.append(f"- 取消人：{_name(t['cancelled_by'])}")
+        lines.append(f"- 取消时间：{_fmt(t['cancelled_at'])}")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def _completion_message(conn, ticket_id: int, t: dict) -> dict | None:
+    """完工消息：优先用工单的 last_business_message_id（最后业务事件），可靠。"""
+    last_id = t.get("last_business_message_id")
+    if last_id:
+        row = conn.execute(
+            "SELECT * FROM messages WHERE ticket_id=? AND message_id=?",
+            (ticket_id, last_id),
+        ).fetchone()
+        if row:
+            return dict(row)
+    msgs = _messages(conn, ticket_id)
+    for m in reversed(msgs):
+        if m["sender_role"] in ("MANAGER", "ENGINEER"):
+            return m
+    return None
+
+
+def _closer_name(conn, ticket_id: int, t: dict) -> str:
+    close = _completion_message(conn, ticket_id, t)
+    if close:
+        return _name(close["sender_id"])
+    return _name(t.get("closed_by") or "")
+
+
+def _closer_role(conn, ticket_id: int, t: dict) -> str:
+    close = _completion_message(conn, ticket_id, t)
+    if close:
+        return _ROLE_LABELS.get(close["sender_role"], close["sender_role"])
+    return ""
+
+
+def export_all(*, out_dir: Path, group_filter: str | None = None, ticket_filter: str | None = None) -> int:
+    db = Database()
+    conn = db.connect()
+
+    where = ""
+    params: list = []
+    if ticket_filter:
+        where = "WHERE ticket_no=?"
+        params = [ticket_filter]
+    rows = conn.execute(f"SELECT * FROM tickets {where} ORDER BY created_at DESC", params).fetchall()
+
+    group_names = {g["store_name"] for g in GROUPS}
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written = 0
+    for row in rows:
+        t = dict(row)
+        if group_filter and t["store_name"] != group_filter:
+            continue
+        md = render_ticket(t, conn)
+        out = out_dir / f"{t['ticket_no']}.md"
+        out.write_text(md, encoding="utf-8")
+        written += 1
+        print(f"已导出 {t['ticket_no']} → {out}")
+    print(f"\n共导出 {written} 张工单 → {out_dir}")
+    db.close()
+    return written
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="按模版导出工单 Markdown 记录")
+    parser.add_argument("--group", default=None, help="仅导出指定群名（默认全部）")
+    parser.add_argument("--ticket", default=None, help="仅导出指定工单编号")
+    parser.add_argument("--out", type=Path, default=Path("/Users/yushui/Desktop/钉钉消息/工单记录"),
+                        help="输出目录（默认 工单记录/）")
+    args = parser.parse_args()
+    export_all(out_dir=args.out, group_filter=args.group, ticket_filter=args.ticket)
+
+
+if __name__ == "__main__":
+    main()
