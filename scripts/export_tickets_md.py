@@ -137,6 +137,30 @@ def _messages(conn, ticket_id: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def _attachments(conn, ticket_id: int) -> list[dict]:
+    """工单全部已归档图片附件（含多模态解析结果）。"""
+    rows = conn.execute(
+        "SELECT * FROM message_attachments "
+        "WHERE ticket_id=? AND stored_path IS NOT NULL "
+        "ORDER BY id",
+        (ticket_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _image_absolute_path(stored_path: str | None) -> str | None:
+    """附件相对路径 → 绝对路径（用于 Markdown 展示）。"""
+    if not stored_path:
+        return None
+    try:
+        from images.archive import ImageArchiveStore
+
+        store = ImageArchiveStore()
+        return str(store.resolve_relative_path(stored_path))
+    except Exception:
+        return None
+
+
 def render_ticket(t: dict, conn) -> str:
     tid = t["id"]
     lines: list[str] = []
@@ -252,6 +276,26 @@ def render_ticket(t: dict, conn) -> str:
         lines.append("")
     if not msgs:
         lines.append("- （无消息记录）\n")
+
+    # 图片与解析内容
+    atts = _attachments(conn, tid)
+    if atts:
+        lines.append("## 图片记录\n")
+        for a in atts:
+            abs_path = _image_absolute_path(a["stored_path"])
+            if abs_path:
+                lines.append(f"![图片]({abs_path})")
+            else:
+                lines.append(f"- 图片（{a['mime_type'] or '未知'}，未归档）")
+            vision = (a.get("vision_result_json") or "").strip()
+            if vision:
+                lines.append("")
+                lines.append(f"**解析内容**：{vision}")
+            elif a.get("analyzed_status") == "ANALYZED" and not vision:
+                lines.append("")
+                lines.append("**解析内容**：（空）")
+            lines.append("")
+        lines.append("")
 
     # 关闭信息
     lines.append("## 关闭信息\n")

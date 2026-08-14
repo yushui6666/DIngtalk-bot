@@ -342,6 +342,8 @@ CREATE TABLE IF NOT EXISTS order_monitor (
     last_status       TEXT NOT NULL DEFAULT '',
     shipped_notified  INTEGER NOT NULL DEFAULT 0,
     closed_notified   INTEGER NOT NULL DEFAULT 0,
+    received_at       TEXT,
+    received_notified INTEGER NOT NULL DEFAULT 0,
     created_at        TEXT NOT NULL,
     updated_at        TEXT NOT NULL
 );
@@ -429,7 +431,20 @@ class Database:
             if column not in existing:
                 conn.execute(f"ALTER TABLE tickets ADD COLUMN {ddl}")
 
-        # 3. 记录迁移版本
+        # 3. order_monitor 新增签收字段（v4.1：到货签收后开始计时，不再下单自动延期）
+        om_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(order_monitor)").fetchall()
+        }
+        _ORDER_MONITOR_MIGRATION_COLUMNS = {
+            "received_at": "received_at TEXT",
+            "received_notified": "received_notified INTEGER NOT NULL DEFAULT 0",
+        }
+        for column, ddl in _ORDER_MONITOR_MIGRATION_COLUMNS.items():
+            if column not in om_cols:
+                conn.execute(f"ALTER TABLE order_monitor ADD COLUMN {ddl}")
+
+        # 4. 记录迁移版本
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations (version, applied_at)"
             " VALUES ('4.0.0_task5_multiticket', ?)",
@@ -608,6 +623,28 @@ class Database:
                 (error, attachment_id),
             )
 
+    def update_attachment_vision(
+        self, attachment_id: int, *, result: str, status: str = "ANALYZED"
+    ) -> None:
+        """多模态解析成功：写入结果并标记已解析。"""
+        from datetime import datetime
+
+        with self.transaction("attachment_vision"):
+            self._conn.execute(
+                """UPDATE message_attachments
+                   SET vision_result_json=?, analyzed_status=?, analyzed_at=?, error=NULL
+                   WHERE id=?""",
+                (result, status, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), attachment_id),
+            )
+
+    def mark_attachment_analyze_error(self, attachment_id: int, error: str) -> None:
+        """解析失败：记录错误，保留状态供重试。"""
+        with self.transaction("attachment_analyze_error"):
+            self._conn.execute(
+                "UPDATE message_attachments SET error=?, analyzed_status='FAILED' WHERE id=?",
+                (error, attachment_id),
+            )
+
     def backfill_attachment_ticket(self, message_id: str, ticket_id: int) -> None:
         """消息归属工单后回填附件 ticket_id（link_message 内已自动调用，此为显式入口）。"""
         with self.transaction("attachment_backfill"):
@@ -625,6 +662,13 @@ class Database:
         sql += " ORDER BY id"
         rows = self.connect().execute(sql, params).fetchall()
         return [dict(r) for r in rows]
+
+    def get_inbox_message(self, message_id: str) -> Optional[dict[str, Any]]:
+        """按消息 ID 查收件箱记录（含 group_id 等），供附件下载等场景使用。"""
+        row = self.connect().execute(
+            "SELECT * FROM inbox_messages WHERE message_id=?", (message_id,)
+        ).fetchone()
+        return dict(row) if row else None
 
     def record_system_reply(
         self, group_id: str, message_id: str, text: str, *, sent_at: str | None = None
@@ -1219,7 +1263,10 @@ class Database:
         store: str,
         ticket_no: str,
     ) -> None:
-        """登记一个报修工单提交的订单（首次提交时调用，标记已延期）。"""
+        """登记一个报修工单提交的订单（首次提交时调用）。
+
+        v4.1 起不再自动延期；等货期间照常算时效，签收后开始计时（见 scheduler）。
+        """
         with self.transaction("upsert_order_monitor"):
             self._conn.execute(
                 """INSERT INTO order_monitor
@@ -1245,8 +1292,13 @@ class Database:
         *,
         shipped_notified: bool | None = None,
         closed_notified: bool | None = None,
+        received_at: str | None = None,
+        received_notified: bool | None = None,
     ) -> None:
-        """更新订单 last_status 与通知标记（状态变化检测 + 一次性通知）。"""
+        """更新订单 last_status 与通知标记（状态变化检测 + 一次性通知）。
+
+        received_at/received_notified：到货签收后一次性标记（开始计时维修）。
+        """
         sets = ["last_status=?", "updated_at=?"]
         params: list[Any] = [status, _now_str()]
         if shipped_notified is not None:
@@ -1255,27 +1307,24 @@ class Database:
         if closed_notified is not None:
             sets.append("closed_notified=?")
             params.append(1 if closed_notified else 0)
+        if received_at is not None:
+            sets.append("received_at=?")
+            params.append(received_at)
+        if received_notified is not None:
+            sets.append("received_notified=?")
+            params.append(1 if received_notified else 0)
         params.append(order_id)
         self._conn.execute(
             f"UPDATE order_monitor SET {', '.join(sets)} WHERE order_id=?", params
         )
 
-    def extend_ticket_deadline(self, ticket_id: int, expected_version: int, days: int) -> bool:
-        """工单截止时间顺延 N 天（乐观版本 CAS，业务在收到订单号后调用）。"""
-        from datetime import datetime, timedelta
-
-        row = self._conn.execute(
-            "SELECT current_deadline_at FROM tickets WHERE id=?", (ticket_id,)
-        ).fetchone()
-        if row is None:
-            return False
-        new_deadline = (
-            datetime.strptime(row["current_deadline_at"], "%Y-%m-%d %H:%M:%S")
-            + timedelta(days=days)
-        ).strftime("%Y-%m-%d %H:%M:%S")
-        cur = self._conn.execute(
-            "UPDATE tickets SET current_deadline_at=?, version=version+1"
-            " WHERE id=? AND version=?",
-            (new_deadline, ticket_id, expected_version),
-        )
-        return cur.rowcount > 0
+    def list_received_active_tickets(self) -> list[dict[str, Any]]:
+        """有订单已签收、且仍处于活动态的工单（签收后每日提醒直至完成）。"""
+        rows = self.connect().execute(
+            """SELECT DISTINCT t.* FROM tickets t
+               JOIN order_monitor om ON om.ticket_id = t.id
+               WHERE om.received_at IS NOT NULL
+                 AND t.status IN ('ACTIVE', 'ACTIVE_OVERDUE')
+               ORDER BY t.id""",
+        ).fetchall()
+        return [dict(r) for r in rows]

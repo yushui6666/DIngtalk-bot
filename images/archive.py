@@ -175,6 +175,73 @@ def _decode_data_url(url: str) -> bytes:
     return base64.b64decode(payload, validate=False)
 
 
+class DingTalkMediaResolver:
+    """通过 dws CLI 下载钉钉媒体（mediaId → 字节）。
+
+    调用 `dws chat message download-media`，需要 mediaId + messageId +
+    openConversationId。实测：resource-id 必须带 `$` 前缀（content 里的原始值）；
+    dws 把文件写到 --output 指定路径，返回 downloadUrl。
+    """
+
+    def __init__(
+        self,
+        *,
+        dws_cmd: str = "dws",
+        timeout_seconds: float = 60.0,
+        tmp_dir: str | Path | None = None,
+    ) -> None:
+        self._dws_cmd = dws_cmd
+        self._timeout = timeout_seconds
+        self._tmp_dir = Path(tmp_dir) if tmp_dir else None
+
+    async def resolve(self, media_id: str, message_id: str, conversation_id: str) -> bytes:
+        import asyncio
+        import tempfile
+
+        # 保留完整 mediaId（含 $ 前缀，dws 实测必需）
+        media_id = media_id.strip()
+        tmp_dir = self._tmp_dir or Path(tempfile.gettempdir())
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        out_file = tmp_dir / f"dd_media_{media_id.lstrip('$')[:40]}_{message_id[-8:]}.bin"
+
+        proc = await asyncio.create_subprocess_exec(
+            self._dws_cmd,
+            "chat", "message", "download-media",
+            "--type", "mediaId",
+            "--resource-id", media_id,
+            "--message-id", message_id,
+            "--open-conversation-id", conversation_id,
+            "--output", str(out_file),
+            "--format", "json",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=self._timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise ValueError("钉钉媒体下载超时")
+        if proc.returncode != 0:
+            raise ValueError(
+                f"dws 下载失败 code={proc.returncode} stderr={stderr.decode('utf-8', 'replace')[:200]}"
+            )
+        out = stdout.decode("utf-8", "replace").strip()
+        if out.startswith("{"):
+            try:
+                import json as _json
+
+                obj = _json.loads(out)
+            except Exception:
+                obj = None
+            if obj is not None and not obj.get("success"):
+                raise ValueError(f"dws 下载失败: {str(obj)[:200]}")
+        if not out_file.exists():
+            raise ValueError(f"dws 下载后文件不存在 path={out_file}")
+        data = out_file.read_bytes()
+        out_file.unlink(missing_ok=True)
+        return data
+
+
 class AttachmentArchiver:
     """消息附件的下载与归档编排：失败只记 error，不抛到业务流程。
 
@@ -188,6 +255,7 @@ class AttachmentArchiver:
         db: Database,
         store: ImageArchiveStore | None = None,
         client: Any = None,
+        media_resolver: Any = None,
         enabled: bool = True,
         max_bytes: int = IMAGE_MAX_BYTES,
         max_count: int = IMAGE_MAX_COUNT_PER_MESSAGE,
@@ -197,6 +265,7 @@ class AttachmentArchiver:
     ) -> None:
         self._db = db
         self._store = store or ImageArchiveStore()
+        self._media_resolver = media_resolver or DingTalkMediaResolver()
         self._enabled = enabled
         self._max_bytes = max_bytes
         self._max_count = max_count
@@ -262,8 +331,10 @@ class AttachmentArchiver:
         if source_type == "remote_url":
             data = await self._download(source_ref)
         elif source_type == "dingtalk_media":
-            raise ValueError(
-                "钉钉媒体 ID 下载接口待接入（真实事件字段确认后实现 DingTalkMediaResolver）"
+            data = await self._media_resolver.resolve(
+                media_id=source_ref,
+                message_id=row["message_id"],
+                conversation_id=self._group_id_for_message(row["message_id"]),
             )
         elif source_type == "data_url":
             data = _decode_data_url(source_ref)
@@ -282,6 +353,16 @@ class AttachmentArchiver:
         if mime not in self._allowed_mime:
             raise ValueError(f"图片类型不允许 mime={mime}")
         return data, mime
+
+    def _group_id_for_message(self, message_id: str) -> str:
+        """由附件行的消息查群 ID（用于 dws 下载）；查不到返回空。"""
+        try:
+            row = self._db.get_inbox_message(message_id)
+            if row and row.get("group_id"):
+                return row["group_id"]
+        except Exception:
+            pass
+        return ""
 
     async def _download(self, url: str) -> bytes:
         if not self._url_ok(url):

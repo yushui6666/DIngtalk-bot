@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from typing import Any, Optional
 
@@ -60,15 +61,30 @@ def _parse_sent_at(raw: Any) -> Optional[datetime]:
     return None
 
 
+# 图片消息 content 渲染格式（dws 实测）：[图片消息](mediaId=$xxx) 注意：如需下载使用dws...
+_IMAGE_MSG_RE = re.compile(r"\[图片消息\]\(\s*mediaId=([^)\s]+)\s*\)")
+
+# 文件消息 content 渲染格式（防御性，待真实样本验证）
+_FILE_MSG_RE = re.compile(r"\[文件消息\]\(\s*[^)]*\s*\)")
+
+
 def _detect_message_type(event: dict[str, Any]) -> str:
     """按事件可选字段判断消息类型；缺省 text。
 
-    TODO(Phase 1 待办)：图片/文件/富文本事件的真实字段待采集样本后完善。
+    实测：dws 图片消息的事件不带 msg_type 字段，content 渲染为
+    `[图片消息](mediaId=$...)`。此处先探测显式字段，再回退到
+    content 文本模式匹配。
     """
     for key in ("msg_type", "msgtype", "type"):
         v = event.get(key)
         if isinstance(v, str) and v in _KNOWN_MEDIA_TYPES:
             return v
+    content = event.get("content")
+    if isinstance(content, str):
+        if _IMAGE_MSG_RE.search(content):
+            return MSG_IMAGE
+        if _FILE_MSG_RE.search(content):
+            return MSG_FILE
     return MSG_TEXT
 
 
@@ -180,6 +196,30 @@ def _extract_attachments(raw_event: dict[str, Any], message_type: str) -> list[I
     if message_type not in (MSG_IMAGE, MSG_FILE, MSG_RICH):
         return []
     content = raw_event.get("content")
+    # 文本渲染模式：dws 实测 content 形如 `[图片消息](mediaId=$xxx) 注意：...`
+    if isinstance(content, str):
+        img = _IMAGE_MSG_RE.search(content)
+        if img:
+            media_id = img.group(1).strip()
+            return [
+                ImageAttachment(
+                    attachment_index=0,
+                    source_type="dingtalk_media",
+                    source_ref=media_id,
+                )
+            ]
+        if _FILE_MSG_RE.search(content):
+            # 文件消息：暂无法从渲染文本定位下载源，记录原文待核对
+            return [
+                ImageAttachment(
+                    attachment_index=0,
+                    source_type="unknown",
+                    source_ref=content[:200],
+                    file_name=None,
+                )
+            ]
+        if "图片" in content or "图片消息" in content:
+            return []
     candidates: list[Any] = []
     structured = False
     if isinstance(content, list):

@@ -223,6 +223,69 @@ class OpenAICompatibleModelClient:
 
         return result
 
+    async def complete_vision(
+        self,
+        *,
+        image_bytes: bytes,
+        mime_type: str,
+        prompt: str | None = None,
+        idempotency_key: str,
+    ) -> str:
+        """OpenAI 兼容视觉请求：图片 base64 传入，返回文本描述。
+
+        请求格式：messages[].content 为 text + image_url 数组。
+        """
+        import base64 as _b64
+        import httpx
+
+        url = f"{self.base_url}/chat/completions"
+        request_trace_id = uuid.uuid4().hex[:12]
+        b64 = _b64.b64encode(image_bytes).decode("ascii")
+        data_url = f"data:{mime_type or 'image/png'};base64,{b64}"
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt or "请描述这张图片的内容。"},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }
+        ]
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+            "X-Idempotency-Key": idempotency_key,
+            "X-Request-Trace-Id": request_trace_id,
+        }
+        request_body = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.0,
+            "max_tokens": 1024,
+        }
+        logger.info(
+            "视觉请求 trace=%s model=%s idempotency=%s img_bytes=%d",
+            request_trace_id, self.model, idempotency_key, len(image_bytes),
+        )
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                response = await client.post(url, headers=headers, json=request_body)
+        except httpx.TimeoutException as exc:
+            logger.warning("视觉请求超时 trace=%s", request_trace_id)
+            raise ModelTimeoutError(f"视觉请求超时 ({self.timeout_seconds}s)") from exc
+
+        if response.status_code >= 400:
+            raise ModelResponseError(f"视觉请求 HTTP {response.status_code}")
+
+        try:
+            data = response.json()
+            content = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise ModelResponseError(f"视觉响应解析失败: {str(data)[:200]}") from exc
+        logger.info("视觉响应 trace=%s text_len=%d", request_trace_id, len(content or ""))
+        return content or ""
+
     def _resolved_response_format(self) -> str:
         """解析 auto 模式，不通过试错请求进行运行时降级。"""
         if self.response_format != "auto":

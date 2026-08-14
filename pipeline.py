@@ -92,10 +92,29 @@ class MessageProcessingPipeline:
         self._llm_enabled = llm_enabled and classifier is not None
         self._max_attempts = max_attempts
         self._retry_delays = retry_delays
+        self._vision_tasks: list[asyncio.Task] = []
 
     async def process(self, item: dict[str, Any]) -> str:
         """处理一条收件箱消息，返回最终收件箱状态。"""
         msg = _row_to_message(item)
+        # 从 DB 恢复附件（入箱时已写 message_attachments 元数据）
+        try:
+            att_rows = self._db.list_attachment_rows(msg.message_id)
+            if att_rows:
+                from models import ImageAttachment
+
+                msg.attachments = [
+                    ImageAttachment(
+                        attachment_index=r["attachment_index"],
+                        source_type=r["source_type"],
+                        source_ref=r["source_ref"],
+                        file_name=r.get("file_name"),
+                        declared_mime_type=r.get("declared_mime_type"),
+                    )
+                    for r in att_rows
+                ]
+        except Exception as exc:
+            logger.warning("附件恢复失败 msg=%s err=%s", msg.message_id, exc)
         self._db.inbox_set_status(msg.message_id, "PROCESSING")
         logger.info(
             "消息处理开始 msg=%s group=%s sender=%s role=%s type=%s",
@@ -112,6 +131,10 @@ class MessageProcessingPipeline:
 
     # ─────────────────────── 主流程 ───────────────────────
     async def _handle(self, msg: NormalizedMessage, item: dict[str, Any]) -> str:
+        # 图片消息（含附件）→ 补图归属 + 多模态解析，不走文本模型
+        if msg.attachments:
+            return self._handle_image_attachment(item, msg)
+
         pending = self._pending.get_waiting(msg.group_id, msg.sender_id)
 
         decision = await self._decide(msg)
@@ -217,7 +240,7 @@ class MessageProcessingPipeline:
         )
         self._complete(item, msg, "EXECUTED" if result.status == RESULT_OK else result.status)
         if result.status == RESULT_OK:
-            # 维修方式带订单号 → 延期 + 登记共享表（新流程，替代旧的签收询问）
+            # 维修方式带订单号 → 登记订单监控 + 共享表（v4.1 起不再自动延期，签收后计时）
             self._handle_order_submitted(cmd, result, msg)
             self._notifier.flush()
         else:
@@ -229,11 +252,12 @@ class MessageProcessingPipeline:
 
     # ─────────────────────── 订单提交处理 ───────────────────────
     def _handle_order_submitted(self, cmd: Any, result: Any, msg: NormalizedMessage) -> None:
-        """识别到订单号：该工单自动延期 +3 天（每单一次），并登记到共享表。
+        """识别到订单号：登记订单到监控与共享表（不再自动延期，2026-08-14 用户决策）。
 
-        后续由调度器读共享表中另一个 AI 回传的订单状态，发货/关闭时群内通知。
+        等货期间工单时效照常计算，超时由工程师回 #超时原因；调度器监测到
+        订单签收后开始计时维修并每日提醒直至完成。
         """
-        from config import ORDER_EXTEND_DAYS, ORDER_STORE_TABLE_PATH
+        from config import ORDER_STORE_TABLE_PATH
         from reconciling.order_store import append_order_row
 
         if cmd.intent != "ticket.repair_plan.submit" or result.status != RESULT_OK:
@@ -248,19 +272,12 @@ class MessageProcessingPipeline:
 
         registered: list[str] = []
         already_registered: list[str] = []
-        days = 0
         for order_no in order_nos:
-            # 已登记过 → 每单只延期一次，不重复
+            # 已登记过 → 跳过，不重复登记
             if self._db.get_order_monitor(order_no) is not None:
                 logger.info("订单已登记过，跳过 order=%s ticket=%s", order_no, ticket["ticket_no"])
                 already_registered.append(order_no)
                 continue
-            current = self._db.get_ticket(result.ticket_id)
-            extended = self._db.extend_ticket_deadline(
-                result.ticket_id, current["version"], ORDER_EXTEND_DAYS
-            )
-            if not extended:
-                logger.warning("工单延期失败（版本冲突）order=%s ticket=%s", order_no, ticket["ticket_no"])
             self._db.upsert_order_monitor(
                 order_id=order_no, ticket_id=result.ticket_id,
                 store=ticket["store_name"], ticket_no=ticket["ticket_no"],
@@ -270,7 +287,6 @@ class MessageProcessingPipeline:
                 store=ticket["store_name"], ticket_no=ticket["ticket_no"],
             )
             registered.append(order_no)
-            days += ORDER_EXTEND_DAYS
 
         if not registered:
             # 全部订单已登记过 → 回执说明，不静默
@@ -282,22 +298,21 @@ class MessageProcessingPipeline:
                 )
             return
 
-        fresh = self._db.get_ticket(result.ticket_id)
         order_text = "、".join(registered)
         text = (
-            f"📦 订单 {order_text} 已登记，工单 {ticket['ticket_no']} "
-            f"自动延期 {days} 天（新截止 {fresh['current_deadline_at']}）。"
+            f"📦 订单 {order_text} 已登记，工单 {ticket['ticket_no']}。"
+            f"到货签收后开始计时维修，请留意群内提醒。"
         )
         if already_registered:
-            text += f"\n注：订单 {'、'.join(already_registered)} 已在其他工单登记过，未重复延期。"
+            text += f"\n注：订单 {'、'.join(already_registered)} 已在其他工单登记过。"
         # 若对账表已导入首个订单，附注收货地址（增强）
         order = self._db.get_taobao_order(registered[0]) if hasattr(self._db, "get_taobao_order") else None
         if order and order.get("address"):
             text += f"\n📍 收货地址：{order['address']}"
         self._notifier.send_group_now(msg.group_id, text, message_id=msg.message_id)
         logger.info(
-            "订单已登记+延期 orders=%s ticket=%s days=%d",
-            order_text, ticket["ticket_no"], days,
+            "订单已登记 orders=%s ticket=%s",
+            order_text, ticket["ticket_no"],
         )
 
     # ─────────────────────── 决策 ───────────────────────
@@ -669,6 +684,76 @@ class MessageProcessingPipeline:
             msg.group_id, f"当前活动工单：\n{lines}", message_id=msg.message_id
         )
         return self._complete(item, msg, "EXECUTED")
+
+    def _handle_image_attachment(self, item: dict[str, Any], msg: NormalizedMessage) -> str:
+        """图片消息：归档后归属到工单（引用/选单上下文/单候选），并触发多模态解析。
+
+        图片消息与文本一样是普通消息，不单独发送回执；归属工单后由
+        视觉模型解析内容写入附件表，供工单记录/导出展示。
+        """
+        candidates = self._repo.snapshot_candidates(msg.group_id)
+        target_id = None
+
+        # 1. 钉钉回复/引用某条消息 → 归属被引用消息关联的工单
+        quoted_id = self._quoted_ticket_id(msg)
+        if quoted_id is not None:
+            target_id = quoted_id
+
+        # 2. 用户 30 分钟内选过的工单（上下文）
+        if target_id is None:
+            target_id = self._context.get_active(msg.group_id, msg.sender_id, datetime.now())
+
+        # 3. 只有一张活动工单 → 直接归属
+        if target_id is None and len(candidates) == 1:
+            target_id = candidates[0].ticket_id
+
+        if target_id is None:
+            # 无法确定归属：让用户选择
+            if candidates:
+                lines = "\n".join(
+                    f"{i + 1}. {c.ticket_no}（{c.subject}）" for i, c in enumerate(candidates)
+                )
+                self._notifier.send_group_now(
+                    msg.group_id,
+                    f"收到图片，请选择归属工单：\n{lines}\n回复数字即可。",
+                    message_id=msg.message_id,
+                )
+            else:
+                self._notifier.send_group_now(
+                    msg.group_id, "收到图片，但当前没有活动工单可归属。", message_id=msg.message_id
+                )
+            return self._complete(item, msg, "COMPLETED")
+
+        self._db.backfill_attachment_ticket(msg.message_id, target_id)
+        logger.info("图片归属工单 msg=%s ticket_id=%s", msg.message_id, target_id)
+
+        # 触发多模态解析（异步，失败不阻塞）
+        self._schedule_vision_analysis(msg.message_id)
+        return self._complete(item, msg, "EXECUTED")
+
+    def _schedule_vision_analysis(self, message_id: str) -> None:
+        """触发图片多模态解析（后台任务，失败不阻塞业务）。"""
+        try:
+            from images.vision import VisionAnalyzer
+
+            async def _run() -> None:
+                try:
+                    analyzer = VisionAnalyzer(db=self._db)
+                    await analyzer.analyze_message(message_id)
+                except Exception as exc:
+                    logger.warning("图片解析异常 msg=%s err=%s", message_id, exc)
+
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None:
+                task = loop.create_task(_run())
+                self._vision_tasks.append(task)
+            else:
+                asyncio.run(_run())
+        except Exception as exc:
+            logger.warning("图片解析任务调度失败 msg=%s err=%s", message_id, exc)
 
     # ─────────────────────── 收尾 ───────────────────────
     def _quoted_ticket_id(self, msg: NormalizedMessage) -> int | None:

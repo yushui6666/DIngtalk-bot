@@ -65,8 +65,9 @@ ORDER_STORE_TABLE_PATH = Path(
     )
 )
 
-# 识别到订单号后工单自动延期天数（每单一次）
-ORDER_EXTEND_DAYS = 3
+# 订单到货签收后每天提醒一次，直到工单完成（用户决策 2026-08-14）：
+# 下单不再自动延期，等货期间照常算时效，超时由工程师回 #超时原因。
+ORDER_RECEIVE_REMIND_DAILY = True
 
 # ───────────────────────── 系统监听账号 ─────────────────────────
 # 工程部AI 的 openDingtalkId（Phase 0 实测）
@@ -168,6 +169,16 @@ ROLE_PERMISSIONS = {
     "SYSTEM": [],
 }
 
+# ───────────────────────── 工单同步到 AI 表格看板 ─────────────────────────
+# 把本地 tickets 增量同步到钉钉 AI 表格「报修工单」表（Kanban 看板数据源）。
+# 用户决策 2026-08-14：新建「报修工单」表 + 工单看板视图，定期同步状态。
+AITABLE_SYNC_ENABLED = _os.environ.get("AITABLE_SYNC_ENABLED", "true").lower() in ("true", "1", "yes")
+AITABLE_SYNC_INTERVAL_SECONDS = int(_os.environ.get("AITABLE_SYNC_INTERVAL_SECONDS", "120"))
+AITABLE_SYNC_BASE_ID = _os.environ.get("AITABLE_SYNC_BASE_ID", "YQBnd5ExVEwP2b70sg5aXja28yeZqMmz")
+AITABLE_SYNC_TABLE_ID = _os.environ.get("AITABLE_SYNC_TABLE_ID", "6tIXGR3")
+# 同步时自动删除线上已不存在的工单（镜像删除，本地库为真相源）
+AITABLE_SYNC_PRUNE = _os.environ.get("AITABLE_SYNC_PRUNE", "true").lower() in ("true", "1", "yes")
+
 # ───────────────────────── 计时参数 ─────────────────────────
 SIDE_REPLY_TIMEOUT_HOURS = 4
 WEEKEND_ESCALATION_DEFER_HOUR = 9
@@ -210,6 +221,19 @@ LLM_API_KEY = _os.environ.get("LLM_API_KEY", "")
 
 # 是否启用云端模型语义匹配（关闭时自然语言走降级路径）
 LLM_ENABLED = _os.environ.get("LLM_ENABLED", "true").lower() in ("true", "1", "yes")
+
+# ───────────────────────── 视觉模型（图片多模态解析） ─────────────────────────
+# OpenAI 兼容的视觉模型（图片 base64 传入），支持按需切换供应商
+VISION_ENABLED = _os.environ.get("VISION_ENABLED", "false").lower() in ("true", "1", "yes")
+VISION_BASE_URL = _os.environ.get("VISION_BASE_URL", LLM_BASE_URL)
+VISION_MODEL = _os.environ.get("VISION_MODEL", LLM_MODEL)
+VISION_API_KEY = _os.environ.get("VISION_API_KEY", LLM_API_KEY)
+VISION_TIMEOUT_SECONDS = float(_os.environ.get("VISION_TIMEOUT_SECONDS", "60"))
+VISION_PROMPT = _os.environ.get(
+    "VISION_PROMPT",
+    "请描述这张图片中的内容，重点说明与设备故障/损坏相关的信息。"
+    "如果看不出故障信息，如实说明。",
+)
 
 # ───────────────────────── 图片附件归档（计划书 §10.6 Task 4A · 存储层） ─────────────────────────
 # 消息到达时只归档图片、不调用视觉模型；工单结束后统一分析（用户决策 2026-08-14）。
