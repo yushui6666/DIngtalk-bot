@@ -29,9 +29,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
-from config import DB_PATH
+from config import DB_PATH, SIDE_REPLY_TIMEOUT_HOURS
 from logger import get_logger
-from models import TICKET_ACTIVE, TICKET_OVERDUE
+from models import (
+    CYCLE_CANCELLED,
+    ROLE_ENGINEER,
+    ROLE_LEADER,
+    ROLE_MANAGER,
+    TICKET_ACTIVE,
+    TICKET_OVERDUE,
+    WAITING_ENGINEER_SIDE,
+    WAITING_MANAGER_SIDE,
+    WAITING_NONE,
+)
 
 logger = get_logger(__name__)
 
@@ -60,8 +70,8 @@ CREATE TABLE IF NOT EXISTS tickets (
     location                       TEXT NOT NULL,
     problem_description            TEXT NOT NULL,
     sla_days                       INTEGER NOT NULL,
-    initial_deadline_at            TEXT NOT NULL,
-    current_deadline_at            TEXT NOT NULL,
+    initial_deadline_at            TEXT,
+    current_deadline_at            TEXT,
     current_timeout_cycle_id       INTEGER,
     status                         TEXT NOT NULL DEFAULT 'ACTIVE',
     waiting_side                   TEXT NOT NULL DEFAULT 'NONE',
@@ -73,6 +83,9 @@ CREATE TABLE IF NOT EXISTS tickets (
     cancelled_at                   TEXT,
     cancelled_by                   TEXT,
     cancel_reason                  TEXT,
+    stopped_at                     TEXT,
+    stopped_by                     TEXT,
+    stop_reason                    TEXT,
     duplicate_of_ticket_id         INTEGER,
     reopen_count                   INTEGER NOT NULL DEFAULT 0,
     created_at                     TEXT NOT NULL,
@@ -367,6 +380,9 @@ _TICKET_MIGRATION_COLUMNS = {
     "cancelled_at": "cancelled_at TEXT",
     "cancelled_by": "cancelled_by TEXT",
     "cancel_reason": "cancel_reason TEXT",
+    "stopped_at": "stopped_at TEXT",
+    "stopped_by": "stopped_by TEXT",
+    "stop_reason": "stop_reason TEXT",
     "duplicate_of_ticket_id": "duplicate_of_ticket_id INTEGER",
     "reopen_count": "reopen_count INTEGER NOT NULL DEFAULT 0",
 }
@@ -451,6 +467,52 @@ class Database:
             (_now_str(),),
         )
         logger.info("v4.0 多工单迁移已应用（单活动工单约束已移除）")
+
+        # 5. v4.2：tickets.deadline 两列改可空（支持「待商榷」不设时效工单）。
+        #    SQLite 无法直接 ALTER 去 NOT NULL，采用标准重建表迁移（幂等）。
+        self._migrate_tickets_nullable_deadline(conn)
+
+    def _migrate_tickets_nullable_deadline(self, conn: sqlite3.Connection) -> None:
+        """把 tickets.initial_deadline_at / current_deadline_at 的 NOT NULL 约束去掉。
+
+        幂等：仅当两列仍带 notnull 约束时重建一次表；数据原样保留。
+        新库（按 _SCHEMA 建表）本身已可空，直接跳过。
+        """
+        cols = {
+            row["name"]: row["notnull"]
+            for row in conn.execute("PRAGMA table_info(tickets)").fetchall()
+        }
+        if cols.get("initial_deadline_at") != 1 or cols.get("current_deadline_at") != 1:
+            return  # 已是可空（或列不存在），无需重建
+        conn.executescript(
+            """
+            DROP INDEX IF EXISTS idx_tickets_group_status;
+            DROP INDEX IF EXISTS idx_tickets_group;
+            DROP INDEX IF EXISTS idx_tickets_status;
+            ALTER TABLE tickets RENAME TO tickets_old;
+            """
+        )
+        conn.executescript(_SCHEMA)
+        conn.execute(
+            """INSERT INTO tickets
+                   (id, ticket_no, group_id, store_name, reporter_id, subject, location,
+                    problem_description, sla_days, initial_deadline_at, current_deadline_at,
+                    current_timeout_cycle_id, status, waiting_side, waiting_since,
+                    current_responsibility_cycle_id, last_business_event_at,
+                    last_business_message_id, version, cancelled_at, cancelled_by,
+                    cancel_reason, stopped_at, stopped_by, stop_reason,
+                    duplicate_of_ticket_id, reopen_count, created_at, closed_at)
+                   SELECT id, ticket_no, group_id, store_name, reporter_id, subject, location,
+                    problem_description, sla_days, initial_deadline_at, current_deadline_at,
+                    current_timeout_cycle_id, status, waiting_side, waiting_since,
+                    current_responsibility_cycle_id, last_business_event_at,
+                    last_business_message_id, version, cancelled_at, cancelled_by,
+                    cancel_reason, stopped_at, stopped_by, stop_reason,
+                    duplicate_of_ticket_id, reopen_count, created_at, closed_at
+                   FROM tickets_old"""
+        )
+        conn.execute("DROP TABLE tickets_old")
+        logger.info("tickets deadline 列已改为可空（待商榷工单支持）")
 
     def close(self) -> None:
         if self._conn is not None:
@@ -1046,6 +1108,14 @@ class Database:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def list_group_tickets(self, group_id: str) -> list[dict[str, Any]]:
+        """群内全部工单（含终态，供 #重开工单 等定位终态工单）。"""
+        rows = self.connect().execute(
+            "SELECT * FROM tickets WHERE group_id=? ORDER BY id",
+            (group_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def next_ticket_seq(self, group_id: str) -> int:
         """分配工单序号（必须在事务内调用，配合 upsert 递增）。"""
         row = self._conn.execute(
@@ -1085,6 +1155,78 @@ class Database:
             (*params, ticket_id, expected_version),
         )
         return cur.rowcount > 0
+
+    def mark_ticket_overdue(self, ticket_id: int) -> bool:
+        """把已超时的活动工单标记为 ACTIVE_OVERDUE（计划书 §9.1，幂等）。
+
+        由调度器在 SLA 扫描发现超时时调用，将状态从 ACTIVE 推进到
+        ACTIVE_OVERDUE（等待原因或完成条件）。已处于 ACTIVE_OVERDUE
+        或已终态（COMPLETED/CANCELLED）的工单不重复切换。
+        不推进 version——状态是调度器语义标记，不是业务版本变更。
+        """
+        cur = self._conn.execute(
+            "UPDATE tickets SET status=? WHERE id=? AND status=?",
+            (TICKET_OVERDUE, ticket_id, TICKET_ACTIVE),
+        )
+        return cur.rowcount > 0
+
+    # ─────────────────────── 责任方切换（计划书 §9.3） ───────────────────────
+    def switch_responsibility(
+        self, ticket_id: int, sender_role: str, message_id: str, sent_at: str
+    ) -> bool:
+        """按消息发送方角色切换工单等待责任方（计划书 §9.3）。
+
+        规则：店长 → 等待工程师方；工程师/工程负责人 → 等待店长方；其他角色不切换。
+        切换时关闭当前未决责任周期并开启新周期（due_at = sent_at + 4h）。
+        返回是否发生了切换。
+        """
+        next_side = {
+            ROLE_MANAGER: WAITING_ENGINEER_SIDE,
+            ROLE_ENGINEER: WAITING_MANAGER_SIDE,
+            ROLE_LEADER: WAITING_MANAGER_SIDE,
+        }.get(sender_role)
+        if next_side is None:
+            return False
+        ticket = self._conn.execute(
+            "SELECT waiting_side FROM tickets WHERE id=?", (ticket_id,)
+        ).fetchone()
+        if ticket is None or ticket["waiting_side"] == next_side:
+            return False
+        self._close_pending_cycles(ticket_id, message_id)
+        due_at = self._add_hours(sent_at, SIDE_REPLY_TIMEOUT_HOURS)
+        cur = self._conn.execute(
+            """INSERT INTO responsibility_cycles
+                   (ticket_id, waiting_side, trigger_message_id, waiting_since, due_at, status)
+               VALUES (?,?,?,?,?, 'PENDING')""",
+            (ticket_id, next_side, message_id, sent_at, due_at),
+        )
+        self._conn.execute(
+            "UPDATE tickets SET waiting_side=?, waiting_since=?, current_responsibility_cycle_id=? WHERE id=?",
+            (next_side, sent_at, cur.lastrowid, ticket_id),
+        )
+        return True
+
+    def close_responsibility_cycles(self, ticket_id: int, closed_by_message_id: str) -> int:
+        """关闭工单所有未决（PENDING）责任周期（完成/取消/重开终态转换时）。"""
+        cur = self._conn.execute(
+            "UPDATE responsibility_cycles SET status=?, closed_by_message_id=? "
+            " WHERE ticket_id=? AND status='PENDING'",
+            (CYCLE_CANCELLED, closed_by_message_id, ticket_id),
+        )
+        return cur.rowcount
+
+    def _close_pending_cycles(self, ticket_id: int, closed_by_message_id: str) -> int:
+        return self._conn.execute(
+            "UPDATE responsibility_cycles SET status=?, closed_by_message_id=? "
+            " WHERE ticket_id=? AND status='PENDING'",
+            (CYCLE_CANCELLED, closed_by_message_id, ticket_id),
+        ).rowcount
+
+    def _add_hours(self, ts: str, hours: int) -> str:
+        dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+        from datetime import timedelta
+
+        return (dt + timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
 
     def add_ticket_message(
         self, message_id: str, ticket_id: int, sender_id: str, sender_role: str,
@@ -1126,19 +1268,62 @@ class Database:
             (ticket_id, message_id, repair_method, order_no, engineer_id, _now_str()),
         )
 
+    def open_timeout_cycle(self, ticket_id: int, reminded_at: str) -> int | None:
+        """为已超时工单建立/确认一个 WAITING_REASON 超时周期（幂等）。
+
+        计划书 §9.5：到期未完成时建立 `WAITING_REASON` 超时周期，等待工程师解释。
+        同一工单同时最多一个未解释周期（idx_timeout_one_waiting 唯一索引保证）。
+        周期建立时记录旧截止时间（old_deadline_at）与提醒时间（reminded_at），
+        并回填 tickets.current_timeout_cycle_id。返回周期 id；工单不存在返回 None。
+        """
+        row = self._conn.execute(
+            "SELECT id FROM timeout_cycles"
+            " WHERE ticket_id=? AND status='WAITING_REASON' ORDER BY id LIMIT 1",
+            (ticket_id,),
+        ).fetchone()
+        if row is not None:
+            return row["id"]
+        cur = self._conn.execute(
+            """INSERT INTO timeout_cycles
+                   (ticket_id, cycle_no, status, old_deadline_at, reminded_at)
+               SELECT id,
+                      COALESCE((SELECT MAX(cycle_no) FROM timeout_cycles WHERE ticket_id=t.id), 0) + 1,
+                      'WAITING_REASON', current_deadline_at, ?
+               FROM tickets t WHERE id=?""",
+            (reminded_at, ticket_id),
+        )
+        if cur.rowcount == 0:
+            return None
+        self._conn.execute(
+            "UPDATE tickets SET current_timeout_cycle_id=? WHERE id=?",
+            (cur.lastrowid, ticket_id),
+        )
+        return cur.lastrowid
+
     def add_timeout_cycle_reason(
         self, ticket_id: int, message_id: str, timeout_reason: str, engineer_id: str
-    ) -> None:
+    ) -> bool:
+        """解释当前未解释的超时周期：WAITING_REASON → EXTENDED（计划书 §4.8）。
+
+        仅当工单存在尚未解释（WAITING_REASON）的周期时接受原因；
+        同一超时周期只接受一次有效原因（status 转 EXTENDED 后不再接受）。
+        无未解释周期返回 False（调用方应拒绝该消息）。
+        记录原因但不自动延期（v4.1 决策，new_deadline_at 留空）。
+        """
+        row = self._conn.execute(
+            "SELECT id FROM timeout_cycles"
+            " WHERE ticket_id=? AND status='WAITING_REASON' ORDER BY id LIMIT 1",
+            (ticket_id,),
+        ).fetchone()
+        if row is None:
+            return False
         self._conn.execute(
-            """INSERT INTO timeout_cycles
-                   (ticket_id, cycle_no, status, old_deadline_at, reminded_at, reason,
-                    reason_engineer_id, reason_submitted_at)
-               SELECT ticket_id,
-                      COALESCE((SELECT MAX(cycle_no) FROM timeout_cycles WHERE ticket_id=?), 0) + 1,
-                      'EXTENDED', current_deadline_at, ?, ?, ?, ?
-               FROM tickets WHERE id=?""",
-            (ticket_id, _now_str(), timeout_reason, engineer_id, _now_str(), ticket_id),
+            """UPDATE timeout_cycles
+                   SET status='EXTENDED', reason=?, reason_engineer_id=?, reason_submitted_at=?
+               WHERE id=? AND status='WAITING_REASON'""",
+            (timeout_reason, engineer_id, _now_str(), row["id"]),
         )
+        return True
 
     # ─────────────────────── 通知 Outbox notification_deliveries ───────────────────────
     def insert_notification(
@@ -1169,6 +1354,18 @@ class Database:
             (limit,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def clear_ticket_sla_dedupe(self, ticket_id: int) -> int:
+        """清理某工单的 SLA 提醒去重键，使重开后的工单可再次触发提醒与超时周期。
+
+        返回受影响行数。只清理 sla_remind/sla_overdue 前缀的键，不影响其他通知。
+        """
+        cur = self._conn.execute(
+            "DELETE FROM notification_deliveries"
+            " WHERE dedupe_key=? OR dedupe_key LIKE ?",
+            (f"sla_overdue:{ticket_id}", f"sla_remind:{ticket_id}:%"),
+        )
+        return cur.rowcount
 
     def mark_notification(
         self, notification_id: int, status: str, *, error: str | None = None

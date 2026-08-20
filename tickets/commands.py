@@ -11,7 +11,7 @@ from typing import Any
 ALLOWED_EXECUTORS = frozenset({
     "create_ticket", "add_ticket_detail", "submit_diagnosis",
     "submit_repair_plan", "submit_timeout_reason", "complete_ticket",
-    "cancel_ticket", "reopen_ticket", "query_ticket", "select_ticket",
+    "cancel_ticket", "stop_ticket", "reopen_ticket", "query_ticket", "select_ticket",
     "clarify", "confirm_pending_action", "reject_pending_action",
     "correct_pending_action", "ignore_message",
 })
@@ -25,6 +25,7 @@ INTENT_LABELS: dict[str, str] = {
     "ticket.timeout_reason.submit": "提交超时原因",
     "ticket.complete": "完成工单",
     "ticket.cancel": "取消工单",
+    "ticket.stop": "停修工单",
     "ticket.reopen": "重开工单",
     "ticket.query": "查询工单",
     "ticket.select": "选择工单",
@@ -41,6 +42,12 @@ def intent_label(intent: str) -> str:
     return INTENT_LABELS.get(intent, intent)
 
 
+def _deadline_text(ticket: dict[str, Any]) -> str:
+    """工单截止文案；待商榷工单（无 deadline）显示「暂不设时效」。"""
+    deadline = ticket.get("current_deadline_at")
+    return f"预计完成：{deadline}" if deadline else "时效：待商榷（暂不设截止时间）"
+
+
 def reply_text(intent: str, ticket: dict[str, Any] | None, fields: dict[str, Any]) -> str:
     """根据意图与执行后的工单生成群内回复。"""
     ticket_no = ticket["ticket_no"] if ticket else ""
@@ -49,7 +56,7 @@ def reply_text(intent: str, ticket: dict[str, Any] | None, fields: dict[str, Any
             f"✅ 已创建工单：{ticket_no}\n"
             f"主题：{ticket['subject']}\n"
             f"位置：{ticket['location']}\n"
-            f"预计完成：{ticket['current_deadline_at']}"
+            f"{_deadline_text(ticket)}"
         )
     if intent == "ticket.add_detail":
         return f"已补充工单 {ticket_no} 的信息"
@@ -63,6 +70,8 @@ def reply_text(intent: str, ticket: dict[str, Any] | None, fields: dict[str, Any
         return f"工单 {ticket_no} 已完成 ✅"
     if intent == "ticket.cancel":
         return f"工单 {ticket_no} 已取消"
+    if intent == "ticket.stop":
+        return f"工单 {ticket_no} 已停修（不再维修）"
     if intent == "ticket.reopen":
         return f"工单 {ticket_no} 已重新开启"
     if intent == "ticket.select":
@@ -73,6 +82,6 @@ def reply_text(intent: str, ticket: dict[str, Any] | None, fields: dict[str, Any
             f"主题：{ticket['subject']}\n"
             f"位置：{ticket['location']}\n"
             f"问题：{ticket['problem_description'][:80]}\n"
-            f"预计完成：{ticket['current_deadline_at']}"
+            f"{_deadline_text(ticket)}"
         )
     return "已处理"

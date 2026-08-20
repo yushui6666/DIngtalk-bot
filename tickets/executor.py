@@ -18,6 +18,7 @@ from models import (
     TICKET_ACTIVE,
     TICKET_CANCELLED,
     TICKET_COMPLETED,
+    TICKET_STOPPED,
 )
 from semantics.types import CommandResult, ValidatedCommand
 from tickets.commands import reply_text
@@ -30,6 +31,9 @@ LINK_EXECUTED = "EXECUTED"
 RESULT_OK = "OK"
 RESULT_REJECTED = "REJECTED"
 RESULT_INTERNAL_ERROR = "INTERNAL_ERROR"
+
+# 只读/终态意图：不参与责任方切换（计划书 §9.3：仅有效人工业务消息切换）
+_READONLY_INTENTS = frozenset({"ticket.query", "ticket.select", "ticket.complete", "ticket.cancel", "ticket.stop"})
 
 
 class TicketCommandExecutor:
@@ -103,13 +107,17 @@ class TicketCommandExecutor:
         if group is None:
             return CommandResult(RESULT_INTERNAL_ERROR, None, None, ())
         fields = command.fields
+        sla_label = fields.get("sla")
+        if not sla_label:
+            # sla 已设为必填（2026-08-19）；绕过校验走到这里视为拒绝
+            return CommandResult(RESULT_REJECTED, None, None, ())
         ticket_id = self._repo.create_ticket(
             group=group,
             reporter_id=command.actor_id,
             subject=fields.get("subject") or "未命名",
             location=fields.get("location") or "",
             problem_description=fields.get("problem_description") or "",
-            sla_label=fields.get("sla") or "1天",  # 未写时效默认 1 天（业务决策 2026-08-12）
+            sla_label=sla_label,
             now=self._now(),
         )
         ticket = self._db.get_ticket(ticket_id)
@@ -167,8 +175,14 @@ class TicketCommandExecutor:
                     ticket["id"], command.message_id,
                     [str(x) for x in diagnosis_items], command.actor_id)
         elif kind == "timeout":
-            self._db.add_timeout_cycle_reason(ticket["id"], command.message_id,
-                                              fields.get("timeout_reason", ""), command.actor_id)
+            # 计划书 §4.8：仅当存在尚未解释的超时周期时接受原因
+            if not self._db.add_timeout_cycle_reason(
+                ticket["id"], command.message_id,
+                fields.get("timeout_reason", ""), command.actor_id,
+            ):
+                logger.info("无未解释超时周期，拒绝原因提交 ticket=%s msg=%s",
+                            ticket["ticket_no"], command.message_id)
+                return CommandResult(RESULT_REJECTED, ticket["id"], ticket["version"], ())
         # 业务变更 → 推进版本与顺序游标
         ok = self._bump_version(ticket, command)
         if not ok:
@@ -188,6 +202,7 @@ class TicketCommandExecutor:
         )
         if not ok:
             return CommandResult(RESULT_REJECTED, ticket["id"], ticket["version"], ())
+        self._db.close_responsibility_cycles(ticket["id"], command.message_id)
         self._db.clear_contexts_by_ticket(ticket["id"])
         updated = self._db.get_ticket(ticket["id"])
         self._finalize(command, updated, LINK_EXECUTED, message)
@@ -206,6 +221,27 @@ class TicketCommandExecutor:
         )
         if not ok:
             return CommandResult(RESULT_REJECTED, ticket["id"], ticket["version"], ())
+        self._db.close_responsibility_cycles(ticket["id"], command.message_id)
+        self._db.clear_contexts_by_ticket(ticket["id"])
+        updated = self._db.get_ticket(ticket["id"])
+        self._finalize(command, updated, LINK_EXECUTED, message)
+        return CommandResult(RESULT_OK, updated["id"], updated["version"], ())
+
+    def _execute_stop(self, command: ValidatedCommand, message: NormalizedMessage | None) -> CommandResult:
+        """#停止维修：工程负责人确认不再维修 → STOPPED 终态，强制记录停修原因。"""
+        ticket = self._require_ticket(command)
+        if ticket is None:
+            return CommandResult(RESULT_INTERNAL_ERROR, None, None, ())
+        ok = self._db.update_ticket_cas(
+            ticket["id"], ticket["version"],
+            "status=?, closed_at=?, stopped_at=?, stopped_by=?, stop_reason=?,"
+            " last_business_event_at=?, last_business_message_id=?",
+            (TICKET_STOPPED, self._now(), self._now(), command.actor_id,
+             command.fields.get("stop_reason", ""), self._now(), command.message_id),
+        )
+        if not ok:
+            return CommandResult(RESULT_REJECTED, ticket["id"], ticket["version"], ())
+        self._db.close_responsibility_cycles(ticket["id"], command.message_id)
         self._db.clear_contexts_by_ticket(ticket["id"])
         updated = self._db.get_ticket(ticket["id"])
         self._finalize(command, updated, LINK_EXECUTED, message)
@@ -218,11 +254,16 @@ class TicketCommandExecutor:
         ok = self._db.update_ticket_cas(
             ticket["id"], ticket["version"],
             "status=?, closed_at=NULL, reopen_count=reopen_count+1,"
+            " waiting_side='NONE', waiting_since=NULL, current_responsibility_cycle_id=NULL,"
             " last_business_event_at=?, last_business_message_id=?",
             (TICKET_ACTIVE, self._now(), command.message_id),
         )
         if not ok:
             return CommandResult(RESULT_REJECTED, ticket["id"], ticket["version"], ())
+        # 计划书 §9.1：重开后建立新的责任周期；同时清理 SLA 去重键，
+        # 让重开后的工单可再次收到到期/超时提醒并按需要建立超时周期
+        self._db.close_responsibility_cycles(ticket["id"], command.message_id)
+        self._db.clear_ticket_sla_dedupe(ticket["id"])
         updated = self._db.get_ticket(ticket["id"])
         self._finalize(command, updated, LINK_EXECUTED, message)
         return CommandResult(RESULT_OK, updated["id"], updated["version"], ())
@@ -280,6 +321,12 @@ class TicketCommandExecutor:
                 message.content, message.message_type,
                 message.sent_at.strftime("%Y-%m-%d %H:%M:%S"),
             )
+            # 计划书 §9.3：业务动作（非查询/选择）按消息发送方角色切换责任方
+            if command.intent not in _READONLY_INTENTS:
+                self._db.switch_responsibility(
+                    ticket["id"], command.actor_role, command.message_id,
+                    message.sent_at.strftime("%Y-%m-%d %H:%M:%S"),
+                )
         self._db.record_processed_event(command.message_id, command.group_id, "EXECUTED")
         if notify:
             self._db.insert_notification(
@@ -304,6 +351,7 @@ _HANDLERS: dict[str, Callable[..., CommandResult]] = {
     "ticket.timeout_reason.submit": lambda self, c, m: self._execute_submit_version(c, m, kind="timeout"),
     "ticket.complete": TicketCommandExecutor._execute_complete,
     "ticket.cancel": TicketCommandExecutor._execute_cancel,
+    "ticket.stop": TicketCommandExecutor._execute_stop,
     "ticket.reopen": TicketCommandExecutor._execute_reopen,
     "ticket.query": TicketCommandExecutor._execute_query,
     "ticket.select": TicketCommandExecutor._execute_select,

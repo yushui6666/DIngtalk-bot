@@ -15,7 +15,7 @@ import asyncio
 import json
 from typing import Awaitable, Callable, Optional
 
-from config import LOG_DIR, USER_ID_MAP
+from config import DWS_CMD, LOG_DIR, USER_ID_MAP
 from event_normalizer import normalize_event
 from logger import get_logger
 from models import NormalizedMessage
@@ -32,7 +32,7 @@ _MAX_BACKOFF = 60
 
 def _build_listen_cmd(group_id: str, chat_query: Optional[str] = None) -> list[str]:
     cmd = [
-        "dws", "event", "+listen-im",
+        DWS_CMD, "event", "+listen-im",
         "--kind", "group",
         "-f", "ndjson",
         "--duration", "0",

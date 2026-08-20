@@ -17,7 +17,7 @@ from semantics.types import TicketCandidate
 
 logger = get_logger(__name__)
 
-_SLA_LABELS = {"1天": 1, "3天": 3, "7天": 7}
+_SLA_LABELS = {"1天": 1, "3天": 3, "7天": 7, "待商榷": 0}
 
 
 class TicketRepository:
@@ -38,10 +38,11 @@ class TicketRepository:
     ) -> int:
         """创建工单（需在事务内调用）。返回工单 id。
 
-        sla_label 为协议枚举（1天/3天/7天），sla_days 取对应天数。
+        sla_label 为协议枚举（1天/3天/7天/待商榷）。待商榷 = 不设时效，
+        仅记录（sla_days=0，deadline 置空）。
         """
         sla_days = _SLA_LABELS.get(sla_label, 1)  # 未识别标签兜底 1 天
-        deadline = _add_days(now, sla_days)
+        deadline = None if sla_days == 0 else _add_days(now, sla_days)
         seq = self._db.next_ticket_seq(group["group_id"])
         store_name = group.get("store_name") or "门店"
         ticket_no = f"{store_name}-{subject}-{sla_label}-{seq:03d}"
@@ -65,6 +66,26 @@ class TicketRepository:
     def snapshot_candidates(self, group_id: str) -> list[TicketCandidate]:
         """当前群活动工单 → 路由候选快照。"""
         rows = self._db.list_active_tickets(group_id)
+        return [
+            TicketCandidate(
+                ticket_id=r["id"],
+                ticket_no=r["ticket_no"],
+                group_id=r["group_id"],
+                subject=r["subject"],
+                location=r["location"],
+                problem_summary=(r["problem_description"] or "")[:80],
+                status=r["status"],
+                version=r["version"],
+            )
+            for r in rows
+        ]
+
+    def snapshot_group_tickets(self, group_id: str) -> list[TicketCandidate]:
+        """群内全部工单（含 STOPPED/COMPLETED/CANCELLED 等终态）→ 候选快照。
+
+        仅供 #重开工单 等需要定位终态工单的动作使用，避免重开无法路由。
+        """
+        rows = self._db.list_group_tickets(group_id)
         return [
             TicketCandidate(
                 ticket_id=r["id"],

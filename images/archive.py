@@ -186,11 +186,13 @@ class DingTalkMediaResolver:
     def __init__(
         self,
         *,
-        dws_cmd: str = "dws",
+        dws_cmd: str | None = None,
         timeout_seconds: float = 60.0,
         tmp_dir: str | Path | None = None,
     ) -> None:
-        self._dws_cmd = dws_cmd
+        from config import DWS_CMD
+
+        self._dws_cmd = dws_cmd or DWS_CMD
         self._timeout = timeout_seconds
         self._tmp_dir = Path(tmp_dir) if tmp_dir else None
 

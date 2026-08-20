@@ -153,3 +153,5 @@ protocols/    语义协议与 Schema（入库）
 tests/        pytest 测试
 docs/         业务文档与测试用例
 ```
+
+> 仓库原则：**只追踪程序文件，程序产出不追踪**。`dingtalk.db`/`*.db-shm|wal`、`框架/`、`docs/上线前已处理事项.md`、`scripts/` 下 6 个一次性脚本（`export_knowledge_base`/`export_tickets_csv`/`link_engineer_msg_to_ticket30`/`manual_create_*`/`replay_cid*`）、`data/`/`logs/`/`archives/` 均已在 `.gitignore` 中忽略。

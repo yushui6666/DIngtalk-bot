@@ -20,7 +20,13 @@ from semantics.types import (
     ValidatedCommand,
 )
 
-from models import NormalizedMessage, role_label
+from models import (
+    ROLE_ENGINEER,
+    ROLE_LEADER,
+    ROLE_MANAGER,
+    NormalizedMessage,
+    role_label,
+)
 
 # 订单号占位值（v3.0 遗留规则，仍适用）
 _ORDER_NO_PLACEHOLDERS = frozenset({"无", "暂无", "稍后补", "不知道"})
@@ -37,8 +43,8 @@ _ALLOWED_REPAIR_METHODS = frozenset({
     "远程视频维修",
 })
 
-# SLA 允许值
-_ALLOWED_SLA = frozenset({"1天", "3天", "7天"})
+# SLA 允许值（「待商榷」= 不设时效、仅记录）
+_ALLOWED_SLA = frozenset({"1天", "3天", "7天", "待商榷"})
 
 # 字段名 → 中文（与协议 field_definitions 的 aliases 对齐，用于回执展示）
 _FIELD_LABELS = {
@@ -57,6 +63,7 @@ _FIELD_LABELS = {
     "completion_note": "完成说明",
     "cancel_reason": "取消原因",
     "reopen_reason": "重开原因",
+    "stop_reason": "停修原因",
 }
 
 # 工单状态枚举 → 中文
@@ -65,6 +72,7 @@ _TICKET_STATUS_LABELS = {
     "ACTIVE_OVERDUE": "已超时",
     "COMPLETED": "已完成",
     "CANCELLED": "已取消",
+    "STOPPED": "已停修",
 }
 
 
@@ -79,9 +87,19 @@ def _ticket_status_label(status: str) -> str:
 
 
 def _validate_role(action: Any, message: NormalizedMessage) -> bool:
-    """校验用户角色是否在动作的允许角色列表中。"""
+    """校验用户角色是否在动作的允许角色列表中。
+
+    LEADER（工程负责人/区域经理）拥有超集权限：可执行 LEADER 专属动作，
+    也可执行店长/工程师允许的所有动作（v4.2：兼任工程负责人的工程师不丢失既有权限）。
+    """
     if not action.allowed_roles:
         return True  # 无限制（如 system.* / chat.ignore）
+    if message.sender_role == ROLE_LEADER:
+        if ROLE_LEADER in action.allowed_roles:
+            return True
+        return any(
+            r in action.allowed_roles for r in (ROLE_MANAGER, ROLE_ENGINEER)
+        )
     return message.sender_role in action.allowed_roles
 
 
@@ -144,6 +162,7 @@ def _dispatch_reason_field(fields: dict[str, Any], intent: str) -> None:
 
     #取消工单 → cancel_reason
     #重开工单 → reopen_reason
+    #停止维修 → stop_reason
     """
     if "reason" not in fields:
         return
@@ -152,6 +171,8 @@ def _dispatch_reason_field(fields: dict[str, Any], intent: str) -> None:
         fields["cancel_reason"] = reason
     elif intent == "ticket.reopen":
         fields["reopen_reason"] = reason
+    elif intent == "ticket.stop":
+        fields["stop_reason"] = reason
     # 其他 intent 不需要 reason 字段
 
 
@@ -279,7 +300,7 @@ def validate_decision(
     # 2. 必填字段
     missing = _validate_required_fields(action, fields, decision.target_ticket_no)
     for mf in missing:
-        errors.append(f"缺少{_field_label(mf)}，请在消息中说明")
+        errors.append("消息缺失，请对照标准补充，如果没有主题请标注无主题")
 
     # 3. 枚举值校验
     for fname, fvalue in fields.items():
@@ -290,7 +311,7 @@ def validate_decision(
     # SLA 特殊枚举校验（字段名可能在不同 action 中）
     if "sla" in fields and fields["sla"] not in _ALLOWED_SLA:
         if "sla" not in [f for f in errors if "sla" in f]:
-            errors.append(f"时效 '{fields['sla']}' 无效，可选：1天、3天、7天")
+            errors.append(f"时效 '{fields['sla']}' 无效，可选：1天、3天、7天、待商榷")
 
     # 维修方式枚举校验
     if "repair_method" in fields:

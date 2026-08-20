@@ -163,6 +163,9 @@ class MessageProcessingPipeline:
             return self._handle_clarify(item, msg, decision)
 
         candidates = self._repo.snapshot_candidates(msg.group_id)
+        # #重开工单 需定位终态工单（STOPPED/COMPLETED/CANCELLED），候选扩大为群内全部工单
+        if decision.intent == "ticket.reopen":
+            candidates = self._repo.snapshot_group_tickets(msg.group_id)
 
         # 选择工单：建立用户上下文（不走执行器）
         if decision.intent == "ticket.select":
@@ -662,11 +665,15 @@ class MessageProcessingPipeline:
                 )
                 return self._complete(item, msg, "REJECTED")
             ticket = self._db.get_ticket(target.ticket_id)
+            deadline = ticket.get("current_deadline_at")
+            deadline_text = (
+                f"预计完成：{deadline}" if deadline else "时效：待商榷（暂不设截止时间）"
+            )
             text = (
                 f"📋 {ticket['ticket_no']}  {ticket['status']}\n"
                 f"主题：{ticket['subject']}\n位置：{ticket['location']}\n"
                 f"问题：{ticket['problem_description'][:80]}\n"
-                f"预计完成：{ticket['current_deadline_at']}"
+                f"{deadline_text}"
             )
             self._notifier.send_group_now(msg.group_id, text, message_id=msg.message_id)
             return self._complete(item, msg, "EXECUTED")

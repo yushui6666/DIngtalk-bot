@@ -111,17 +111,16 @@ async def test_create_ticket_via_keyword(env):
 
 
 @pytest.mark.asyncio
-async def test_create_defaults_sla_to_one_day(env):
-    """报修未写时效时默认 1 天（业务决策 2026-08-12）。"""
-    await env.process("#报修\n主题：收银机\n位置：前台\n问题描述：死机", "m1")
+async def test_create_requires_sla(env):
+    """时效已设为必填：报修未写时效 → 拒绝建单，不静默默认（业务决策 2026-08-19）。"""
+    status = await env.process("#报修\n主题：收银机\n位置：前台\n问题描述：死机", "m1")
+    assert status == "COMPLETED"  # 收件箱终态；实际结果看 processed_result
+    row = env.db.connect().execute(
+        "SELECT processed_result FROM inbox_messages WHERE message_id='m1'"
+    ).fetchone()
+    assert row["processed_result"] == "REJECTED"
     act = _active(env.db)
-    assert len(act) == 1
-    assert act[0]["sla_days"] == 1
-    # 截止 = 建单时间 + 1 天
-    from datetime import datetime, timedelta
-
-    expected = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-    assert act[0]["current_deadline_at"].startswith(expected)
+    assert len(act) == 0
 
 
 @pytest.mark.asyncio
@@ -161,6 +160,28 @@ async def test_add_detail_and_complete(env):
     assert "屏幕闪烁" in t["problem_description"] and t["version"] == 2
     await env.process("#完毕 工单编号：钉钉消息测试-收银机-1天-001", "m3")
     assert _ticket(env.db, t1["ticket_no"])["status"] == "COMPLETED"
+
+
+@pytest.mark.asyncio
+async def test_responsibility_switches_via_executor(env):
+    """计划书 §9.3：建单(店长)等工程师 → 工程师补充后切等店长 → 完成关闭周期。"""
+    await env.process("#报修\n主题：收银机\n位置：前台\n问题描述：死机\n时效：1天", "m1")
+    t = _ticket(env.db, "钉钉消息测试-收银机-1天-001")
+    assert t["waiting_side"] == "ENGINEER_SIDE"
+    assert t["waiting_since"] is not None
+    # 工程师补充 → 切到店长方
+    await env.process("#补充 工单编号：钉钉消息测试-收银机-1天-001 内容：确认故障", "m2",
+                      role="ENGINEER", sender="uid-eng")
+    t = _ticket(env.db, "钉钉消息测试-收银机-1天-001")
+    assert t["waiting_side"] == "MANAGER_SIDE"
+    rows = env.db.connect().execute(
+        "SELECT status FROM responsibility_cycles WHERE ticket_id=?", (t["id"],)).fetchall()
+    assert rows[0]["status"] == "CANCELLED"  # 旧周期已关闭
+    # 完成 → 全部未决周期关闭
+    await env.process("#完毕 工单编号：钉钉消息测试-收银机-1天-001", "m3")
+    rows = env.db.connect().execute(
+        "SELECT status FROM responsibility_cycles WHERE ticket_id=?", (t["id"],)).fetchall()
+    assert all(r["status"] == "CANCELLED" for r in rows)
 
 
 @pytest.mark.asyncio
@@ -326,3 +347,111 @@ async def test_shadow_mode_records_but_does_not_execute(env):
     dec = env.db.connect().execute(
         "SELECT intent FROM semantic_decisions WHERE message_id='m1'").fetchone()
     assert dec is not None and dec["intent"] == "ticket.create"
+
+
+# ───────────────────────── #停止维修（v4.2） ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_leader_can_perform_engineer_actions(env):
+    """LEADER 为超集角色：兼任工程负责人的工程师仍可提交维修方式/订单号（不降权）。"""
+    await env.process("#报修\n主题：收银机\n位置：前台\n问题描述：死机\n时效：1天", "m1")
+    t1 = _active(env.db)[0]
+    status = await env.process(
+        "#维修方式 维修方式：淘宝采购后自行维修 订单号：TB-2026-0001",
+        "m2", role="LEADER", sender="uid-leader")
+    assert status == "COMPLETED"
+    row = env.db.connect().execute(
+        "SELECT processed_result FROM inbox_messages WHERE message_id='m2'").fetchone()
+    assert row["processed_result"] == "EXECUTED"
+    assert _ticket(env.db, t1["ticket_no"])["status"] == "ACTIVE"
+    rcur = env.db.connect().execute(
+        "SELECT repair_method FROM repair_method_versions WHERE ticket_id=? AND is_current=1",
+        (t1["id"],)).fetchone()
+    assert rcur is not None and rcur["repair_method"] == "淘宝采购后自行维修"
+
+
+@pytest.mark.asyncio
+async def test_leader_stop_ticket_via_keyword(env):
+    """关键词 #停止维修（工程负责人）：直接进入 STOPPED 终态并记录原因/操作人。"""
+    await env.process("#报修\n主题：收银机\n位置：前台\n问题描述：死机\n时效：1天", "m1")
+    t1 = _active(env.db)[0]
+    status = await env.process("#停止维修 原因：配件停产，无法修复",
+                               "m2", role="LEADER", sender="uid-leader")
+    assert status == "COMPLETED"
+    t = _ticket(env.db, t1["ticket_no"])
+    assert t["status"] == "STOPPED"
+    assert t["stop_reason"] == "配件停产，无法修复"
+    assert t["stopped_by"] == "uid-leader"
+    assert t["stopped_at"] and t["closed_at"]
+    assert any("已停修" in s for s in env.sent)
+
+
+@pytest.mark.asyncio
+async def test_stop_requires_reason(env):
+    """#停止维修 未提供原因 → 校验拒绝。"""
+    await env.process("#报修\n主题：收银机\n位置：前台\n问题描述：死机\n时效：1天", "m1")
+    t1 = _active(env.db)[0]
+    await env.process("#停止维修", "m2", role="LEADER", sender="uid-leader")
+    row = env.db.connect().execute(
+        "SELECT processed_result FROM inbox_messages WHERE message_id='m2'").fetchone()
+    assert row["processed_result"] == "REJECTED"
+    assert _ticket(env.db, t1["ticket_no"])["status"] == "ACTIVE"
+
+
+@pytest.mark.asyncio
+async def test_manager_cannot_stop_ticket(env):
+    """停修仅限工程负责人（LEADER）；店长发 #停止维修 被拒。"""
+    await env.process("#报修\n主题：收银机\n位置：前台\n问题描述：死机\n时效：1天", "m1")
+    t1 = _active(env.db)[0]
+    await env.process("#停止维修 原因：不修了", "m2", role="MANAGER", sender="uid-mgr")
+    row = env.db.connect().execute(
+        "SELECT processed_result FROM inbox_messages WHERE message_id='m2'").fetchone()
+    assert row["processed_result"] == "REJECTED"
+    assert _ticket(env.db, t1["ticket_no"])["status"] == "ACTIVE"
+
+
+@pytest.mark.asyncio
+async def test_stopped_ticket_can_reopen(env):
+    """STOPPED 终态可 #重开工单 恢复 ACTIVE。"""
+    await env.process("#报修\n主题：收银机\n位置：前台\n问题描述：死机\n时效：1天", "m1")
+    t1 = _active(env.db)[0]
+    await env.process("#停止维修 原因：配件停产，无法修复", "m2",
+                      role="LEADER", sender="uid-leader")
+    status = await env.process(
+        f"#重开工单 工单编号：{t1['ticket_no']} 重开原因：新配件到货",
+        "m3", role="LEADER", sender="uid-leader")
+    assert status == "COMPLETED"
+    t = _ticket(env.db, t1["ticket_no"])
+    assert t["status"] == "ACTIVE"
+    assert t["closed_at"] is None
+    assert t["reopen_count"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_model_stop_still_requires_confirmation(env):
+    """模型来源 #停止维修（高危动作）→ 仍走确认流程。"""
+    await env.process("#报修\n主题：收银机\n位置：前台\n问题描述：死机\n时效：1天", "m1")
+    t1 = _active(env.db)[0]
+    env.classifier.responses["m2"] = SemanticDecision(
+        protocol_version="4.0.0", source="SEMANTIC_MODEL", intent="ticket.stop",
+        target_ticket_no=t1["ticket_no"], intent_confidence=0.95,
+        fields={"stop_reason": "配件停产"})
+    status = await env.process("这个工单不要再修了，配件停产",
+                               "m2", role="LEADER", sender="uid-leader")
+    row = env.db.connect().execute(
+        "SELECT processed_result FROM inbox_messages WHERE message_id='m2'").fetchone()
+    assert row["processed_result"] == "WAITING_CONFIRMATION"
+    assert _ticket(env.db, t1["ticket_no"])["status"] == "ACTIVE"
+    # 确认提示用中文可读文案，不暴露 intent ID
+    assert any("确认执行「停修工单」" in s for s in env.sent)
+    assert not any("ticket.stop" in s for s in env.sent)
+    env.classifier.responses["c1"] = SemanticDecision(
+        protocol_version="4.0.0", source="SEMANTIC_MODEL",
+        intent="system.confirm_pending_action", target_ticket_no=None,
+        intent_confidence=1.0)
+    await env.process("确认", "c1", role="LEADER", sender="uid-leader")
+    t = _ticket(env.db, t1["ticket_no"])
+    assert t["status"] == "STOPPED"
+    assert t["stop_reason"] == "配件停产"
+    assert t["stopped_by"] == "uid-leader"

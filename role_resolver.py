@@ -15,6 +15,7 @@ from id_mapper import to_user_id
 from logger import get_logger
 from models import (
     ROLE_ENGINEER,
+    ROLE_LEADER,
     ROLE_MANAGER,
     ROLE_OTHER,
     ROLE_SYSTEM,
@@ -31,8 +32,9 @@ def resolve_role(
 ) -> str:
     """按群配置解析角色。
 
-    优先级：系统账号 > 店长 > 工程师 > 其他成员 > 未配置。
-    group 的 manager_ids/engineer_ids 均为 userId。
+    优先级：系统账号 > 工程负责人/区域经理(LEADER) > 店长 > 工程师 > 其他成员 > 未配置。
+    group 的 manager_ids/engineer_ids 均为 userId；
+    engineering_leader_id / regional_manager_id 为单个 userId（可能为空）。
     """
     if open_dingtalk_id == LISTENER_USER_ID:
         return ROLE_SYSTEM
@@ -50,6 +52,14 @@ def resolve_role(
         )
         return ROLE_UNKNOWN
 
+    leader_ids = {
+        gid for gid in (
+            group.get("engineering_leader_id"),
+            group.get("regional_manager_id"),
+        ) if gid
+    }
+    if user_id in leader_ids:
+        return ROLE_LEADER
     if user_id in group.get("manager_ids", []):
         return ROLE_MANAGER
     if user_id in group.get("engineer_ids", []):

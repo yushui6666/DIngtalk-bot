@@ -25,6 +25,8 @@ class Notifier:
         self._db = db
         self._sender = sender
         self._enabled = enabled
+        # 影子模式下仅记录一次每个 dedupe_key，避免每分钟调度重复刷屏
+        self._shadow_seen: set[str] = set()
 
     def flush(self) -> int:
         """投递所有 PENDING Outbox 通知，返回投递数。"""
@@ -76,8 +78,10 @@ class Notifier:
     def send_deduped_group(self, group_id: str, text: str, *, dedupe_key: str) -> bool:
         """按 dedupe_key 去重的群消息（同一 key 只发一次，用于定时提醒）。"""
         if not self._enabled:
-            logger.info("影子模式：跳过去重群消息 group=%s key=%s text=%r",
-                        group_id, dedupe_key, text[:60])
+            if dedupe_key not in self._shadow_seen:
+                self._shadow_seen.add(dedupe_key)
+                logger.info("影子模式：跳过去重群消息 group=%s key=%s text=%r",
+                            group_id, dedupe_key, text[:60])
             return False
         notification_id = self._db.insert_notification(
             dedupe_key=dedupe_key,

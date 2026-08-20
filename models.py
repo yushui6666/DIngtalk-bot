@@ -14,6 +14,7 @@ from typing import Any, Optional
 # 角色（与 config.ROLE_PERMISSIONS 对齐）
 ROLE_MANAGER = "MANAGER"        # 店长
 ROLE_ENGINEER = "ENGINEER"      # 工程师
+ROLE_LEADER = "LEADER"          # 工程负责人/区域经理（v4.2: 可触发 #停止维修）
 ROLE_OTHER = "OTHER"            # 其他成员（只归档）
 ROLE_SYSTEM = "SYSTEM"          # 系统监听账号
 ROLE_UNKNOWN = "UNKNOWN"        # 未在群配置中的发送人
@@ -22,6 +23,7 @@ ROLE_UNKNOWN = "UNKNOWN"        # 未在群配置中的发送人
 ROLE_LABELS = {
     ROLE_MANAGER: "店长",
     ROLE_ENGINEER: "工程师",
+    ROLE_LEADER: "工程负责人",
     ROLE_OTHER: "其他成员",
     ROLE_SYSTEM: "系统",
     ROLE_UNKNOWN: "未识别成员",
@@ -37,6 +39,7 @@ TICKET_ACTIVE = "ACTIVE"
 TICKET_OVERDUE = "ACTIVE_OVERDUE"
 TICKET_COMPLETED = "COMPLETED"
 TICKET_CANCELLED = "CANCELLED"  # v4.0: #取消工单 或 AI 取消确认后的终态
+TICKET_STOPPED = "STOPPED"      # v4.2: #停止维修 终态（工程负责人决定不再维修，可重开）
 
 # 等待责任方
 WAITING_ENGINEER_SIDE = "ENGINEER_SIDE"

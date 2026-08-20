@@ -31,12 +31,12 @@ class ProtocolValidationError(ValueError):
 ALLOWED_EXECUTORS = frozenset({
     "create_ticket", "add_ticket_detail", "submit_diagnosis",
     "submit_repair_plan", "submit_timeout_reason", "complete_ticket",
-    "cancel_ticket", "reopen_ticket", "query_ticket", "select_ticket",
+    "cancel_ticket", "stop_ticket", "reopen_ticket", "query_ticket", "select_ticket",
     "clarify", "confirm_pending_action", "reject_pending_action",
     "correct_pending_action", "ignore_message",
 })
 
-ALLOWED_ROLES = frozenset({"MANAGER", "ENGINEER", "OTHER", "SYSTEM"})
+ALLOWED_ROLES = frozenset({"MANAGER", "ENGINEER", "LEADER", "OTHER", "SYSTEM"})
 
 ALLOWED_TARGET_TICKET_POLICIES = frozenset({
     "MUST_EXIST", "MUST_NOT_EXIST", "ANY", "MUST_EXIST_OR_NONE",

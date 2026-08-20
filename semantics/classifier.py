@@ -22,7 +22,7 @@ from semantics.types import SemanticDecision, TicketCandidate, TicketScore, Pend
 from semantics.model_client import ModelTimeoutError, ModelResponseError
 from semantics.keyword_matcher import match_keyword
 
-from models import NormalizedMessage
+from models import ROLE_ENGINEER, ROLE_LEADER, ROLE_MANAGER, NormalizedMessage
 
 from logger import get_logger
 
@@ -51,8 +51,8 @@ _INTENT_FIELD_OVERRIDES: dict[str, frozenset[str]] = {
     "system.correct_pending_action": _KNOWN_FIELDS - {"ticket_no"},
 }
 
-# 允许的 SLA 枚举值（§4.5）
-_ALLOWED_SLA = frozenset({"1天", "3天", "7天"})
+# 允许的 SLA 枚举值（§4.5；「待商榷」= 不设时效、仅记录）
+_ALLOWED_SLA = frozenset({"1天", "3天", "7天", "待商榷"})
 
 # 允许的紧急度枚举值（§4.5）
 _ALLOWED_URGENCY = frozenset({"低", "中", "高"})
@@ -73,6 +73,7 @@ _BUSINESS_ACTION_CUES: dict[str, tuple[str, ...]] = {
     "ticket.timeout_reason.submit": ("超时原因", "没按时完成"),
     "ticket.complete": ("完成工单", "直接完毕", "确认完毕"),
     "ticket.cancel": ("取消工单",),
+    "ticket.stop": ("停止维修", "停修", "不再维修"),
     "ticket.reopen": ("重开工单",),
 }
 
@@ -377,9 +378,15 @@ def _build_payload(
     for a in protocol.actions:
         if not a.semantic_enabled:
             continue
-        # 角色裁剪：无角色限制（system.*）保留；否则只保留该角色可触发的动作
+        # 角色裁剪：无角色限制（system.*）保留；否则只保留该角色可触发的动作。
+        # LEADER（工程负责人）为超集角色，额外兼容店长/工程师允许的动作，避免
+        # 兼任工程负责人的工程师在自然语言路径下丢失既有语义能力。
         if a.allowed_roles and sender_role not in a.allowed_roles:
-            continue
+            if not (
+                sender_role == ROLE_LEADER
+                and any(r in a.allowed_roles for r in (ROLE_MANAGER, ROLE_ENGINEER))
+            ):
+                continue
         parts = [f"- {a.intent_id}"]
         if a.required_fields:
             parts.append("必填:" + ",".join(a.required_fields))
@@ -489,7 +496,7 @@ def _build_output_schema(protocol: TicketProtocol) -> dict[str, Any]:
                     "problem_description": {"type": "string"},
                     "device": {"type": "string"},
                     "urgency": {"type": "string", "enum": ["低", "中", "高"]},
-                    "sla": {"type": "string", "enum": ["1天", "3天", "7天"]},
+                    "sla": {"type": "string", "enum": sorted(_ALLOWED_SLA)},
                     "diagnosis_items": {
                         "type": "array",
                         "items": {"type": "string"},

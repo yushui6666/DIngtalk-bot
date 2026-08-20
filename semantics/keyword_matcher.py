@@ -28,6 +28,8 @@ _FIELD_ALIAS_MAP: dict[str, str] = {
     "未完成原因": "timeout_reason",
     "取消原因": "cancel_reason",
     "重开原因": "reopen_reason",
+    "停修原因": "stop_reason",
+    "停止维修原因": "stop_reason",
     "原因": "reason",  # 通用 "原因"，需按 intent 再分发
     "完成说明": "completion_note",
 }
@@ -214,6 +216,8 @@ def match_keyword(content: str, protocol: TicketProtocol) -> SemanticDecision | 
             fields["cancel_reason"] = reason
         elif action.intent_id == "ticket.reopen":
             fields["reopen_reason"] = reason
+        elif action.intent_id == "ticket.stop":
+            fields["stop_reason"] = reason
 
     # 计算 missing_fields
     missing = tuple(

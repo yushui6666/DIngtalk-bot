@@ -3,7 +3,14 @@
 import pytest
 
 from config import LISTENER_USER_ID, USER_ID_MAP
-from models import ROLE_ENGINEER, ROLE_MANAGER, ROLE_OTHER, ROLE_SYSTEM, ROLE_UNKNOWN
+from models import (
+    ROLE_ENGINEER,
+    ROLE_LEADER,
+    ROLE_MANAGER,
+    ROLE_OTHER,
+    ROLE_SYSTEM,
+    ROLE_UNKNOWN,
+)
 from role_resolver import resolve_role, validate_role_overlap
 
 NEI_YU_QING_OID = "DV2iipykTJciSappVW4GfsiSQii2iPTIiiIm8jw"
@@ -15,6 +22,8 @@ GROUP_WITH_ALL = {
     "manager_ids": ["uid-manager-1"],
     "engineer_ids": ["uid-engineer-1"],
     "other_member_ids": ["uid-other-1"],
+    "engineering_leader_id": "uid-leader-1",
+    "regional_manager_id": "uid-regional-1",
 }
 
 
@@ -31,6 +40,26 @@ def test_manager_via_mapping():
 def test_engineer_via_mapping():
     id_map = {"oid-engineer": "uid-engineer-1"}
     assert resolve_role(GROUP_WITH_ALL, "oid-engineer", id_map) == ROLE_ENGINEER
+
+
+def test_leader_via_engineering_leader():
+    """工程负责人（engineering_leader_id）→ LEADER，优先级高于店长/工程师。"""
+    id_map = {"oid-leader": "uid-leader-1"}
+    assert resolve_role(GROUP_WITH_ALL, "oid-leader", id_map) == ROLE_LEADER
+
+
+def test_leader_via_regional_manager():
+    """区域经理（regional_manager_id）→ LEADER。"""
+    id_map = {"oid-regional": "uid-regional-1"}
+    assert resolve_role(GROUP_WITH_ALL, "oid-regional", id_map) == ROLE_LEADER
+
+
+def test_leader_takes_precedence_over_manager():
+    """同一 userId 同时是店长和工程负责人时 → LEADER（最高优先级）。"""
+    group = dict(GROUP_WITH_ALL)
+    group["manager_ids"] = ["uid-leader-1"]
+    id_map = {"oid-leader": "uid-leader-1"}
+    assert resolve_role(group, "oid-leader", id_map) == ROLE_LEADER
 
 
 def test_other_via_mapping():

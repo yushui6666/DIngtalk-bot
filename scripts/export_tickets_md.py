@@ -64,6 +64,7 @@ NAME_MAP = {**_load_store_name_map(), **NAME_MAP}
 _ROLE_LABELS = {
     "MANAGER": "店长",
     "ENGINEER": "工程师",
+    "LEADER": "工程负责人",
     "OTHER": "其他成员",
     "SYSTEM": "系统",
 }
@@ -73,6 +74,7 @@ _STATUS_LABELS = {
     "ACTIVE_OVERDUE": "已超时",
     "COMPLETED": "已完成",
     "CANCELLED": "已取消",
+    "STOPPED": "已停修",
 }
 
 
@@ -86,6 +88,10 @@ def _fmt(dt: str) -> str:
 
 def _status_text(t: dict) -> str:
     return _STATUS_LABELS.get(t["status"], t["status"])
+
+
+def _order_status_label(status: str) -> str:
+    return (status or "").strip() or "未更新"
 
 
 def _diagnosis_current(conn, ticket_id: int) -> list[str]:
@@ -114,6 +120,21 @@ def _repair_current(conn, ticket_id: int) -> dict | None:
         "ORDER BY id DESC LIMIT 1", (ticket_id,)
     ).fetchone()
     return dict(row) if row else None
+
+
+def _order_info(conn, ticket_id: int) -> list[dict]:
+    """工单关联订单（订单号 + 最后状态），来自 order_monitor 监控表。"""
+    rows = conn.execute(
+        "SELECT order_id, last_status FROM order_monitor WHERE ticket_id=? ORDER BY order_id",
+        (ticket_id,),
+    ).fetchall()
+    orders = [dict(r) for r in rows]
+    if not orders:
+        # 兜底：仅登记过订单号但未进入监控表的工单
+        rcur = _repair_current(conn, ticket_id)
+        if rcur and rcur.get("order_no"):
+            orders = [{"order_id": rcur["order_no"], "last_status": ""}]
+    return orders
 
 
 def _repair_history(conn, ticket_id: int) -> list[dict]:
@@ -181,13 +202,30 @@ def render_ticket(t: dict, conn) -> str:
     lines.append(f"| 初始截止时间 | {_fmt(t['initial_deadline_at'])} |")
     lines.append(f"| 最终截止时间 | {_fmt(t['current_deadline_at'])} |")
 
-    # 关闭信息（若已关闭/取消）
+    # 订单号 + 最后状态（order_monitor 监控表）
+    orders = _order_info(conn, tid)
+    if orders:
+        lines.append("| 订单号 | " + "、".join(o["order_id"] for o in orders) + " |")
+        last_status = "；".join(
+            f"{o['order_id']}:{_order_status_label(o['last_status'])}" for o in orders
+        )
+        lines.append(f"| 订单最后状态 | {last_status} |")
+    else:
+        lines.append("| 订单号 | （暂无） |")
+        lines.append("| 订单最后状态 | （暂无） |")
+
+    # 关闭信息（若已关闭/取消/停修）
     if t["status"] in ("COMPLETED", "CANCELLED"):
         lines.append(f"| 关闭人 | {_name(t.get('cancelled_by') or '') if t['status']=='CANCELLED' else _closer_name(conn, tid, t)} |")
         lines.append(f"| 关闭角色 | {_closer_role(conn, tid, t)} |")
         lines.append(f"| 关闭时间 | {_fmt(t['closed_at'] or t['cancelled_at'])} |")
         if t.get("cancel_reason"):
             lines.append(f"| 取消原因 | {(t['cancel_reason'] or '').replace(chr(10), ' ')} |")
+    elif t["status"] == "STOPPED":
+        lines.append(f"| 停修人 | {_name(t.get('stopped_by') or '')} |")
+        lines.append(f"| 停修时间 | {_fmt(t['stopped_at'])} |")
+        if t.get("stop_reason"):
+            lines.append(f"| 停修原因 | {(t['stop_reason'] or '').replace(chr(10), ' ')} |")
     lines.append("")
 
     # 当前故障判断
@@ -308,6 +346,11 @@ def render_ticket(t: dict, conn) -> str:
     elif t["status"] == "CANCELLED":
         lines.append(f"- 取消人：{_name(t['cancelled_by'])}")
         lines.append(f"- 取消时间：{_fmt(t['cancelled_at'])}")
+    elif t["status"] == "STOPPED":
+        lines.append(f"- 停修人：{_name(t.get('stopped_by') or '')}")
+        lines.append(f"- 停修时间：{_fmt(t.get('stopped_at') or '')}")
+        if t.get("stop_reason"):
+            lines.append(f"- 停修原因：{(t['stop_reason'] or '').strip()}")
     lines.append("")
 
     return "\n".join(lines)

@@ -28,6 +28,7 @@ _STATUS_LABELS = {
     "ACTIVE_OVERDUE": "已超时",
     "COMPLETED": "已完成",
     "CANCELLED": "已取消",
+    "STOPPED": "已停修",
 }
 
 _HEADERS = [
@@ -39,6 +40,7 @@ _HEADERS = [
 _ROLE_LABELS = {
     "MANAGER": "店长",
     "ENGINEER": "工程师",
+    "LEADER": "工程负责人",
     "OTHER": "其他成员",
     "SYSTEM": "系统",
 }

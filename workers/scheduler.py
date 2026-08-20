@@ -189,6 +189,7 @@ class SchedulerWorker:
         rows = self._db.connect().execute(
             """SELECT * FROM tickets t
                WHERE t.status IN ('ACTIVE', 'ACTIVE_OVERDUE') AND t.current_deadline_at <= ?
+                 AND t.sla_days > 0   -- 待商榷(0) 不设时效，不参与 SLA 提醒
                  AND NOT EXISTS (
                      SELECT 1 FROM order_monitor om
                      WHERE om.ticket_id = t.id AND om.received_at IS NOT NULL
@@ -200,10 +201,15 @@ class SchedulerWorker:
             ticket = dict(row)
             overdue = ticket["current_deadline_at"] < now_str
             if overdue:
+                # 计划书 §9.1：超时工单状态推进 ACTIVE → ACTIVE_OVERDUE（幂等）。
+                # 首次推进（返回 True）即建 WAITING_REASON 超时周期，与提醒是否外发成功解耦
+                # （影子模式/发送失败时状态已推进，周期必须同步建立，否则工程师回 #超时原因 会被拒）。
+                if self._db.mark_ticket_overdue(ticket["id"]):
+                    self._db.open_timeout_cycle(ticket["id"], now_str)
                 dedupe = f"sla_overdue:{ticket['id']}"
                 text = (
                     f"⏰ 工单 {ticket['ticket_no']} 已超时效（{ticket['current_deadline_at']}）。"
-                    f"如已修复，请回复「修好了」完成工单；如未完成请说明情况。"
+                    f"如已修复，请回复「修好了」完成工单；如未完成，请回复 #超时原因 说明情况。"
                 )
             else:
                 dedupe = f"sla_remind:{ticket['id']}:{ticket['current_deadline_at']}"

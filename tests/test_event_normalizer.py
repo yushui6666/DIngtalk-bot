@@ -6,7 +6,7 @@ import pytest
 
 from config import GROUPS, LISTENER_USER_ID, USER_ID_MAP
 from event_normalizer import normalize_event
-from models import ROLE_ENGINEER, ROLE_SYSTEM, ROLE_UNKNOWN
+from models import ROLE_LEADER, ROLE_SYSTEM, ROLE_UNKNOWN
 
 # Phase 0 实测的真实事件样例（脱敏保留结构）
 REAL_EVENT = {
@@ -42,10 +42,10 @@ def test_real_event_normalized():
 
 
 def test_role_mapped_via_user_id():
-    """聂宇清 openDingtalkId → userId → ENGINEER（配置为 userId）。"""
+    """聂宇清 openDingtalkId → userId → LEADER（同时配置为工程师/工程负责人，最高优先级）。"""
     msg = normalize_event(REAL_EVENT, TEST_GROUP, USER_ID_MAP)
     assert msg is not None
-    assert msg.sender_role == ROLE_ENGINEER
+    assert msg.sender_role == ROLE_LEADER
 
 
 def test_system_account_filtered():

@@ -54,6 +54,7 @@ _load_env_file()
 
 import config as _config  # noqa: E402  — 需在 _load_env_file 之后导入
 from config import (  # noqa: E402  — 需在 _load_env_file 之后导入
+    DWS_CMD,
     GROUPS,
     LLM_API_KEY,
     LLM_ENABLED,
@@ -65,7 +66,7 @@ from config import (  # noqa: E402  — 需在 _load_env_file 之后导入
 
 def _dws_sender(target_id: str, text: str) -> None:
     """通过 dws CLI 发群消息（同步，低吞吐场景够用）。"""
-    cmd = ["dws", "chat", "message", "send", "--group", target_id, "--text", text]
+    cmd = [DWS_CMD, "chat", "message", "send", "--group", target_id, "--text", text]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if proc.returncode != 0:
@@ -189,7 +190,8 @@ async def main(
         if duration:
             await asyncio.sleep(duration)
         else:
-            await asyncio.sleep(3600 * 24)  # 默认长驻
+            while True:  # 默认常驻，直到外部信号取消
+                await asyncio.sleep(3600)
     finally:
         for task in tasks:
             task.cancel()

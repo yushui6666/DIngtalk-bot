@@ -61,7 +61,7 @@ class SimpleNamespace:
 
 async def _create_ticket(env) -> dict:
     msg = NormalizedMessage(message_id="c1", group_id="G1", sender_id="staff", sender_name="店员",
-                            content="#报修\n主题：金库\n位置：五房\n问题描述：风机风力小",
+                            content="#报修\n主题：金库\n位置：五房\n问题描述：风机风力小\n时效：3天",
                             message_type="text", sent_at=datetime.now(), sender_role="OTHER")
     env.db.enqueue_message(msg)
     row = env.db.connect().execute("SELECT * FROM inbox_messages WHERE message_id='c1'").fetchone()

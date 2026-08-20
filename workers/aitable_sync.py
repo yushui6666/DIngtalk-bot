@@ -13,7 +13,7 @@ import json
 import subprocess
 from pathlib import Path
 
-from config import AITABLE_SYNC_BASE_ID, AITABLE_SYNC_TABLE_ID
+from config import AITABLE_SYNC_BASE_ID, AITABLE_SYNC_TABLE_ID, DWS_CMD
 from db import Database
 from logger import get_logger
 
@@ -36,6 +36,7 @@ _FIELD_IDS = {
     "version": "g0i1WrY",         # 版本
     "reopen_count": "Jr7AISo",    # 重开次数
     "engineer": "3PJf0YA",        # 工程师（多选，来自门店群配置）
+    "messages": "RUQR1Ii",        # 消息记录（多行文本，已归属工单的消息）
 }
 
 # 工程师 userId → AI 表格选项姓名（与 groups.json engineer_ids 对应）
@@ -56,7 +57,7 @@ _DATE_COLUMNS = {
 
 def _run_dws(args: list[str]) -> dict:
     """调用 dws CLI 并解析 JSON 输出；失败抛异常。"""
-    cmd = ["dws", *args, "--format", "json"]
+    cmd = [DWS_CMD, *args, "--format", "json"]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if proc.returncode != 0:
         raise RuntimeError(f"dws {' '.join(args[:3])} 失败: {proc.stderr[:300]}")
@@ -79,10 +80,44 @@ def _fmt_datetime(value: str | None) -> str | None:
     return f"{date_part}T{hh}:{mm}:00+08:00"
 
 
-def _ticket_to_cells(row: dict, engineers: list[str] | None = None) -> dict:
+def _fmt_ticket_messages(rows: list) -> str:
+    """工单已归属消息 → 可读多行文本（时间 角色：内容）。
+
+    rows: messages 表行（已按 sent_at 排序），角色取 sender_role。
+    """
+    lines: list[str] = []
+    for row in rows:
+        sent_at = str(row["sent_at"] or "")[:16]
+        role = {
+            "MANAGER": "店长",
+            "ENGINEER": "工程师",
+            "LEADER": "工程负责人",
+            "OTHER": "成员",
+        }.get(row["sender_role"], row["sender_role"] or "未知")
+        content = str(row["content"] or "").strip()
+        lines.append(f"[{sent_at}] {role}: {content}")
+    return "\n".join(lines)
+
+
+def _messages_by_ticket(db: Database) -> dict[int, str]:
+    """{ticket_id: 消息文本}，一次性拉取所有已归属工单的消息。"""
+    conn = db.connect()
+    rows = conn.execute(
+        "SELECT ticket_id, sender_role, content, sent_at FROM messages"
+        " ORDER BY ticket_id, sent_at"
+    ).fetchall()
+    grouped: dict[int, list] = {}
+    for r in rows:
+        grouped.setdefault(r["ticket_id"], []).append(r)
+    return {tid: _fmt_ticket_messages(msgs) for tid, msgs in grouped.items()}
+
+
+def _ticket_to_cells(row: dict, engineers: list[str] | None = None,
+                     messages: str | None = None) -> dict:
     """本地工单行 → AI 表格 cells（fieldId → value）。
 
     engineers: 该工单所属门店配置的工程师姓名列表（填多选字段），可空。
+    messages: 该工单已归属消息文本（填「消息记录」字段），可空。
     """
     cells: dict = {}
     for field, field_id in _FIELD_IDS.items():
@@ -90,9 +125,15 @@ def _ticket_to_cells(row: dict, engineers: list[str] | None = None) -> dict:
             if engineers:
                 cells[field_id] = engineers
             continue
+        if field == "messages":
+            if messages:
+                cells[field_id] = messages
+            continue
         value = row.get(field)
         if value is None:
             continue
+        if field == "sla_days" and value == 0:
+            continue  # 待商榷工单不设时效：看板「时效(天)」留空，由工单号体现
         if field in _DATE_COLUMNS:
             value = _fmt_datetime(value)
         cells[field_id] = value
@@ -154,13 +195,15 @@ def sync_once(db: Database, *, full: bool = False, prune: bool = False) -> dict:
 
     online = _online_ticket_no_map()
     engineers_by_store = _group_engineers_by_store()
+    messages_by_ticket = _messages_by_ticket(db)
     creates: list[dict] = []
     updates: list[dict] = []
     for row in rows:
         d = dict(row)
         ticket_no = d["ticket_no"]
         engineers = engineers_by_store.get(d["store_name"])
-        cells = _ticket_to_cells(d, engineers)
+        messages = messages_by_ticket.get(d["id"])
+        cells = _ticket_to_cells(d, engineers, messages)
         if ticket_no in online:
             updates.append({"recordId": online[ticket_no], "cells": cells})
         else:
@@ -230,8 +273,17 @@ def sync(db_path: Path, *, dry_run: bool = False, full: bool = False, prune: boo
                 " OR version > 1 ORDER BY id"
             ).fetchall()
         online = _online_ticket_no_map()
-        creates = [r for r in rows if r["ticket_no"] not in online]
-        updates = [r for r in rows if r["ticket_no"] in online]
+        messages_by_ticket = _messages_by_ticket(db)
+        creates = [
+            {"ticket_no": r["ticket_no"], "cells": _ticket_to_cells(
+                dict(r), None, messages_by_ticket.get(r["id"]))}
+            for r in rows if r["ticket_no"] not in online
+        ]
+        updates = [
+            {"ticket_no": r["ticket_no"], "cells": _ticket_to_cells(
+                dict(r), None, messages_by_ticket.get(r["id"]))}
+            for r in rows if r["ticket_no"] in online
+        ]
         local_nos = {
             str(r["ticket_no"])
             for r in conn.execute("SELECT ticket_no FROM tickets").fetchall()

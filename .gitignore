@@ -37,6 +37,19 @@ htmlcov/
 data/
 logs/
 archives/
+dingtalk.db
+*.db-shm
+*.db-wal
 
 # ---- 日志 ----
 *.log
+
+# ---- 一次性脚本与线下产出（程序产出，不追踪） ----
+框架/
+docs/上线前已处理事项.md
+scripts/export_knowledge_base.py
+scripts/export_tickets_csv.py
+scripts/link_engineer_msg_to_ticket30.py
+scripts/manual_create_wujiaochang.py
+scripts/manual_flush_create_receipt.py
+scripts/replay_cid30oQwHgrh.py

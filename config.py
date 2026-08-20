@@ -74,6 +74,11 @@ ORDER_RECEIVE_REMIND_DAILY = True
 LISTENER_USER_ID = "DuT5LjNZRjS6gMdv9dii9LLC2iPTIiiIm8jw"
 LISTENER_USER_NAME = "工程部AI"
 
+# ───────────────────────── dws CLI 路径 ─────────────────────────
+# 监听/发送/看板同步都通过 dws CLI；默认取 PATH，可显式指定完整路径
+# （本机安装位置：/Users/yushui/.workbuddy/binaries/node/cli-connector-packages/bin/dws）
+DWS_CMD = _os.environ.get("DWS_CMD", "dws")
+
 # ───────────────────────── 群配置 ─────────────────────────
 # 群与成员配置独立保存在 JSON 文件（结构：{"groups":[...], "user_id_map":{...}}），
 # 便于 50 群/几百人规模维护；GROUPS 与 USER_ID_MAP 由此加载，保持导出名不变。

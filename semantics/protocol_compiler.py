@@ -29,6 +29,7 @@ _KEYWORD_TO_INTENT: dict[str, str] = {
     "#超时原因": "ticket.timeout_reason.submit",
     "#完毕": "ticket.complete",
     "#取消工单": "ticket.cancel",
+    "#停止维修": "ticket.stop",
     "#重开工单": "ticket.reopen",
     "#查询工单": "ticket.query",
     "#选择工单": "ticket.select",
@@ -38,6 +39,8 @@ _KEYWORD_TO_INTENT: dict[str, str] = {
 _ROLE_MAP: dict[str, str] = {
     "店长": "MANAGER",
     "工程师": "ENGINEER",
+    "工程负责人": "LEADER",
+    "区域经理": "LEADER",
     "其他成员": "OTHER",
     "系统账号": "SYSTEM",
 }
@@ -104,12 +107,41 @@ _EXTRA_ACTIONS: list[dict[str, Any]] = [
         "field_definitions": {},
     },
     {
+        "intent_id": "ticket.stop",
+        "display_name": "停修工单",
+        "explicit_keywords": ["#停止维修"],
+        "semantic_enabled": True,
+        "allowed_roles": ["LEADER"],
+        "allowed_ticket_states": ["ACTIVE", "ACTIVE_OVERDUE"],
+        "required_fields": ["ticket_no", "stop_reason"],
+        "optional_fields": [],
+        "target_ticket_policy": "MUST_EXIST",
+        "risk_level": "HIGH",
+        "confirmation_policy": {
+            "EXPLICIT_KEYWORD": "NOT_REQUIRED",
+            "SEMANTIC_MODEL": "ALWAYS",
+        },
+        "positive_examples": [
+            "这个工单不要再修了，停止维修，配件已停产无法修复",
+            "#停止维修 原因：配件停产，无法修复",
+            "工单 W001 停止维修，原因：设备已报废不再维修",
+        ],
+        "negative_examples": [
+            "这个工单还要继续修吗",
+            "停止维修是终态吗",
+            "我不太确定要不要停修",
+        ],
+        "confirmation_template": "⚠️ 确认停止维修工单 {ticket_no}？该工单将进入停修终态，可随时重开。请明确回复。",
+        "executor": "stop_ticket",
+        "field_definitions": {},
+    },
+    {
         "intent_id": "ticket.reopen",
         "display_name": "重开工单",
         "explicit_keywords": ["#重开工单"],
         "semantic_enabled": True,
-        "allowed_roles": ["MANAGER", "ENGINEER", "OTHER"],
-        "allowed_ticket_states": ["COMPLETED", "CANCELLED"],
+        "allowed_roles": ["MANAGER", "ENGINEER", "OTHER", "LEADER"],
+        "allowed_ticket_states": ["COMPLETED", "CANCELLED", "STOPPED"],
         "required_fields": ["ticket_no", "reopen_reason"],
         "optional_fields": [],
         "target_ticket_policy": "MUST_EXIST",
@@ -149,12 +181,14 @@ _EXTRA_ACTIONS: list[dict[str, Any]] = [
             "SEMANTIC_MODEL": "NOT_REQUIRED",
         },
         "positive_examples": [
+            "现在有多少单在处理",
+            "现在有哪些工单在处理",
+            "帮我查一下工单",
             "#查询工单",
             "#查询工单 W001",
         ],
         "negative_examples": [
-            "帮我查一下工单",
-            "现在有哪些工单在处理",
+            "这个工单是什么问题",
         ],
         "confirmation_template": "",
         "executor": "query_ticket",
@@ -313,6 +347,7 @@ _FIELD_DICTIONARY: dict[str, dict[str, Any]] = {
     "completion_note": {"type": "text", "aliases": ["完成说明"]},
     "cancel_reason": {"type": "text", "aliases": ["取消原因"]},
     "reopen_reason": {"type": "text", "aliases": ["重开原因"]},
+    "stop_reason": {"type": "text", "aliases": ["停修原因", "停止维修原因"]},
     "clarification_reason": {"type": "text", "aliases": ["澄清原因"]},
     "content": {"type": "text", "aliases": ["内容", "补充说明"]},
 }
@@ -364,7 +399,7 @@ def _infer_policy(intent_id: str) -> str:
     if intent_id == "ticket.create":
         return "MUST_NOT_EXIST"
     elif intent_id in ("ticket.complete", "ticket.cancel",
-                       "ticket.reopen",
+                       "ticket.reopen", "ticket.stop",
                        "ticket.add_detail", "ticket.diagnosis.submit",
                        "ticket.repair_plan.submit", "ticket.timeout_reason.submit",
                        "ticket.select"):
@@ -375,7 +410,7 @@ def _infer_policy(intent_id: str) -> str:
 
 
 def _infer_risk(intent_id: str) -> str:
-    if intent_id in ("ticket.complete", "ticket.cancel", "ticket.reopen"):
+    if intent_id in ("ticket.complete", "ticket.cancel", "ticket.reopen", "ticket.stop"):
         return "HIGH"
     elif intent_id in ("ticket.create", "ticket.timeout_reason.submit"):
         return "NORMAL"
@@ -387,7 +422,7 @@ def _infer_risk(intent_id: str) -> str:
 
 
 def _infer_confirmation_policy(intent_id: str) -> dict[str, str]:
-    if intent_id in ("ticket.cancel", "ticket.reopen"):
+    if intent_id in ("ticket.cancel", "ticket.reopen", "ticket.stop"):
         return {"EXPLICIT_KEYWORD": "NOT_REQUIRED", "SEMANTIC_MODEL": "ALWAYS"}
     # 业务决策（2026-08-12）：完工在群里说「修好了」即直接完成，不再强制二次确认。
     # 取消/重开仍要求确认，避免误操作。
@@ -407,6 +442,7 @@ def _executor_for(intent_id: str) -> str:
         "ticket.timeout_reason.submit": "submit_timeout_reason",
         "ticket.complete": "complete_ticket",
         "ticket.cancel": "cancel_ticket",
+        "ticket.stop": "stop_ticket",
         "ticket.reopen": "reopen_ticket",
         "ticket.query": "query_ticket",
         "ticket.select": "select_ticket",
@@ -446,6 +482,7 @@ def _translate_field_name(chinese_name: str) -> str:
         "时效": "sla", "故障判断": "diagnosis_items", "维修方式": "repair_method",
         "订单号": "order_no", "未完成原因": "timeout_reason", "完成说明": "completion_note",
         "取消原因": "cancel_reason", "重开原因": "reopen_reason",
+        "停修原因": "stop_reason",
     }
     if chinese_name in direct_map:
         return direct_map[chinese_name]
@@ -550,6 +587,7 @@ def compile_business_protocol(source: Path, destination: Path) -> str:
         "risk_policies": {
             "ticket.complete": {"SEMANTIC_MODEL": "NOT_REQUIRED"},
             "ticket.cancel": {"SEMANTIC_MODEL": "ALWAYS"},
+            "ticket.stop": {"SEMANTIC_MODEL": "ALWAYS"},
             "ticket.reopen": {"SEMANTIC_MODEL": "ALWAYS"},
         },
     }
@@ -598,10 +636,10 @@ def _sort_key(intent_id: str) -> tuple[int, str]:
 def _ticket_states_for(intent_id: str) -> list[str]:
     if intent_id in ("ticket.create",):
         return []
-    elif intent_id in ("ticket.cancel",):
+    elif intent_id in ("ticket.cancel", "ticket.stop"):
         return ["ACTIVE", "ACTIVE_OVERDUE"]
     elif intent_id in ("ticket.reopen",):
-        return ["COMPLETED", "CANCELLED"]
+        return ["COMPLETED", "CANCELLED", "STOPPED"]
     elif intent_id in ("ticket.add_detail",):
         return ["ACTIVE", "ACTIVE_OVERDUE"]
     return ["ACTIVE", "ACTIVE_OVERDUE"]
