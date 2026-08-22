@@ -230,18 +230,24 @@ def test_compiled_protocol_matches_v4_contract(tmp_path):
 
 
 def test_compiler_is_reproducible_and_matches_committed_protocol(tmp_path):
-    """同一业务源重复编译结果逐字节一致，并等于已提交运行时协议。"""
+    """同一业务源重复编译结果逐字节一致，并等于已提交运行时协议。
+
+    业务源 dashbord/维修工单_流程关键词.json 不入库（.gitignore），
+    缺失时跳过（克隆环境无源可编译，不算失败）。
+    """
     from semantics.protocol_compiler import compile_business_protocol
 
-    project_root = Path(__file__).parents[2]
+    project_root = Path(__file__).parents[1]
     source = project_root / "dashbord" / "维修工单_流程关键词.json"
+    if not source.exists():
+        pytest.skip(f"业务源缺失，跳过编译一致性检查: {source}")
     first = tmp_path / "first.json"
     second = tmp_path / "second.json"
 
     compile_business_protocol(source, first)
     compile_business_protocol(source, second)
 
-    committed = project_root / "dingtalk_script" / "protocols" / "ticket_semantics.v4.json"
+    committed = project_root / "protocols" / "ticket_semantics.v4.json"
     assert first.read_bytes() == second.read_bytes()
     assert first.read_bytes() == committed.read_bytes()
 

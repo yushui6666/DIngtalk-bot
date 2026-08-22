@@ -44,7 +44,13 @@ class FakeClassifier:
 
 
 @pytest.fixture()
-def env(tmp_path):
+def env(tmp_path, monkeypatch):
+    # 隔离外部文件依赖（淘宝对账/订单共享表默认指向特定开发机的绝对路径，
+    # 其他机器上不可写/不存在会导致订单相关用例异常）
+    import config as _config
+    monkeypatch.setattr(_config, "ORDER_STORE_TABLE_PATH", tmp_path / "订单门店状态表.xlsx")
+    monkeypatch.setattr(_config, "TAOBAO_ORDER_DETAIL_XLSX", tmp_path / "订单地址明细.xlsx")
+    monkeypatch.setattr(_config, "TAOBAO_PENDING_XLSX", tmp_path / "待人工处理.xlsx")
     db = Database(tmp_path / "test.db")
     db.init_schema()
     db.upsert_group(GROUP)
