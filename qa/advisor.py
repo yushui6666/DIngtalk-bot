@@ -42,6 +42,7 @@ class TicketAdvisor:
         embedding_client: Any = None,
         enabled: bool = True,
         top_k: int = 3,
+        group_whitelist: Optional[set[str]] = None,
     ) -> None:
         self._db = db
         self._store = store
@@ -49,6 +50,8 @@ class TicketAdvisor:
         self._embedding_client = embedding_client
         self.enabled = enabled
         self.top_k = top_k
+        # 群白名单（灰度）：None=全部群；set=只对这些群发建议
+        self._group_whitelist = group_whitelist
 
     # ─────────────────────── 主入口 ───────────────────────
 
@@ -59,6 +62,12 @@ class TicketAdvisor:
             {"suggestion_id", "text", "doc_ids", "top_score"} 或 None
         """
         if not self.enabled:
+            return None
+        if self._group_whitelist is not None and                 ticket.get("group_id") not in self._group_whitelist:
+            logger.debug(
+                "群不在建议白名单，跳过 group=%s ticket=%s",
+                ticket.get("group_id"), ticket.get("ticket_no"),
+            )
             return None
         try:
             return self._advise(ticket)

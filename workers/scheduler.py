@@ -65,6 +65,32 @@ class SchedulerWorker:
         self.scan_received_reminders(now)
         self.scan_order_status()
         self.scan_aitable_sync(now)
+        self.scan_kb_sync(now)
+
+    def scan_kb_sync(self, now: datetime) -> None:
+        """知识库增量同步（v4.3 RAG 闭环，按间隔节流）。
+
+        终态工单 → 案例文档 upsert（content_hash 变更检测）→
+        待嵌入文档批量嵌入。任何失败静默跳过（建议链路可降级）。
+        """
+        from config import QA_ADVISOR_ENABLED, QA_KB_SYNC_INTERVAL_SECONDS
+
+        if not QA_ADVISOR_ENABLED or QA_KB_SYNC_INTERVAL_SECONDS <= 0:
+            return
+        if getattr(self, "_last_kb_sync_at", None) is not None:
+            elapsed = (now - self._last_kb_sync_at).total_seconds()
+            if elapsed < QA_KB_SYNC_INTERVAL_SECONDS:
+                return
+        self._last_kb_sync_at = now
+        try:
+            from qa.sync import sync_knowledge_base
+
+            stats = sync_knowledge_base(self._db)
+            if stats and (stats.get("inserted") or stats.get("updated")
+                          or stats.get("embedded")):
+                logger.info("知识库增量同步完成 %s", stats)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("知识库同步失败（忽略）: %s", exc)
 
     def scan_aitable_sync(self, now: datetime) -> None:
         """把本地工单增量同步到 AI 表格「报修工单」看板数据源（按间隔节流）。

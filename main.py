@@ -120,6 +120,23 @@ def _build_pipeline(mode: str):
     else:
         logger.info("云端模型未启用，仅走关键词快路径")
 
+    # v4.3 RAG 闭环顾问：建单相似案例建议（QA_ADVISOR_ENABLED 控制）
+    advisor = None
+    if _config.QA_ADVISOR_ENABLED:
+        from qa.advisor import TicketAdvisor
+        from qa.kb_store import KBStore
+
+        kb_store = KBStore(_config.DB_PATH)
+        kb_store.init_schema()
+        advisor = TicketAdvisor(
+            db, kb_store,
+            group_whitelist=_config.QA_ADVISOR_GROUPS or None,
+        )
+        logger.info(
+            "RAG 顾问已启用 whitelist=%s",
+            _config.QA_ADVISOR_GROUPS or "全部群",
+        )
+
     pipeline = MessageProcessingPipeline(
         db=db,
         repo=repo,
@@ -131,6 +148,7 @@ def _build_pipeline(mode: str):
         notifier=notifier,
         classifier=classifier,
         archiver=archiver,
+        advisor=advisor,
         mode=RuntimeMode(mode),
     )
     return db, pipeline, notifier, archiver

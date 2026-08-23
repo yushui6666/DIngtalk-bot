@@ -227,6 +227,17 @@ LLM_API_KEY = _os.environ.get("LLM_API_KEY", "")
 # 是否启用云端模型语义匹配（关闭时自然语言走降级路径）
 LLM_ENABLED = _os.environ.get("LLM_ENABLED", "true").lower() in ("true", "1", "yes")
 
+# ───────────────────────── RAG 闭环顾问（v4.3） ─────────────────────────
+# 建单后相似案例建议 + 未解决升级；知识库与主库同文件（SQLite 唯一真相源）。
+# - QA_ADVISOR_ENABLED  总开关（默认 true）
+# - QA_ADVISOR_GROUPS   群白名单（逗号分隔 group_id；空=全部群，灰度期可只开测试群）
+# - QA_ADVISOR_TOP_K    建议引用案例数（默认 3）
+# - QA_KB_SYNC_INTERVAL_SECONDS  知识库增量同步间隔（默认 1800；0=关闭）
+QA_ADVISOR_ENABLED = _os.environ.get("QA_ADVISOR_ENABLED", "true").lower() in ("true", "1", "yes")
+QA_ADVISOR_GROUPS = _os.environ.get("QA_ADVISOR_GROUPS", "").strip()
+QA_ADVISOR_TOP_K = int(_os.environ.get("QA_ADVISOR_TOP_K", "3"))
+QA_KB_SYNC_INTERVAL_SECONDS = int(_os.environ.get("QA_KB_SYNC_INTERVAL_SECONDS", "1800"))
+
 # ───────────────────────── 视觉模型（图片多模态解析） ─────────────────────────
 # OpenAI 兼容的视觉模型（图片 base64 传入），支持按需切换供应商
 VISION_ENABLED = _os.environ.get("VISION_ENABLED", "false").lower() in ("true", "1", "yes")
