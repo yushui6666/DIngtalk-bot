@@ -5,6 +5,63 @@
  "source_sha256": "5687e936efa4feff3f072275506f20d2363bfc2033f59debc7fc8aeeaaf4fff7",
  "actions": [
   {
+   "intent_id": "qa.unresolved",
+   "display_name": "AI建议未解决",
+   "explicit_keywords": [
+    "#未解决"
+   ],
+   "semantic_enabled": true,
+   "allowed_roles": [
+    "MANAGER",
+    "ENGINEER",
+    "LEADER",
+    "OTHER"
+   ],
+   "allowed_ticket_states": [
+    "ACTIVE",
+    "ACTIVE_OVERDUE"
+   ],
+   "required_fields": [
+    "ticket_no"
+   ],
+   "optional_fields": [],
+   "target_ticket_policy": "MUST_EXIST",
+   "risk_level": "LOW",
+   "confirmation_policy": {
+    "EXPLICIT_KEYWORD": "NOT_REQUIRED",
+    "SEMANTIC_MODEL": "NOT_REQUIRED"
+   },
+   "positive_examples": [
+    "还是不行，跟之前一样",
+    "没修好，还是不制冷",
+    "按建议弄了，没用",
+    "试过了，还是嗡嗡响",
+    "建议没用，问题还在",
+    "更严重了，现在完全不制冷了",
+    "没解决，你来看看吧",
+    "搞不定，还是漏水",
+    "试了半天还是不行",
+    "#未解决",
+    "#未解决 工单编号：W001"
+   ],
+   "negative_examples": [
+    "解决了，正常了",
+    "修好了，谢谢",
+    "正常了",
+    "还是不行吗？",
+    "我先试试",
+    "等会儿再试",
+    "怎么还没人来修",
+    "工程师说要明天来",
+    "#查询工单",
+    "好的",
+    "大家下午好"
+   ],
+   "confirmation_template": "",
+   "executor": "qa_unresolved",
+   "field_definitions": {}
+  },
+  {
    "intent_id": "ticket.add_detail",
    "display_name": "补充工单信息",
    "explicit_keywords": [

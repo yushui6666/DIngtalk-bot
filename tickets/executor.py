@@ -202,11 +202,41 @@ class TicketCommandExecutor:
         )
         if not ok:
             return CommandResult(RESULT_REJECTED, ticket["id"], ticket["version"], ())
+        # v4.3 决策6：AI 建议存在且未反馈时，「解决了」即结果级验证——
+        # 建议的原因/处理自动落档为诊断与维修方式（来源 AI，无需工程师确认）
+        self._maybe_record_ai_resolution(ticket["id"])
         self._db.close_responsibility_cycles(ticket["id"], command.message_id)
         self._db.clear_contexts_by_ticket(ticket["id"])
         updated = self._db.get_ticket(ticket["id"])
         self._finalize(command, updated, LINK_EXECUTED, message)
         return CommandResult(RESULT_OK, updated["id"], updated["version"], ())
+
+    def _maybe_record_ai_resolution(self, ticket_id: int) -> None:
+        """AI 建议自动落档（决策 6，2026-08-20）。
+
+        前提：该工单有未反馈的 AI 建议。行为：
+        - 建议标记 RESOLVED（结果级验证）；
+        - 工单尚无当前诊断 → 建议原因落 diagnosis_versions（engineer_id='AI'）；
+        - 工单尚无当前维修方式 → 建议处理落 repair_method_versions（engineer_id='AI'）。
+        巧合性自愈风险由 AI 来源标记全程可追溯，不做人工确认（业务确认）。
+        """
+        suggestion = self._db.get_latest_suggestion(ticket_id)
+        if suggestion is None or suggestion["feedback"] is not None:
+            return
+        detail = suggestion.get("detail") or {}
+        causes = [str(c) for c in (detail.get("causes") or []) if str(c).strip()]
+        repairs = [str(r) for r in (detail.get("repairs") or []) if str(r).strip()]
+        source_id = f"ai-sugg-{suggestion['id']}"
+        if causes and not self._db.has_current_diagnosis(ticket_id):
+            self._db.add_diagnosis_version(ticket_id, source_id, causes[:3], "AI")
+        if repairs and not self._db.has_current_repair_method(ticket_id):
+            self._db.add_repair_method_version(
+                ticket_id, source_id, repairs[0], None, "AI")
+        self._db.set_suggestion_feedback(suggestion["id"], "RESOLVED")
+        logger.info(
+            "AI 建议已随完单落档 ticket_id=%s suggestion=%s causes=%d repairs=%d",
+            ticket_id, suggestion["id"], len(causes), len(repairs),
+        )
 
     def _execute_cancel(self, command: ValidatedCommand, message: NormalizedMessage | None) -> CommandResult:
         ticket = self._require_ticket(command)

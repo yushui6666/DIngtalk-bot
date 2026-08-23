@@ -83,11 +83,13 @@ class TicketAdvisor:
             return None
 
         text = self._format_suggestion(ticket, results)
+        causes, repairs = self._extract_causes_repairs(results)
         suggestion_id = self._db.record_suggestion(
             ticket_id=ticket["id"],
             doc_ids=[r.doc_id for r in results],
             top_score=max(r.vector_score for r in results) if results else 0.0,
             content=text,
+            detail={"causes": causes, "repairs": repairs},
         )
         logger.info(
             "建议已生成 ticket=%s docs=%s top_cos=%.3f",
@@ -115,18 +117,30 @@ class TicketAdvisor:
     # ─────────────────────── 文案组装（确定性模板） ───────────────────────
 
     @staticmethod
-    def _format_suggestion(ticket: dict[str, Any], results: list[Any]) -> str:
+    def _extract_causes_repairs(results: list[Any]) -> tuple[list[str], list[str]]:
+        """从检索结果元数据提取（去重的）可能原因与历史处理。"""
         causes: list[str] = []
         repairs: list[str] = []
+        for r in results:
+            meta = getattr(r, "metadata", {}) or {}
+            diag = meta.get("diagnosis")
+            if diag and diag not in causes:
+                causes.append(str(diag))
+            repair = meta.get("repair_method")
+            if repair and repair not in repairs:
+                repairs.append(str(repair))
+        return causes, repairs
+
+    @classmethod
+    def _format_suggestion(cls, ticket: dict[str, Any], results: list[Any]) -> str:
+        causes: list[str] = []
+        repairs: list[str] = cls._extract_causes_repairs(results)[1]
         for r in results:
             meta = getattr(r, "metadata", {}) or {}
             no = meta.get("ticket_no") or r.doc_id.split(":", 1)[-1]
             diag = meta.get("diagnosis")
             if diag:
                 causes.append(f"{diag}（{no}）")
-            repair = meta.get("repair_method")
-            if repair and repair not in repairs:
-                repairs.append(str(repair))
         refs = "、".join(
             (r.metadata or {}).get("ticket_no") or r.doc_id.split(":", 1)[-1]
             for r in results

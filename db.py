@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS tickets (
     stop_reason                    TEXT,
     duplicate_of_ticket_id         INTEGER,
     reopen_count                   INTEGER NOT NULL DEFAULT 0,
+    ai_escalated                   INTEGER NOT NULL DEFAULT 0,
     created_at                     TEXT NOT NULL,
     closed_at                      TEXT
 );
@@ -208,6 +209,7 @@ CREATE TABLE IF NOT EXISTS ticket_suggestions (
     doc_ids      TEXT NOT NULL,
     top_score    REAL NOT NULL,
     content      TEXT NOT NULL,
+    detail       TEXT NOT NULL DEFAULT '{}',
     feedback     TEXT,
     created_at   TEXT NOT NULL,
     escalated_at TEXT
@@ -401,6 +403,8 @@ _TICKET_MIGRATION_COLUMNS = {
     "stop_reason": "stop_reason TEXT",
     "duplicate_of_ticket_id": "duplicate_of_ticket_id INTEGER",
     "reopen_count": "reopen_count INTEGER NOT NULL DEFAULT 0",
+    # v4.3 RAG 闭环：AI 建议未解决 → 工程师接手标记（升级后该工单 AI 静默）
+    "ai_escalated": "ai_escalated INTEGER NOT NULL DEFAULT 0",
 }
 
 
@@ -1287,15 +1291,21 @@ class Database:
     # ─────────────────────── ticket_suggestions（v4.3 RAG 顾问） ───────────────────────
 
     def record_suggestion(
-        self, ticket_id: int, doc_ids: list[str], top_score: float, content: str
+        self, ticket_id: int, doc_ids: list[str], top_score: float, content: str,
+        detail: dict[str, Any] | None = None,
     ) -> int:
-        """记录一条建单建议，返回台账 id。"""
+        """记录一条建单建议，返回台账 id。
+
+        detail 保存结构化建议（causes/repairs），供「解决了」自动落档
+        为诊断/维修方式（决策 6）与隐式比对使用。
+        """
         cur = self._conn.execute(
             """INSERT INTO ticket_suggestions
-                   (ticket_id, doc_ids, top_score, content, created_at)
-               VALUES (?,?,?,?,?)""",
+                   (ticket_id, doc_ids, top_score, content, detail, created_at)
+               VALUES (?,?,?,?,?,?)""",
             (ticket_id, json.dumps(doc_ids, ensure_ascii=False),
-             float(top_score), content, _now_str()),
+             float(top_score), content,
+             json.dumps(detail or {}, ensure_ascii=False), _now_str()),
         )
         return int(cur.lastrowid)
 
@@ -1309,7 +1319,28 @@ class Database:
             return None
         d = dict(row)
         d["doc_ids"] = json.loads(d["doc_ids"] or "[]")
+        d["detail"] = json.loads(d.get("detail") or "{}")
         return d
+
+    def has_current_diagnosis(self, ticket_id: int) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM diagnosis_versions WHERE ticket_id=? AND is_current=1",
+            (ticket_id,),
+        ).fetchone()
+        return row is not None
+
+    def has_current_repair_method(self, ticket_id: int) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM repair_method_versions WHERE ticket_id=? AND is_current=1",
+            (ticket_id,),
+        ).fetchone()
+        return row is not None
+
+    def mark_ticket_ai_escalated(self, ticket_id: int) -> None:
+        """AI 未解决升级：置 ai_escalated=1（幂等）。"""
+        self._conn.execute(
+            "UPDATE tickets SET ai_escalated=1 WHERE id=?", (ticket_id,),
+        )
 
     def set_suggestion_feedback(self, suggestion_id: int, feedback: str) -> None:
         self._conn.execute(
