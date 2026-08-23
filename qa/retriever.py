@@ -111,12 +111,19 @@ class HybridRetriever:
 
     @staticmethod
     def _fts_query(query: str) -> str:
-        """把自然语言转成 FTS5 安全查询：去特殊字符，词组化（trigram 按子串命中）。"""
-        cleaned = "".join(ch for ch in query if ch.isalnum() or ch.isspace())
+        """自然语言 → FTS5 安全查询。
+
+        非字母数字字符替换为空格（避免中英文标点把词粘连切断），
+        词组间用 OR 连接：召回优先（BM25 会把命中更多词的排前），
+        AND 语义在口语化查询下极易空结果。
+        """
+        cleaned = "".join(
+            ch if ch.isalnum() or ch.isspace() else " " for ch in query
+        )
         tokens = [t for t in cleaned.split() if t]
         if not tokens:
             return '""'
-        return " ".join(f'"{t}"' for t in tokens)
+        return " OR ".join(f'"{t}"' for t in tokens)
 
     # ─────────────────────── 向量通道 ───────────────────────
 

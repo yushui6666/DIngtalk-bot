@@ -199,6 +199,22 @@ CREATE TABLE IF NOT EXISTS notification_deliveries (
 
 CREATE INDEX IF NOT EXISTS idx_notify_status ON notification_deliveries(status, scheduled_at);
 
+-- ─────────────────────── ticket_suggestions（v4.3 RAG 闭环顾问） ───────────────────────
+-- 建单后 Agent 相似案例建议台账：feedback 记录显式反馈（RESOLVED/UNRESOLVED），
+-- escalated_at 记录「未解决」升级时间；隐式比对结果记在 metadata 扩展列（二期）。
+CREATE TABLE IF NOT EXISTS ticket_suggestions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_id    INTEGER NOT NULL,
+    doc_ids      TEXT NOT NULL,
+    top_score    REAL NOT NULL,
+    content      TEXT NOT NULL,
+    feedback     TEXT,
+    created_at   TEXT NOT NULL,
+    escalated_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_sugg_ticket ON ticket_suggestions(ticket_id);
+
 -- ─────────────────────── schema_migrations（v4.0 Task 5） ───────────────────────
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version    TEXT PRIMARY KEY,
@@ -1266,6 +1282,48 @@ class Database:
                    (ticket_id, source_message_id, repair_method, order_no, engineer_id, submitted_at, is_current)
                VALUES (?,?,?,?,?,?,1)""",
             (ticket_id, message_id, repair_method, order_no, engineer_id, _now_str()),
+        )
+
+    # ─────────────────────── ticket_suggestions（v4.3 RAG 顾问） ───────────────────────
+
+    def record_suggestion(
+        self, ticket_id: int, doc_ids: list[str], top_score: float, content: str
+    ) -> int:
+        """记录一条建单建议，返回台账 id。"""
+        cur = self._conn.execute(
+            """INSERT INTO ticket_suggestions
+                   (ticket_id, doc_ids, top_score, content, created_at)
+               VALUES (?,?,?,?,?)""",
+            (ticket_id, json.dumps(doc_ids, ensure_ascii=False),
+             float(top_score), content, _now_str()),
+        )
+        return int(cur.lastrowid)
+
+    def get_latest_suggestion(self, ticket_id: int) -> dict[str, Any] | None:
+        """工单最近一条建议（反馈/升级判断用）。"""
+        row = self._conn.execute(
+            "SELECT * FROM ticket_suggestions WHERE ticket_id=?"
+            " ORDER BY id DESC LIMIT 1", (ticket_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        d["doc_ids"] = json.loads(d["doc_ids"] or "[]")
+        return d
+
+    def set_suggestion_feedback(self, suggestion_id: int, feedback: str) -> None:
+        self._conn.execute(
+            "UPDATE ticket_suggestions SET feedback=? WHERE id=?",
+            (feedback, suggestion_id),
+        )
+
+    def mark_suggestion_escalated(self, ticket_id: int) -> None:
+        """「未解决」升级：标记该工单最新建议并记录时间。"""
+        self._conn.execute(
+            "UPDATE ticket_suggestions SET escalated_at=?, feedback='UNRESOLVED'"
+            " WHERE id=(SELECT id FROM ticket_suggestions WHERE ticket_id=?"
+            " ORDER BY id DESC LIMIT 1)",
+            (_now_str(), ticket_id),
         )
 
     def open_timeout_cycle(self, ticket_id: int, reminded_at: str) -> int | None:

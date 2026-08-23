@@ -70,6 +70,7 @@ def build_ticket_case_documents(db: Any) -> list[dict[str, Any]]:
             + "\n"
             f"时效：{t['sla_days']}天 · 完成：{t['closed_at'] or '-'}"
         )
+        diagnosis_text = "；".join(str(x) for x in items)
         documents.append({
             "doc_id": f"ticket:{t['ticket_no']}",
             "source_type": "TICKET_CASE",
@@ -81,6 +82,8 @@ def build_ticket_case_documents(db: Any) -> list[dict[str, Any]]:
                 "subject": t["subject"],
                 "location": t["location"],
                 "status": t["status"],
+                "diagnosis": diagnosis_text,
+                "repair_method": repair["repair_method"],
             },
         })
     logger.info("工单案例构建完成 cases=%d / 终态工单=%d", len(documents), len(rows))

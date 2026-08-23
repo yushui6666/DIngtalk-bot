@@ -73,6 +73,7 @@ class MessageProcessingPipeline:
         notifier: Any,
         classifier: Any | None = None,
         archiver: Any | None = None,
+        advisor: Any | None = None,
         mode: RuntimeMode = RuntimeMode.PRODUCTION,
         llm_enabled: bool = LLM_ENABLED,
         max_attempts: int = LLM_MAX_ATTEMPTS,
@@ -88,6 +89,7 @@ class MessageProcessingPipeline:
         self._notifier = notifier
         self._classifier = classifier
         self._archiver = archiver
+        self._advisor = advisor
         self._mode = mode
         self._llm_enabled = llm_enabled and classifier is not None
         self._max_attempts = max_attempts
@@ -245,13 +247,34 @@ class MessageProcessingPipeline:
         if result.status == RESULT_OK:
             # 维修方式带订单号 → 登记订单监控 + 共享表（v4.1 起不再自动延期，签收后计时）
             self._handle_order_submitted(cmd, result, msg)
+            # 先 flush 建单回执，再发 RAG 建议 —— 保证群里顺序：回执 → 建议
             self._notifier.flush()
+            self._maybe_advise_new_ticket(cmd, result, msg)
         else:
             self._notifier.send_group_now(
                 msg.group_id, f"工单操作未完成（{result.status}），请重试或联系管理员。",
                 message_id=msg.message_id,
             )
         return _INBOX_COMPLETED
+
+    # ─────────────────────── RAG 建单建议（v4.3） ───────────────────────
+    def _maybe_advise_new_ticket(self, cmd: Any, result: Any, msg: NormalizedMessage) -> None:
+        """建单成功后的相似案例建议：检索→模板组装→Outbox 发群→台账。
+
+        失败一律静默降级（advisor 内部兜底），绝不影响建单主链路；
+        建单回执已在 Outbox，建议随后发送，顺序天然保证。
+        """
+        if self._advisor is None or cmd.intent != "ticket.create":
+            return
+        ticket = self._db.get_ticket(result.ticket_id)
+        if ticket is None:
+            return
+        advice = self._advisor.advise_for_new_ticket(ticket)
+        if advice is None:
+            return
+        self._notifier.send_group_now(
+            msg.group_id, advice["text"], message_id=f"advice:{msg.message_id}",
+        )
 
     # ─────────────────────── 订单提交处理 ───────────────────────
     def _handle_order_submitted(self, cmd: Any, result: Any, msg: NormalizedMessage) -> None:
