@@ -156,8 +156,11 @@ class TicketCommandExecutor:
         fields = command.fields
         suppress_notify = False
         if kind == "diagnosis":
+            diagnosis_items = [str(x) for x in fields.get("diagnosis_items", [])]
             self._db.add_diagnosis_version(ticket["id"], command.message_id,
-                                           list(fields.get("diagnosis_items", [])), command.actor_id)
+                                           diagnosis_items, command.actor_id)
+            # v4.3 任务7：工程师诊断 vs AI 建议 隐式比对（零打扰，失败不影响主链路）
+            self._maybe_compare_ai_suggestion(ticket["id"], diagnosis_items)
         elif kind == "repair":
             repair_method = fields.get("repair_method", "")
             if repair_method:
@@ -171,9 +174,10 @@ class TicketCommandExecutor:
             # 同一消息顺带提交了故障判断（如「估计是铰链坏了，单号是…」）→ 一并记录
             diagnosis_items = fields.get("diagnosis_items")
             if diagnosis_items:
+                items = [str(x) for x in diagnosis_items]
                 self._db.add_diagnosis_version(
-                    ticket["id"], command.message_id,
-                    [str(x) for x in diagnosis_items], command.actor_id)
+                    ticket["id"], command.message_id, items, command.actor_id)
+                self._maybe_compare_ai_suggestion(ticket["id"], items)
         elif kind == "timeout":
             # 计划书 §4.8：仅当存在尚未解释的超时周期时接受原因
             if not self._db.add_timeout_cycle_reason(
@@ -210,6 +214,25 @@ class TicketCommandExecutor:
         updated = self._db.get_ticket(ticket["id"])
         self._finalize(command, updated, LINK_EXECUTED, message)
         return CommandResult(RESULT_OK, updated["id"], updated["version"], ())
+
+    def _maybe_compare_ai_suggestion(self, ticket_id: int, diagnosis_items: list[str]) -> None:
+        """工程师诊断与 AI 建议的隐式比对（任务 7）。
+
+        有建议且未反馈过时比对落库；任何异常静默跳过（不影响诊断主链路）。
+        """
+        try:
+            suggestion = self._db.get_latest_suggestion(ticket_id)
+            if suggestion is None or suggestion["feedback"] is not None:
+                return
+            from qa.feedback import compare_suggestion_with_diagnosis
+            result = compare_suggestion_with_diagnosis(suggestion, diagnosis_items)
+            self._db.set_suggestion_implicit_match(ticket_id, result)
+            logger.info(
+                "隐式比对完成 ticket_id=%s hit=%s matched=%s",
+                ticket_id, result["hit"], result["matched_items"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("隐式比对失败（忽略）ticket_id=%s: %s", ticket_id, exc)
 
     def _maybe_record_ai_resolution(self, ticket_id: int) -> None:
         """AI 建议自动落档（决策 6，2026-08-20）。

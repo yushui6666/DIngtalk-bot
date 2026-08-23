@@ -1342,6 +1342,20 @@ class Database:
             "UPDATE tickets SET ai_escalated=1 WHERE id=?", (ticket_id,),
         )
 
+    def set_suggestion_implicit_match(
+        self, ticket_id: int, result: dict[str, Any]
+    ) -> None:
+        """隐式比对结果写入最新建议的 detail.implicit_match（任务 7）。"""
+        suggestion = self.get_latest_suggestion(ticket_id)
+        if suggestion is None:
+            return
+        detail = suggestion.get("detail") or {}
+        detail["implicit_match"] = result
+        self._conn.execute(
+            "UPDATE ticket_suggestions SET detail=? WHERE id=?",
+            (json.dumps(detail, ensure_ascii=False), suggestion["id"]),
+        )
+
     def set_suggestion_feedback(self, suggestion_id: int, feedback: str) -> None:
         self._conn.execute(
             "UPDATE ticket_suggestions SET feedback=? WHERE id=?",
