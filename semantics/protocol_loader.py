@@ -31,9 +31,11 @@ class ProtocolValidationError(ValueError):
 ALLOWED_EXECUTORS = frozenset({
     "create_ticket", "add_ticket_detail", "submit_diagnosis",
     "submit_repair_plan", "submit_timeout_reason", "complete_ticket",
+    "confirm_complete_ticket", "reject_complete_ticket",
     "cancel_ticket", "stop_ticket", "reopen_ticket", "query_ticket", "select_ticket",
     "clarify", "confirm_pending_action", "reject_pending_action",
     "correct_pending_action", "ignore_message",
+    "submit_special_case",
 })
 
 ALLOWED_ROLES = frozenset({"MANAGER", "ENGINEER", "LEADER", "OTHER", "SYSTEM"})

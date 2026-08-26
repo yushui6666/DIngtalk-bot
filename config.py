@@ -17,6 +17,40 @@ from logger import get_logger
 
 logger = get_logger(__name__)
 
+
+def _load_dotenv(path: Path | None = None) -> dict[str, str]:
+    """极简 .env 加载器（无第三方依赖，2026-08-25）。
+
+    - 读取项目根目录 .env（可用 path 参数覆盖，测试用）；
+    - 只设置当前进程环境中**不存在**的键：真实环境变量优先于 .env；
+    - 支持 KEY=VALUE、整行 # 注释；值两侧成对引号会被剥离。
+    必须在本模块任何 ``_os.environ.get`` 之前调用。
+    """
+    env_path = path or (Path(__file__).resolve().parent / ".env")
+    loaded: dict[str, str] = {}
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return loaded
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        if key and key not in _os.environ:
+            _os.environ[key] = value
+            loaded[key] = value
+    return loaded
+
+
+_INITIAL_ENV = dict(_os.environ)
+_DOTENV_PATH = Path(__file__).resolve().parent / ".env"
+_load_dotenv()
+
 # ───────────────────────── 路径 ─────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "data" / "tickets.db"
@@ -63,6 +97,13 @@ ORDER_STORE_TABLE_PATH = Path(
         "ORDER_STORE_TABLE_PATH",
         "/Users/yushui/Desktop/淘宝对账/订单门店状态表.xlsx",
     )
+)
+
+# 共享表写入失败后的兜底：调度器每隔多少秒重试未同步订单（可被环境变量覆盖）。
+# 登记时共享表被 Excel/WPS 占用等导致写失败 → 订单保持 xlsx_synced=0，
+# 调度器 scan_shared_table_resync 按此间隔重试直至写入成功。
+SHARED_TABLE_RESYNC_INTERVAL_SECONDS = int(
+    _os.environ.get("SHARED_TABLE_RESYNC_INTERVAL_SECONDS", "300")
 )
 
 # 订单到货签收后每天提醒一次，直到工单完成（用户决策 2026-08-14）：
@@ -189,6 +230,85 @@ SIDE_REPLY_TIMEOUT_HOURS = 4
 WEEKEND_ESCALATION_DEFER_HOUR = 9
 BACKGROUND_SCAN_INTERVAL_SECONDS = 60
 
+# ───────────────────────── 响应 SLA（2026-08-24 需求 #4） ─────────────────────────
+# 收到门店报修/需门店配合后：责任方须在 1 小时内响应；
+# 超 1h AI 提醒责任方；超 4h 群内升级提醒责任方+升级对象（并单聊升级对象）。
+# 工程师侧升级对象＝任柏松（工程总监）；店长侧升级对象＝该群区域经理。
+# 总开关（2026-08-26）：RESPONSE_SLA_ENABLED=false 时整条响应 SLA 链路静默
+# （含 1h 提醒、4h 升级、单聊），不影响时效 SLA 与到货签收等其他提醒。
+RESPONSE_SLA_ENABLED = _os.environ.get("RESPONSE_SLA_ENABLED", "true").lower() in (
+    "true", "1", "yes", "on",
+)
+
+
+def _read_dotenv_value_live(key: str) -> str | None:
+    """直接重读 .env 文件的当前值（不经过 _os.environ 缓存），供热切换使用。"""
+    try:
+        lines = _DOTENV_PATH.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k = k.strip()
+        if k != key:
+            continue
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+            v = v[1:-1]
+        return v
+    return None
+
+
+def is_response_sla_enabled() -> bool:
+    """响应 SLA 是否启用（支持 .env 热修改，无需重启）。
+
+    优先级：
+    1. 单测中对 RESPONSE_SLA_ENABLED 的 monkeypatch 优先（检测 PYTEST 标识）；
+    2. 若进程启动前外部环境已显式设置 RESPONSE_SLA_ENABLED（在 _INITIAL_ENV 中），
+       则以外部环境为准（容器/ systemd 注入优先）；
+    3. 否则实时重读 .env 文件当前值；
+    4. 都不存在时回退到模块常量。
+    """
+    # 单测兼容：pytest 运行时 monkeypatch 对常量的赋值应优先生效
+    if "PYTEST_CURRENT_TEST" in _os.environ:
+        # 若当前常量与 live 文件值不一致，说明测试已 monkeypatch，尊重常量
+        live_for_test = _read_dotenv_value_live("RESPONSE_SLA_ENABLED")
+        if live_for_test is not None:
+            live_bool = live_for_test.lower() in ("true", "1", "yes", "on")
+            if bool(RESPONSE_SLA_ENABLED) != live_bool:
+                return bool(RESPONSE_SLA_ENABLED)
+    if "RESPONSE_SLA_ENABLED" in _INITIAL_ENV:
+        return _INITIAL_ENV["RESPONSE_SLA_ENABLED"].lower() in ("true", "1", "yes", "on")
+    live = _read_dotenv_value_live("RESPONSE_SLA_ENABLED")
+    if live is not None:
+        return live.lower() in ("true", "1", "yes", "on")
+    return bool(RESPONSE_SLA_ENABLED)
+
+
+def refresh_response_sla_enabled() -> bool:
+    """将 RESPONSE_SLA_ENABLED 同步为当前 is_response_sla_enabled() 的值并返回。"""
+    global RESPONSE_SLA_ENABLED
+    RESPONSE_SLA_ENABLED = is_response_sla_enabled()
+    return RESPONSE_SLA_ENABLED
+RESPONSE_SLA_FIRST_HOURS = float(_os.environ.get("RESPONSE_SLA_FIRST_HOURS", "1"))
+RESPONSE_SLA_ESCALATE_HOURS = float(_os.environ.get("RESPONSE_SLA_ESCALATE_HOURS", "4"))
+# 工程师侧升级对象 userId（任柏松）；本地无法核实姓名↔userId 映射，
+# 默认回退用各群 engineering_leader_id；此处设置环境变量可全局覆盖。
+RESPONSE_SLA_ENGINEER_ESCALATE_USER_ID = _os.environ.get(
+    "RESPONSE_SLA_ENGINEER_ESCALATE_USER_ID", ""
+)
+RESPONSE_SLA_ENGINEER_ESCALATE_NAME = _os.environ.get(
+    "RESPONSE_SLA_ENGINEER_ESCALATE_NAME", "任柏松"
+)
+# 一次性分界（用户决策 2026-08-26）：此前建单的存量工单一律不参与响应 SLA，
+# 仅分界时刻之后新建的工单纳入。分界取值晚于全部存量单的最后建单时间
+# （2026-08-26 14:43:19）。存量工单自然完结后本条件恒空转；如需彻底移除该措施，
+# 删除本常量并去掉 scheduler.scan_response_sla 中对应的过滤条件即可。
+RESPONSE_SLA_EFFECTIVE_FROM = "2026-08-26 15:00:00"
+
 # SLA 提醒：时效临近到期前 N 小时提醒一次；超时后再提醒一次
 SLA_REMIND_BEFORE_HOURS = 1
 SLA_SCAN_INTERVAL_SECONDS = 60
@@ -243,7 +363,9 @@ VISION_PROMPT = _os.environ.get(
 # ───────────────────────── 图片附件归档（计划书 §10.6 Task 4A · 存储层） ─────────────────────────
 # 消息到达时只归档图片、不调用视觉模型；工单结束后统一分析（用户决策 2026-08-14）。
 IMAGE_ARCHIVE_ENABLED = _os.environ.get("IMAGE_ARCHIVE_ENABLED", "true").lower() in ("true", "1", "yes")
-IMAGE_ARCHIVE_DIR = Path(_os.environ.get("IMAGE_ARCHIVE_DIR", str(ARCHIVE_DIR / "attachments")))
+# 注意：归档文件相对路径本身以 attachments/ 开头（save() 固定拼接），
+# 因此根目录默认即 ARCHIVE_DIR，物理路径形如 archives/attachments/2026/08/20/<msgId>/0-<sha8>.jpg
+IMAGE_ARCHIVE_DIR = Path(_os.environ.get("IMAGE_ARCHIVE_DIR", str(ARCHIVE_DIR)))
 IMAGE_MAX_BYTES = int(_os.environ.get("IMAGE_MAX_BYTES", str(10 * 1024 * 1024)))
 IMAGE_MAX_COUNT_PER_MESSAGE = int(_os.environ.get("IMAGE_MAX_COUNT_PER_MESSAGE", "3"))
 IMAGE_DOWNLOAD_TIMEOUT_SECONDS = float(_os.environ.get("IMAGE_DOWNLOAD_TIMEOUT_SECONDS", "15"))

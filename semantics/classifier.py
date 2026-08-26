@@ -15,6 +15,7 @@ SemanticClassifier 负责：
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from semantics.protocol_loader import TicketProtocol
@@ -35,6 +36,7 @@ _KNOWN_FIELDS: frozenset[str] = frozenset({
     "sla", "diagnosis_items", "repair_method", "order_no",
     "timeout_reason", "completion_note", "cancel_reason", "reopen_reason",
     "clarification_reason", "ticket_no", "content", "attachments",
+    "special_case_reason", "expected_resume_at",
 })
 
 _INTENT_FIELD_OVERRIDES: dict[str, frozenset[str]] = {
@@ -47,6 +49,7 @@ _INTENT_FIELD_OVERRIDES: dict[str, frozenset[str]] = {
     "ticket.diagnosis.submit": frozenset({"diagnosis_items"}),
     "ticket.repair_plan.submit": frozenset({"repair_method", "order_no"}),
     "ticket.timeout_reason.submit": frozenset({"timeout_reason"}),
+    "ticket.special_case.submit": frozenset({"special_case_reason", "expected_resume_at"}),
     "ticket.complete": frozenset({"completion_note"}),
     "system.correct_pending_action": _KNOWN_FIELDS - {"ticket_no"},
 }
@@ -57,7 +60,7 @@ _ALLOWED_SLA = frozenset({"1天", "3天", "7天", "待商榷"})
 # 允许的紧急度枚举值（§4.5）
 _ALLOWED_URGENCY = frozenset({"低", "中", "高"})
 
-# 允许的维修方式枚举值（§4.7）
+# 维修方式已改为自由文本（2026-08-26），保留集合仅用于文档，不再强校验
 _ALLOWED_REPAIR_METHODS = frozenset({
     "淘宝采购后自行维修",
     "需要供应商维修",
@@ -69,13 +72,37 @@ _ALLOWED_REPAIR_METHODS = frozenset({
 _BUSINESS_ACTION_CUES: dict[str, tuple[str, ...]] = {
     "ticket.create": ("报修",),
     "ticket.diagnosis.submit": ("故障判断", "判断是", "应该是"),
-    "ticket.repair_plan.submit": tuple(_ALLOWED_REPAIR_METHODS),
+    "ticket.repair_plan.submit": ("维修方式", "维修方案", "维修", "采购", "更换"),
     "ticket.timeout_reason.submit": ("超时原因", "没按时完成"),
+    "ticket.special_case.submit": ("特殊情况",),
     "ticket.complete": ("完成工单", "直接完毕", "确认完毕"),
     "ticket.cancel": ("取消工单",),
     "ticket.stop": ("停止维修", "停修", "不再维修"),
     "ticket.reopen": ("重开工单",),
 }
+
+
+def _protected_identifier_guard(content: str, order_no: Any) -> str | None:
+    """当模型抽取的订单号实际是消息中的手机号/资产号时返回防护原因。"""
+    text = content or ""
+    extracted = str(order_no or "").strip()
+    if not extracted:
+        return None
+
+    normalized_mobile_order = re.sub(r"[\s-]", "", extracted)
+    for match in re.finditer(r"(?<!\d)1[3-9]\d(?:[\s-]?\d){8}(?!\d)", text):
+        normalized_mobile = re.sub(r"[\s-]", "", match.group(0))
+        if normalized_mobile_order == normalized_mobile:
+            return "mobile_number_guard"
+
+    asset_pattern = re.compile(
+        r"(?:资产(?:号|编号)|设备(?:号|编号))\s*[:：为是#]?\s*"
+        r"([A-Za-z0-9][A-Za-z0-9-]{5,63})",
+        re.IGNORECASE,
+    )
+    if any(extracted.casefold() == match.group(1).casefold() for match in asset_pattern.finditer(text)):
+        return "asset_number_guard"
+    return None
 
 
 class SemanticClassifier:
@@ -123,16 +150,9 @@ class SemanticClassifier:
         """
         candidates = candidates or []
 
-        # 1. 关键词已命中 → 跳过模型（§2.3 快路径优先）
-        if match_keyword(message.content, self._protocol) is not None:
-            return SemanticDecision(
-                protocol_version=self._protocol.protocol_version,
-                source="SEMANTIC_MODEL",
-                intent="chat.ignore",
-                target_ticket_no=None,
-                intent_confidence=0.0,
-                evidence=("keyword_already_matched",),
-            )
+        # 1. 关键词快路径已停用（2026-08-20 全面由 AI 判断）：不再跳过模型
+        # if match_keyword(message.content, self._protocol) is not None:
+        #     return SemanticDecision(... keyword_already_matched ...)
 
         action_cues = _find_business_action_cues(message.content)
         if len(action_cues) > 1:
@@ -194,6 +214,29 @@ class SemanticClassifier:
             )
             return _fallback_decision(self._protocol, message.message_id, "unknown_intent")
 
+        raw_fields_for_guard = raw.get("fields")
+        order_no_for_guard = (
+            raw_fields_for_guard.get("order_no")
+            if isinstance(raw_fields_for_guard, dict)
+            else None
+        )
+        protected_guard = (
+            _protected_identifier_guard(message.content, order_no_for_guard)
+            if intent == "ticket.repair_plan.submit"
+            else None
+        )
+        if protected_guard:
+            logger.info("过滤敏感编号订单误判 message_id=%s guard=%s", message.message_id, protected_guard)
+            return SemanticDecision(
+                protocol_version=self._protocol.protocol_version,
+                source="SEMANTIC_MODEL",
+                intent="chat.ignore",
+                target_ticket_no=None,
+                intent_confidence=1.0,
+                fields={},
+                evidence=(protected_guard,),
+            )
+
         # 4.5 业务动作词兜底：消息明确是单个业务动作（如「报修」「报修一下」），
         #     但模型误判为 chat.ignore → 返回该业务动作，缺失字段交给 validator 引导补全。
         if intent == "chat.ignore" and len(action_cues) == 1:
@@ -233,6 +276,9 @@ class SemanticClassifier:
         safe_fields: dict[str, Any] = {}
         for key, value in raw_fields.items():
             if key == "ticket_no" or key in allowed_fields:
+                # 兼容模型把 diagnosis_items 误返回为字符串而非数组：归一为 [string]
+                if key == "diagnosis_items" and isinstance(value, str):
+                    value = [value] if value.strip() else []
                 safe_fields[key] = value
             else:
                 logger.debug(
@@ -240,6 +286,13 @@ class SemanticClassifier:
                     key,
                     message.message_id,
                 )
+
+        # 5.1 清洗 order_no 的空/None 占位（模型可能返回 null → Python None → 误触发“None”订单）
+        if "order_no" in safe_fields:
+            _raw_on = safe_fields["order_no"]
+            if _raw_on is None or not str(_raw_on).strip() or str(_raw_on).strip().lower() in ("none", "null", "nil"):
+                logger.debug("order_no 空/占位值=%s，已剔除 message_id=%s", _raw_on, message.message_id)
+                del safe_fields["order_no"]
 
         # 6. 枚举值校验（§4.5, §4.7）
         missing: list[str] = []
@@ -254,10 +307,16 @@ class SemanticClassifier:
             missing.append("urgency")
             del safe_fields["urgency"]
 
-        if "repair_method" in safe_fields and safe_fields["repair_method"] not in _ALLOWED_REPAIR_METHODS:
-            logger.debug("repair_method 非法值=%s，移入 missing", safe_fields["repair_method"])
-            missing.append("repair_method")
-            del safe_fields["repair_method"]
+        # 维修方式自由文本：仅清洗空值/过长，不做枚举校验（2026-08-26）
+        if "repair_method" in safe_fields:
+            _rm_val = safe_fields["repair_method"]
+            if _rm_val is None or not str(_rm_val).strip():
+                logger.debug("repair_method 空值，已剔除 message_id=%s", message.message_id)
+                del safe_fields["repair_method"]
+                missing.append("repair_method")
+            elif len(str(_rm_val).strip()) > 500:
+                logger.debug("repair_method 过长，已截断 message_id=%s", message.message_id)
+                safe_fields["repair_method"] = str(_rm_val).strip()[:500]
 
         # 置信度
         confidence = 0.0
@@ -273,13 +332,22 @@ class SemanticClassifier:
             ticket_no = str(ticket_no).strip() or None
         candidate_nos = {candidate.ticket_no for candidate in candidates}
         if ticket_no and ticket_no not in candidate_nos:
-            logger.debug(
-                "过滤候选集合外目标 ticket_no=%s message_id=%s",
-                ticket_no,
-                message.message_id,
-            )
-            ticket_no = None
-            missing.append("ticket_no")
+            # 重开/查询可指向已完结工单（不在活动候选内），保留编号交由校验层用全量候选判定
+            if intent in ("ticket.reopen", "ticket.query"):
+                logger.debug(
+                    "保留候选集合外目标 ticket_no=%s intent=%s message_id=%s（交由校验层判定）",
+                    ticket_no,
+                    intent,
+                    message.message_id,
+                )
+            else:
+                logger.debug(
+                    "过滤候选集合外目标 ticket_no=%s message_id=%s",
+                    ticket_no,
+                    message.message_id,
+                )
+                ticket_no = None
+                missing.append("ticket_no")
 
         # 候选评分（模型可选返回）
         candidate_scores: tuple[TicketScore, ...] = ()
@@ -425,19 +493,22 @@ def _build_payload(
         + "\n".join(action_summaries)
         + "\n\n规则：\n"
         "- 只抽取用户明确表达的信息\n"
-        "- 不要猜测位置、设备名称等\n"
-        "- 字段键名使用英文字段名\n"
+        "- 不要猜测位置、设备名称、时效等；时效(sla)只有用户明确说 1天/3天/7天/待商榷 时才填，否则留空让校验层提示补充\n"
+        "- 字段键名使用英文字段名；用户可能写“1主题:xxx、2位置:xxx、3问题描述:xxx;可选:时效(7天)”或“#报修”前缀，编号/顿号/括号均为分隔装饰，请自动剥离后识别主题/位置/问题描述/时效，“#”为可选前缀，不影响意图\n"
         "- 报修时字段拆分：subject=场馆/空间名（如「博物馆奇妙夜」），"
         "location=更具体的发生位置（如「里面的那间房子」「一楼大厅」），"
         "device=具体损坏的物品（如「风扇」「消防门」），problem_description=故障描述。"
         "不要把整串修饰语都塞进 location，也不要把损坏物品当 subject\n"
+        "- 若消息仅含淘宝订单号（6-64位字母数字连字符且至少含6个数字，如 TB-2024-0001 或 5125938806116169335）或含订单号+故障判断（如“估计是铰链坏了，单号是...”），且群内有活动工单，则视为 ticket.repair_plan.submit，提取 order_no/order_nos 并酌情提取 diagnosis_items；纯手机号（11位且以1开头）不要误判为订单号\n"
         "- 如果消息没有明确报修/诊断/完成等意图，返回 chat.ignore\n"
         "- 同一消息包含两个或更多业务动作时，即使后一个动作是未来或条件动作，也返回 system.clarify\n"
         "- 用户从候选工单中明确选择编号或序号时，返回 ticket.select\n"
         "- 用户说「第N个/第一个/第二个」指候选工单列表的第 N 项：据此确定目标工单，把该项的完整工单编号填入 ticket_no 字段，并返回用户实际意图（如「第一个完成了」→ ticket.complete 且 ticket_no=第1项编号）\n"
+        "- 报修时若用户是在补充上一条未完成报修的缺失字段（如上一条因缺少时效/主题等被提示补充，且历史中最近一条系统消息明确要求补充），可结合历史中最近的未完成报修内容补齐缺失字段，但不得编造历史中不存在的字段；其他情况下当前报修的主题/位置/问题描述/时效必须来自当前消息原文，缺失字段留空让校验提示补充；历史还可用于理解「第N个」「它」等指代\n"
         "- 工程师使用‘可能’‘应该是’等保留表达给出具体故障判断时，仍可返回 ticket.diagnosis.submit，但应降低置信度\n"
         "- 疑问句但明确描述故障（含设备/位置/问题）时，仍返回 ticket.create；纯笼统询问、否定句返回 chat.ignore\n"
         "- 用户表示问题已解决、恢复正常、可以使用（如「正常了」「搞定了」「弄好了」「没问题了」「修好了」）→ 返回 ticket.complete\n"
+        "- 用户回复「特殊情况：原因；预计恢复：时间」（通常是对系统一小时提醒的答复，声明等待到货/等待工程师上门/等待门店或客户配合/等待第三方等外部依赖暂时无法推进）→ 返回 ticket.special_case.submit：special_case_reason=原因原文，expected_resume_at=恢复时间原文（保留「一小时内」「明天下午」等用户原话，不要换算）\n"
         "- 取消工单(ticket.cancel)、重开工单(ticket.reopen) 只在用户非常确定时才返回\n"
     )
 
@@ -501,10 +572,7 @@ def _build_output_schema(protocol: TicketProtocol) -> dict[str, Any]:
                         "type": "array",
                         "items": {"type": "string"},
                     },
-                    "repair_method": {
-                        "type": "string",
-                        "enum": sorted(_ALLOWED_REPAIR_METHODS),
-                    },
+                    "repair_method": {"type": "string"},
                     "order_no": {"type": "string"},
                     "timeout_reason": {"type": "string"},
                     "completion_note": {"type": "string"},
@@ -513,6 +581,8 @@ def _build_output_schema(protocol: TicketProtocol) -> dict[str, Any]:
                     "clarification_reason": {"type": "string"},
                     "ticket_no": {"type": "string"},
                     "content": {"type": "string"},
+                    "special_case_reason": {"type": "string"},
+                    "expected_resume_at": {"type": "string"},
                 },
             },
             "evidence": {

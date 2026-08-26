@@ -56,27 +56,34 @@ class Notifier:
 
         同时把回执文本作为 SYSTEM 消息写入收件箱，作为群聊上文供模型理解。
         """
+        if not self._enabled:
+            logger.info("影子模式：跳过即时回复 group=%s msg=%s text=%r",
+                        group_id, message_id, text[:60])
+            return
         notification_id = self._db.insert_notification(
             dedupe_key=f"reply:{message_id}",
             ticket_id=None,
             notification_type="group_text",
             target_type="group",
             target_id=group_id,
+            payload_text=text,
         )
         self._db.record_system_reply(group_id, f"sys:{message_id}", text)
-        if not self._enabled:
-            logger.info("影子模式：跳过即时回复 group=%s msg=%s text=%r",
-                        group_id, message_id, text[:60])
+        if not notification_id:
+            logger.info("即时回复去重跳过 group=%s msg=%s", group_id, message_id)
             return
         try:
             self._sender(group_id, text)
-            if notification_id:
-                self._db.mark_notification(notification_id, "SENT")
+            self._db.mark_notification(notification_id, "SENT")
         except Exception as exc:
             logger.warning("即时回复发送失败 group=%s err=%s", group_id, exc)
 
     def send_deduped_group(self, group_id: str, text: str, *, dedupe_key: str) -> bool:
-        """按 dedupe_key 去重的群消息（同一 key 只发一次，用于定时提醒）。"""
+        """按 dedupe_key 去重的群消息（同一 key 只发一次，用于定时提醒）。
+
+        失败时 Outbox 标记 FAILED（无原始 payload，重试只会发出占位文案）；
+        定时任务下一周期会随新的 dedupe key 自然重试。
+        """
         if not self._enabled:
             if dedupe_key not in self._shadow_seen:
                 self._shadow_seen.add(dedupe_key)
@@ -97,10 +104,42 @@ class Notifier:
             self._db.mark_notification(notification_id, "SENT")
             return True
         except Exception as exc:
+            self._db.mark_notification(notification_id, "FAILED", error=str(exc))
             logger.warning("去重群消息发送失败 group=%s err=%s", group_id, exc)
             return False
 
+    def send_deduped_user(self, user_id: str, text: str, *, dedupe_key: str) -> bool:
+        """按 dedupe_key 去重的单聊消息（响应 SLA 升级提醒用，target 加 user: 前缀）。
+
+        失败时 Outbox 标记 FAILED（无原始 payload，重试只会发出占位文案）；
+        升级提醒随 SLA 周期推进产生新 dedupe key，自然重试。
+        """
+        if not self._enabled:
+            self._shadow_seen.add(dedupe_key)
+            logger.info("影子模式：跳过单聊提醒 user=%s key=%s", user_id, dedupe_key)
+            return False
+        notification_id = self._db.insert_notification(
+            dedupe_key=dedupe_key,
+            ticket_id=None,
+            notification_type="escalate_dm",
+            target_type="user",
+            target_id=f"user:{user_id}",
+            payload_text=text,
+        )
+        if not notification_id:
+            return False
+        try:
+            self._sender(f"user:{user_id}", text)
+            self._db.mark_notification(notification_id, "SENT")
+            return True
+        except Exception as exc:
+            self._db.mark_notification(notification_id, "FAILED", error=str(exc))
+            logger.warning("单聊提醒发送失败 user=%s err=%s", user_id, exc)
+            return False
+
     def _build_text(self, item: dict[str, Any]) -> str:
+        if item.get("payload_text"):
+            return item["payload_text"]
         ticket = None
         if item["ticket_id"] is not None:
             ticket = self._db.get_ticket(item["ticket_id"])

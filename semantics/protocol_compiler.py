@@ -82,7 +82,7 @@ _EXTRA_ACTIONS: list[dict[str, Any]] = [
         "explicit_keywords": ["#取消工单"],
         "semantic_enabled": True,
         "allowed_roles": ["MANAGER"],
-        "allowed_ticket_states": ["ACTIVE", "ACTIVE_OVERDUE"],
+        "allowed_ticket_states": ["ACTIVE", "ACTIVE_OVERDUE", "PENDING_CONFIRM"],
         "required_fields": ["ticket_no", "cancel_reason"],
         "optional_fields": [],
         "target_ticket_policy": "MUST_EXIST",
@@ -112,7 +112,7 @@ _EXTRA_ACTIONS: list[dict[str, Any]] = [
         "explicit_keywords": ["#停止维修"],
         "semantic_enabled": True,
         "allowed_roles": ["LEADER"],
-        "allowed_ticket_states": ["ACTIVE", "ACTIVE_OVERDUE"],
+        "allowed_ticket_states": ["ACTIVE", "ACTIVE_OVERDUE", "PENDING_CONFIRM"],
         "required_fields": ["ticket_no", "stop_reason"],
         "optional_fields": [],
         "target_ticket_policy": "MUST_EXIST",
@@ -140,7 +140,7 @@ _EXTRA_ACTIONS: list[dict[str, Any]] = [
         "display_name": "重开工单",
         "explicit_keywords": ["#重开工单"],
         "semantic_enabled": True,
-        "allowed_roles": ["MANAGER", "ENGINEER", "OTHER", "LEADER"],
+        "allowed_roles": ["ENGINEER", "MANAGER", "LEADER"],
         "allowed_ticket_states": ["COMPLETED", "CANCELLED", "STOPPED"],
         "required_fields": ["ticket_no", "reopen_reason"],
         "optional_fields": [],
@@ -318,6 +318,127 @@ _EXTRA_ACTIONS: list[dict[str, Any]] = [
         "executor": "ignore_message",
         "field_definitions": {},
     },
+    # ── 2026-08-26 特殊情况暂停（响应 SLA 一小时提醒引导的答复）──
+    {
+        "intent_id": "ticket.special_case.submit",
+        "display_name": "登记特殊情况",
+        "explicit_keywords": ["#特殊情况"],
+        "semantic_enabled": True,
+        "allowed_roles": ["MANAGER", "ENGINEER"],
+        "allowed_ticket_states": ["ACTIVE", "ACTIVE_OVERDUE", "PENDING_CONFIRM"],
+        "required_fields": ["special_case_reason"],
+        "optional_fields": ["ticket_no", "expected_resume_at"],
+        "target_ticket_policy": "MUST_EXIST",
+        "risk_level": "LOW",
+        "confirmation_policy": {
+            "EXPLICIT_KEYWORD": "NOT_REQUIRED",
+            "SEMANTIC_MODEL": "NOT_REQUIRED",
+        },
+        "positive_examples": [
+            "特殊情况：等待门店接客两场连场 预计恢复：一小时内",
+            "特殊情况：等待到货；预计恢复：明天下午",
+            "特殊情况：等待工程师上门，预计恢复：2026-08-28 10:00",
+            "有特殊情况，门店现在接客走不开，预计一小时内恢复处理",
+            "特殊情况 等待客户配合 预计恢复 半小时",
+        ],
+        "negative_examples": [
+            "特殊情况怎么填",
+            "没有什么特殊情况",
+            "是不是有特殊情况",
+            "特殊情况下你们一般怎么处理",
+            "这单挺特殊的",
+        ],
+        "confirmation_template": "",
+        "executor": "submit_special_case",
+        "field_definitions": {},
+    },
+    # ── 2026-08-24 店长确认完工流（需求 #3）──
+    {
+        "intent_id": "ticket.confirm_complete",
+        "display_name": "店长确认完成",
+        "explicit_keywords": ["确认修好", "#确认修好", "#确认完成"],
+        "semantic_enabled": True,
+        "allowed_roles": ["MANAGER"],
+        "allowed_ticket_states": ["PENDING_CONFIRM"],
+        "required_fields": [],
+        "optional_fields": ["ticket_no"],
+        "target_ticket_policy": "MUST_EXIST",
+        "risk_level": "NORMAL",
+        "confirmation_policy": {
+            "EXPLICIT_KEYWORD": "NOT_REQUIRED",
+            "SEMANTIC_MODEL": "NOT_REQUIRED",
+        },
+        "positive_examples": [
+            "确认修好",
+            "确认修好 工单编号：钉钉消息测试-收银机-1天-001",
+            "#确认修好 已恢复正常",
+            "#确认完成",
+            "可以，收银机能正常用了，完成吧",
+            "没问题了，确认完成",
+            "修好了确认一下，可以关单了",
+            "好的确认修好了",
+            "测试通过，确认修好 工单编号：钉钉消息测试-门锁-3天-002",
+            "店长确认：已修复，完成这张工单",
+        ],
+        "negative_examples": [
+            "还没修好",
+            "应该快修好了吧",
+            "帮我确认一下维修方式",
+            "等会儿再确认",
+            "你确认过故障原因吗",
+            "还没试，等下确认",
+            "需要供应商上门后再确认",
+            "先别关单，我还没验收",
+            "确认收到货了",
+            "确认一下上门时间",
+        ],
+        "confirmation_template": "",
+        "executor": "confirm_complete_ticket",
+        "field_definitions": {},
+    },
+    {
+        "intent_id": "ticket.reject_complete",
+        "display_name": "店长反馈未修好",
+        "explicit_keywords": ["没修好", "#没修好", "还未修好"],
+        "semantic_enabled": True,
+        "allowed_roles": ["MANAGER"],
+        "allowed_ticket_states": ["PENDING_CONFIRM"],
+        "required_fields": [],
+        "optional_fields": ["ticket_no", "reject_reason"],
+        "target_ticket_policy": "MUST_EXIST",
+        "risk_level": "NORMAL",
+        "confirmation_policy": {
+            "EXPLICIT_KEYWORD": "NOT_REQUIRED",
+            "SEMANTIC_MODEL": "BY_CONFIDENCE",
+        },
+        "positive_examples": [
+            "没修好",
+            "没修好，还是不制冷",
+            "#没修好 问题还在",
+            "还未修好，门还是打不开",
+            "不行，还是老样子，没修好",
+            "试了一下还是不行，没修好",
+            "没修好 工单编号：钉钉消息测试-收银机-1天-001 还会死机",
+            "店长反馈：尚未修复，继续处理",
+            "还是闪屏，没修好",
+            "问题没有解决，还未修好",
+        ],
+        "negative_examples": [
+            "确认修好",
+            "上次说没修好，现在好了",
+            "维修方式没确定",
+            "还没开始修",
+            "修好了",
+            "应该快修好了",
+            "没修好的话再叫一次工程师",
+            "之前没修好，这次换了配件",
+            "不确定是不是修好了，再观察下",
+            "没时间验收，明天再说",
+        ],
+        "confirmation_template": "",
+        "executor": "reject_complete_ticket",
+        "field_definitions": {},
+    },
 ]
 
 # 字段词典
@@ -329,17 +450,14 @@ _FIELD_DICTIONARY: dict[str, dict[str, Any]] = {
     "device": {"type": "text", "aliases": ["设备", "设备名称"]},
     "urgency": {"type": "enum", "allowed": ["低", "中", "高"]},
     "attachments": {"type": "object[]", "aliases": ["附件"]},
-    "sla": {"type": "enum", "allowed": ["1天", "3天", "7天"], "aliases": ["时效", "维修时效"]},
+    "sla": {
+        "type": "enum",
+        "allowed": ["1天", "3天", "7天", "待商榷"],
+        "aliases": ["时效", "维修时效"],
+    },
     "diagnosis_items": {"type": "string[]", "aliases": ["故障判断"]},
     "repair_method": {
-        "type": "enum",
-        "allowed": [
-            "淘宝采购后自行维修",
-            "需要供应商维修",
-            "需要木工维修",
-            "需要工程师上门",
-            "远程视频维修",
-        ],
+        "type": "text",
         "aliases": ["维修方式"],
     },
     "order_no": {"type": "string", "aliases": ["订单号", "淘宝订单号"], "pattern": "^[A-Za-z0-9-]{6,64}$"},
@@ -350,6 +468,8 @@ _FIELD_DICTIONARY: dict[str, dict[str, Any]] = {
     "stop_reason": {"type": "text", "aliases": ["停修原因", "停止维修原因"]},
     "clarification_reason": {"type": "text", "aliases": ["澄清原因"]},
     "content": {"type": "text", "aliases": ["内容", "补充说明"]},
+    "special_case_reason": {"type": "text", "aliases": ["特殊情况", "特殊情况原因"]},
+    "expected_resume_at": {"type": "text", "aliases": ["预计恢复", "预计恢复时间"]},
 }
 
 
@@ -594,7 +714,7 @@ def compile_business_protocol(source: Path, destination: Path) -> str:
 
     # 先写入临时文件做校验（避免写入无效协议）
     destination.parent.mkdir(parents=True, exist_ok=True)
-    canonical = json.dumps(protocol, ensure_ascii=False, indent=2, sort_keys=False)
+    canonical = json.dumps(protocol, ensure_ascii=False, indent=1, sort_keys=False)
     destination.write_text(canonical, encoding="utf-8")
 
     # 通过 loader 做最终校验
@@ -637,7 +757,8 @@ def _ticket_states_for(intent_id: str) -> list[str]:
     if intent_id in ("ticket.create",):
         return []
     elif intent_id in ("ticket.cancel", "ticket.stop"):
-        return ["ACTIVE", "ACTIVE_OVERDUE"]
+        # 2026-08-24：待店长确认工单仍可取消/停修
+        return ["ACTIVE", "ACTIVE_OVERDUE", "PENDING_CONFIRM"]
     elif intent_id in ("ticket.reopen",):
         return ["COMPLETED", "CANCELLED", "STOPPED"]
     elif intent_id in ("ticket.add_detail",):

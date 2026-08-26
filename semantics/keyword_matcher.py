@@ -32,12 +32,24 @@ _FIELD_ALIAS_MAP: dict[str, str] = {
     "停止维修原因": "stop_reason",
     "原因": "reason",  # 通用 "原因"，需按 intent 再分发
     "完成说明": "completion_note",
+    "特殊情况": "special_case_reason",
+    "特殊情况原因": "special_case_reason",
+    "预计恢复": "expected_resume_at",
+    "预计恢复时间": "expected_resume_at",
 }
 
 
 def _normalize_field_key(key: str) -> str:
-    """中文字段名 → 英文键；未识别则原样返回。"""
-    return _FIELD_ALIAS_MAP.get(key.strip(), key.strip())
+    """中文字段名 → 英文键；未识别则原样返回。
+
+    兼容用户手写前缀：`1主题`/`2.位置`/`一、主题` 等编号/符号前缀自动剥离。
+    """
+    cleaned = key.strip()
+    # 剥离开头的数字/中文数字/序号符号（1/1./1、/一、/（1） 等）
+    cleaned = re.sub(r'^[0-9０-９一二三四五六七八九十\.、，,;；\s\-#\(\)（）]+', '', cleaned)
+    # 去掉末尾的序号残留
+    cleaned = cleaned.strip()
+    return _FIELD_ALIAS_MAP.get(cleaned, cleaned)
 
 
 def _parse_fields(text: str) -> dict[str, Any]:
@@ -46,10 +58,22 @@ def _parse_fields(text: str) -> dict[str, Any]:
     支持：键：值（全角冒号）、键:值（半角冒号）。
     单行消息按 '键[：:]值' 模式逐段提取；多行按行处理。
     重复字段值不一致时标记 _duplicate_conflict。
+
+    兼容性（2026-08-20）：
+    - 用户常写 `1主题:xxx、2位置:xxx`、分号/顿号混用、`时效(7天)`/`可选:时效(7天)`；
+      此处做归一化：顿号/逗号/分号→空格，括号时效→冒号，前缀数字剥离，并截掉关键词后到首个已知字段前的赘语（如“建立工单(店长)”）。
     """
+    # ── 括号写法归一：时效(7天)/时效（7天）/可选:时效(7天) → 时效:7天 ──
+    text = re.sub(r'可选\s*[:：]\s*', ' ', text)
+    text = re.sub(r'时效\s*[\(（]\s*(1天|3天|7天|待商榷)\s*[\)）]', r'时效:\1', text)
+    text = re.sub(r'\b可选\b', ' ', text)
+    # 截掉首个已知字段前的赘语（如“建立工单(店长)”），避免污染第一个键
+    first_field = re.search(r'(主题|位置|问题描述|时效|故障判断|维修方式|订单号|工单编号|未完成原因|取消原因|重开原因|停修原因|停止维修原因|原因|完成说明|内容|特殊情况|特殊情况原因|预计恢复|预计恢复时间)', text)
+    if first_field:
+        text = text[first_field.start():]
+
     fields: dict[str, Any] = {}
 
-    # 统一策略：按换行分割，然后每行内再按 "键:值" 拆分
     if "\n" in text:
         lines = text.split("\n")
     else:
@@ -59,11 +83,7 @@ def _parse_fields(text: str) -> dict[str, Any]:
         line = line.strip()
         if not line:
             continue
-        # 单行可能含多个 "键：值" 对，逐次提取
         _parse_line_fields(line, fields)
-
-    # 处理通用 "原因" 字段：不在此处映射，validator 根据 intent 再做分发
-    # （保留原因值，validator 会将其分发到 cancel_reason/reopen_reason 等）
 
     return fields
 
@@ -83,12 +103,16 @@ def _parse_line_fields(line: str, fields: dict[str, Any]) -> None:
         # 找到下一个 "任意文本：" 
         next_m = _COLON_PATTERN.search(line, after_start)
         if next_m:
-            # 往前回溯到空格/制表符，找到键名起始
+            # 往前回溯到分隔符（空格/顿号/逗号/分号等），找到下一键名起始
             val_end = next_m.start()
-            # 从 val_end 往回找空格
-            while val_end > after_start and line[val_end - 1] not in (' ', '\t'):
+            while val_end > after_start and line[val_end - 1] not in (' ', '\t', '、', '，', ',', '；', ';', '。'):
                 val_end -= 1
+            # 若回溯到紧邻冒号（说明无空格分隔，如 “勇者斯巴达、2位置:”），
+            # 则需进一步剥离末尾的序号/分隔残留（如“、2”）
             value_raw = line[after_start:val_end].strip()
+            # 去掉末尾残留的分隔符（顿号/逗号等）— 由下一键的编号导致
+            # 注意：不剥离数字，避免把 W001/二楼302/纯数字订单号 等合法末尾数字误删
+            value_raw = re.sub(r'[、，,；;\s]+$', '', value_raw).strip()
             pos = val_end
         else:
             value_raw = line[after_start:].strip()
@@ -145,14 +169,14 @@ def match_keyword(content: str, protocol: TicketProtocol) -> SemanticDecision | 
     if not stripped:
         return None
 
-    # 查找所有命中的关键词（仅匹配开头）
+    # 查找所有命中的关键词（仅匹配开头，需词边界）
     hits: list[tuple[str, Any]] = []  # (keyword_text, action)
     for action in protocol.actions:
         for kw in action.explicit_keywords:
             if stripped.startswith(kw):
                 after = stripped[len(kw):]
-                # 词边界检查：关键词后必须是空白、换行或结束
-                if not after or after[0] in (' ', '\t', '\n', '\r'):
+                # 词边界：关键词后需为空白/换行/冒号或结束，避免 "#完毕了吗" 误命中 "#完毕"
+                if not after or after[0] in (' ', '\t', '\n', '\r', ':', '：'):
                     hits.append((kw, action))
                     break  # 每个 action 只记一次（第一个匹配的关键词）
 

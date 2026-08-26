@@ -232,7 +232,7 @@ async def test_classifier_accepts_valid_create():
 
 @pytest.mark.asyncio
 async def test_classifier_skips_when_keyword_matched():
-    """消息含显式关键词 → 模型直接跳过（keyword 快路径优先）。"""
+    """全AI架构（2026-08-20）：显式关键词不再走快路径，全部由 AI 判断 → 模型正常调用。"""
     from semantics.classifier import SemanticClassifier
 
     protocol = _load_protocol()
@@ -240,9 +240,116 @@ async def test_classifier_skips_when_keyword_matched():
     classifier = SemanticClassifier(client=fake, protocol=protocol)
     msg = _make_message(content="#报修 主题：门 位置：大厅 问题描述：坏了 时效：3天")
     result = await classifier.classify(msg, candidates=[])
-    assert result.intent == "chat.ignore"
+    assert result.intent == "ticket.create"
     assert result.source == "SEMANTIC_MODEL"
-    assert fake.call_count == 0  # 关键词命中 → 模型零调用
+    assert fake.call_count == 1  # 全AI架构下关键词也走模型
+
+
+@pytest.mark.asyncio
+async def test_classifier_rejects_bare_mobile_number_as_order_submission():
+    """即使模型误判，纯手机号也不得进入订单提交流程。"""
+    from semantics.classifier import SemanticClassifier
+    from semantics.types import TicketCandidate
+
+    protocol = _load_protocol()
+    fake = FakeModelClient(response={
+        "intent": "ticket.repair_plan.submit",
+        "confidence": 0.96,
+        "fields": {"order_no": "13800138000"},
+    })
+    classifier = SemanticClassifier(client=fake, protocol=protocol)
+    result = await classifier.classify(
+        _make_message(content="13800138000"),
+        candidates=[TicketCandidate(
+            ticket_id=1,
+            ticket_no="测试店-门锁-3天-001",
+            group_id="g-test",
+            subject="门锁",
+            location="前台",
+            problem_summary="打不开",
+            status="ACTIVE",
+            version=1,
+        )],
+    )
+
+    assert result.intent == "chat.ignore"
+    assert result.fields == {}
+    assert "mobile_number_guard" in result.evidence
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content", "order_no", "guard"),
+    [
+        ("联系电话：13800138000，到了给我打电话", "13800138000", "mobile_number_guard"),
+        ("手机号是 139-1234-5678", "13912345678", "mobile_number_guard"),
+        ("这台设备的资产号：123456789012345", "123456789012345", "asset_number_guard"),
+        ("资产编号 ZC-2026-0001，在前台", "ZC-2026-0001", "asset_number_guard"),
+        ("设备编号：DEV-2026-8899", "DEV-2026-8899", "asset_number_guard"),
+    ],
+)
+async def test_classifier_rejects_protected_identifier_as_order_submission(
+    content: str, order_no: str, guard: str,
+):
+    """模型把消息中的手机号或资产号当成订单号时，本地防护必须拦截。"""
+    from semantics.classifier import SemanticClassifier
+    from semantics.types import TicketCandidate
+
+    protocol = _load_protocol()
+    fake = FakeModelClient(response={
+        "intent": "ticket.repair_plan.submit",
+        "confidence": 0.96,
+        "fields": {"order_no": order_no},
+    })
+    classifier = SemanticClassifier(client=fake, protocol=protocol)
+    result = await classifier.classify(
+        _make_message(content=content),
+        candidates=[TicketCandidate(
+            ticket_id=1,
+            ticket_no="测试店-门锁-3天-001",
+            group_id="g-test",
+            subject="门锁",
+            location="前台",
+            problem_summary="打不开",
+            status="ACTIVE",
+            version=1,
+        )],
+    )
+
+    assert result.intent == "chat.ignore"
+    assert result.fields == {}
+    assert guard in result.evidence
+
+
+@pytest.mark.asyncio
+async def test_classifier_keeps_real_order_when_message_also_contains_mobile_number():
+    """防护应比对模型抽取值，不应因消息同时含手机号而丢弃真实订单号。"""
+    from semantics.classifier import SemanticClassifier
+    from semantics.types import TicketCandidate
+
+    protocol = _load_protocol()
+    fake = FakeModelClient(response={
+        "intent": "ticket.repair_plan.submit",
+        "confidence": 0.96,
+        "fields": {"order_no": "5127629004214178517"},
+    })
+    classifier = SemanticClassifier(client=fake, protocol=protocol)
+    result = await classifier.classify(
+        _make_message(content="订单号：5127629004214178517，联系电话：13800138000"),
+        candidates=[TicketCandidate(
+            ticket_id=1,
+            ticket_no="测试店-门锁-3天-001",
+            group_id="g-test",
+            subject="门锁",
+            location="前台",
+            problem_summary="打不开",
+            status="ACTIVE",
+            version=1,
+        )],
+    )
+
+    assert result.intent == "ticket.repair_plan.submit"
+    assert result.fields["order_no"] == "5127629004214178517"
 
 
 @pytest.mark.asyncio
@@ -329,7 +436,7 @@ async def test_classifier_strips_unsafe_sla():
 
 @pytest.mark.asyncio
 async def test_classifier_strips_unsafe_repair_method():
-    """模型返回非法维修方式 → 移入 missing_fields。"""
+    """模型返回维修方式自由填入（2026-08-26）：任意非空文本均视为有效，不再按枚举剔除。"""
     from semantics.classifier import SemanticClassifier
 
     protocol = _load_protocol()
@@ -337,14 +444,15 @@ async def test_classifier_strips_unsafe_repair_method():
         "intent": "ticket.repair_plan.submit",
         "confidence": 0.9,
         "fields": {
-            "repair_method": "随便修修",  # 非法枚举
+            "repair_method": "随便修修",  # 自由填入，合法
         },
     })
     classifier = SemanticClassifier(client=fake, protocol=protocol)
     msg = _make_message()
     result = await classifier.classify(msg, candidates=[])
-    assert "repair_method" in result.missing_fields
-    assert "repair_method" not in result.fields
+    assert "repair_method" in result.fields
+    assert result.fields["repair_method"] == "随便修修"
+    assert "repair_method" not in result.missing_fields
 
 
 @pytest.mark.asyncio
@@ -560,10 +668,12 @@ async def test_classifier_single_http_call():
 
 
 @pytest.mark.asyncio
-async def test_classifier_model_client_not_configured():
+async def test_classifier_model_client_not_configured(monkeypatch):
     """OpenAICompatibleModelClient 在无 API Key 时 is_configured=False。"""
     from semantics.model_client import OpenAICompatibleModelClient
 
+    # .env 自动加载后进程内会有真实 LLM_API_KEY；本测试验证"无 Key"路径，须显式清空
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
     client = OpenAICompatibleModelClient(api_key="")
     assert not client.is_configured
 
@@ -664,3 +774,135 @@ async def test_model_client_redacts_api_key_from_http_error_log(monkeypatch, cap
             idempotency_key="msg-1",
         )
     assert secret not in caplog.text
+
+
+# ───────────────────── 思考模式与空响应防护（2026-08-26） ─────────────────────
+
+
+class _JsonResponse:
+    status_code = 200
+    text = ""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self._payload = payload
+
+    def json(self) -> dict[str, Any]:
+        return self._payload
+
+
+class _StubAsyncClient:
+    """返回可编程 JSON 响应体的捕获客户端。"""
+
+    instances: list["_StubAsyncClient"] = []
+    response_payload: dict[str, Any] = {
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "message": {"content": '{"intent":"chat.ignore","confidence":1,"fields":{}}'},
+            }
+        ]
+    }
+
+    def __init__(self, *, timeout: float) -> None:
+        self.timeout = timeout
+        self.posts: list[dict[str, Any]] = []
+        self.instances.append(self)
+
+    async def __aenter__(self) -> "_StubAsyncClient":
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback) -> None:
+        return None
+
+    async def post(self, url: str, *, headers: dict[str, str], json: dict[str, Any]) -> _JsonResponse:
+        self.posts.append(json)
+        return _JsonResponse(self.response_payload)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("base_url", "expected_thinking"),
+    [
+        ("https://api.deepseek.com", {"type": "disabled"}),
+        ("https://api.openai.com/v1", None),
+    ],
+)
+async def test_model_client_auto_disables_thinking_for_deepseek(
+    monkeypatch, base_url: str, expected_thinking: dict[str, str] | None
+):
+    """auto 模式只对 DeepSeek 显式禁用思考模式。
+
+    V4 系列默认开启思考(effort=high)：思考 token 计入 max_tokens 会把
+    json_object 正文挤空/挤断，且 temperature 被忽略。
+    """
+    import httpx
+    from semantics.model_client import OpenAICompatibleModelClient
+
+    monkeypatch.delenv("LLM_THINKING_MODE", raising=False)
+    _StubAsyncClient.instances.clear()
+    monkeypatch.setattr(httpx, "AsyncClient", _StubAsyncClient)
+    client = OpenAICompatibleModelClient(base_url=base_url, api_key="sk-test", model="m")
+    await client.complete_json(
+        payload={"messages": [{"role": "system", "content": "t"}]},
+        schema={"type": "object"},
+        idempotency_key="msg-think",
+    )
+
+    body = _StubAsyncClient.instances[0].posts[0]
+    assert body["max_tokens"] == 2048  # 思考禁用后预算全留正文，防长字段截断
+    if expected_thinking is None:
+        assert "thinking" not in body  # 非 DeepSeek 服务不发送未知参数
+    else:
+        assert body["thinking"] == expected_thinking
+
+
+@pytest.mark.asyncio
+async def test_model_client_thinking_mode_env_override(monkeypatch):
+    """LLM_THINKING_MODE=enabled 可显式覆盖 auto 的域名判断。"""
+    import httpx
+    from semantics.model_client import OpenAICompatibleModelClient
+
+    monkeypatch.setenv("LLM_THINKING_MODE", "enabled")
+    _StubAsyncClient.instances.clear()
+    monkeypatch.setattr(httpx, "AsyncClient", _StubAsyncClient)
+    client = OpenAICompatibleModelClient(
+        base_url="https://example.test/v1", api_key="sk-test", model="m"
+    )
+    await client.complete_json(
+        payload={"messages": [{"role": "system", "content": "t"}]},
+        schema={"type": "object"},
+        idempotency_key="msg-think",
+    )
+    assert _StubAsyncClient.instances[0].posts[0]["thinking"] == {"type": "enabled"}
+
+
+def test_model_client_rejects_unknown_thinking_mode(monkeypatch):
+    """未知 LLM_THINKING_MODE 配置应在启动时失败。"""
+    from semantics.model_client import OpenAICompatibleModelClient
+
+    monkeypatch.setenv("LLM_THINKING_MODE", "xml")
+    with pytest.raises(ValueError, match="LLM_THINKING_MODE"):
+        OpenAICompatibleModelClient(api_key="sk-test")
+
+
+@pytest.mark.asyncio
+async def test_model_client_empty_content_reports_finish_reason(monkeypatch):
+    """DeepSeek json_object 已知偶发空 content：报错须带 finish_reason，便于诊断。"""
+    import httpx
+    from semantics.model_client import OpenAICompatibleModelClient
+
+    _StubAsyncClient.response_payload = {
+        "choices": [{"finish_reason": "length", "message": {"content": ""}}]
+    }
+    monkeypatch.delenv("LLM_THINKING_MODE", raising=False)
+    _StubAsyncClient.instances.clear()
+    monkeypatch.setattr(httpx, "AsyncClient", _StubAsyncClient)
+    client = OpenAICompatibleModelClient(
+        base_url="https://api.deepseek.com", api_key="sk-test", model="m"
+    )
+    with pytest.raises(ModelResponseError, match="finish_reason=length"):
+        await client.complete_json(
+            payload={"messages": [{"role": "system", "content": "t"}]},
+            schema={"type": "object"},
+            idempotency_key="msg-empty",
+        )

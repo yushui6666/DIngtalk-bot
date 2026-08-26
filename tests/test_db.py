@@ -110,7 +110,7 @@ def test_init_schema_idempotent(db: Database):
     tables = db.connect().execute(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
     ).fetchone()[0]
-    assert tables == 20
+    assert tables == 21
 
 
 # ─────────────────────── 2. 事务与幂等 ───────────────────────

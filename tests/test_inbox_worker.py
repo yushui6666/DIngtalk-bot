@@ -36,7 +36,7 @@ GROUPS = [
 
 
 class SlowClassifier:
-    """记录同时进行的模型调用数。"""
+    """记录同时进行的模型调用数。兼容全AI架构：#报修 等也走模型。"""
 
     def __init__(self, delay: float = 0.15) -> None:
         self.delay = delay
@@ -50,8 +50,29 @@ class SlowClassifier:
             await asyncio.sleep(self.delay)
         finally:
             self.active -= 1
+        # 全AI下 #报修 也走模型：模拟 AI 正确解析建单
+        text = (message.content or "").strip()
+        if text.startswith("#报修"):
+            # 简易解析：提取主题/位置/问题描述/时效
+            import re as _re
+            subject = _re.search(r"主题[：:]\s*([^\n]+)", text)
+            location = _re.search(r"位置[：:]\s*([^\n]+)", text)
+            desc = _re.search(r"问题描述[：:]\s*([^\n]+)", text)
+            sla_m = _re.search(r"时效[：:]\s*(1天|3天|7天|待商榷)", text)
+            fields: dict = {}
+            if subject:
+                fields["subject"] = subject.group(1).strip()
+            if location:
+                fields["location"] = location.group(1).strip()
+            if desc:
+                fields["problem_description"] = desc.group(1).strip()
+            if sla_m:
+                fields["sla"] = sla_m.group(1).strip()
+            return SemanticDecision(protocol_version="4.0.0", source="SEMANTIC_MODEL",
+                                     intent="ticket.create", target_ticket_no=None,
+                                     intent_confidence=0.95, fields=fields)
         return SemanticDecision(protocol_version="4.0.0", source="SEMANTIC_MODEL",
-                                intent="chat.ignore", target_ticket_no=None, intent_confidence=0.0)
+                                 intent="chat.ignore", target_ticket_no=None, intent_confidence=0.0)
 
 
 @pytest.fixture()
@@ -142,13 +163,13 @@ async def test_same_group_serial_processing(env):
 
 @pytest.mark.asyncio
 async def test_group_keyword_messages_processed_while_model_slow(env):
-    """某群模型慢，不应阻塞另一群的关键词建单。"""
+    """某群模型慢，不应阻塞另一群的建单（全AI架构下均为模型调用，但按群并行）。"""
     _enqueue(env, "G2", "帮我查一下工单（模型慢）", "m1")  # G2 走慢模型
-    _enqueue(env, "G1", "#报修\n主题：收银机\n位置：前台\n问题描述：死机\n时效：1天", "m2")  # G1 关键词快路径
+    _enqueue(env, "G1", "#报修\n主题：收银机\n位置：前台\n问题描述：死机\n时效：1天", "m2")  # G1 全AI建单
     await _run_worker_for(env, 0.6, ["G1", "G2"])
     m2 = env.db.connect().execute(
         "SELECT status, processed_result FROM inbox_messages WHERE message_id='m2'"
     ).fetchone()
     assert m2["status"] == "COMPLETED"
     tickets = env.db.list_active_tickets("G1")
-    assert len(tickets) == 1, "G1 关键词建单应不被 G2 的慢模型阻塞"
+    assert len(tickets) == 1, "G1 建单应不被 G2 的慢模型阻塞（按群并行）"

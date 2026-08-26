@@ -25,7 +25,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
@@ -89,7 +89,9 @@ CREATE TABLE IF NOT EXISTS tickets (
     duplicate_of_ticket_id         INTEGER,
     reopen_count                   INTEGER NOT NULL DEFAULT 0,
     created_at                     TEXT NOT NULL,
-    closed_at                      TEXT
+    closed_at                      TEXT,
+    completed_confirm_by           TEXT,
+    completed_confirm_at           TEXT
 );
 
 -- v4.0 Task 5 已删除单活动工单唯一索引，支持同群多工单并行。
@@ -191,6 +193,8 @@ CREATE TABLE IF NOT EXISTS notification_deliveries (
     target_type       TEXT NOT NULL,
     target_id         TEXT NOT NULL,
     scheduled_at      TEXT,
+    payload_text      TEXT,
+    claimed_at        TEXT,
     sent_at           TEXT,
     status            TEXT NOT NULL DEFAULT 'PENDING',
     attempts          INTEGER NOT NULL DEFAULT 0,
@@ -357,6 +361,7 @@ CREATE TABLE IF NOT EXISTS order_monitor (
     closed_notified   INTEGER NOT NULL DEFAULT 0,
     received_at       TEXT,
     received_notified INTEGER NOT NULL DEFAULT 0,
+    xlsx_synced       INTEGER NOT NULL DEFAULT 0,
     created_at        TEXT NOT NULL,
     updated_at        TEXT NOT NULL
 );
@@ -371,6 +376,28 @@ CREATE TABLE IF NOT EXISTS taobao_orders (
     source          TEXT,
     updated_at      TEXT
 );
+
+-- ─────────────────────── ticket_special_cases（特殊情况暂停，2026-08-26） ───────────────────────
+-- 责任方回复「特殊情况：原因；预计恢复：时间」后建立一条暂停记录；
+-- resumed_at IS NULL 即为生效中的暂停：时效 SLA / 响应 SLA / 签收后每日催均豁免，
+-- 实际业务动作或再次声明时关闭，并按「实际暂停时长」顺延 current_deadline_at。
+CREATE TABLE IF NOT EXISTS ticket_special_cases (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_id            INTEGER NOT NULL,
+    source_message_id    TEXT NOT NULL UNIQUE,
+    reason               TEXT NOT NULL,
+    expected_resume_text TEXT,
+    expected_resume_at   TEXT,
+    paused_deadline_at   TEXT,
+    submitted_by         TEXT NOT NULL,
+    submitted_at         TEXT NOT NULL,
+    resumed_at           TEXT,
+    resume_message_id    TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_special_case_ticket ON ticket_special_cases(ticket_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_special_case_one_active
+    ON ticket_special_cases(ticket_id) WHERE resumed_at IS NULL;
 """
 
 
@@ -385,6 +412,9 @@ _TICKET_MIGRATION_COLUMNS = {
     "stop_reason": "stop_reason TEXT",
     "duplicate_of_ticket_id": "duplicate_of_ticket_id INTEGER",
     "reopen_count": "reopen_count INTEGER NOT NULL DEFAULT 0",
+    # 2026-08-24 店长确认完工留痕
+    "completed_confirm_by": "completed_confirm_by TEXT",
+    "completed_confirm_at": "completed_confirm_at TEXT",
 }
 
 
@@ -455,10 +485,21 @@ class Database:
         _ORDER_MONITOR_MIGRATION_COLUMNS = {
             "received_at": "received_at TEXT",
             "received_notified": "received_notified INTEGER NOT NULL DEFAULT 0",
+            # 共享表写入兜底（2026-08-25）：0=尚未确认写入 订单门店状态表.xlsx
+            "xlsx_synced": "xlsx_synced INTEGER NOT NULL DEFAULT 0",
         }
         for column, ddl in _ORDER_MONITOR_MIGRATION_COLUMNS.items():
             if column not in om_cols:
                 conn.execute(f"ALTER TABLE order_monitor ADD COLUMN {ddl}")
+
+        notify_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(notification_deliveries)").fetchall()
+        }
+        if "payload_text" not in notify_cols:
+            conn.execute("ALTER TABLE notification_deliveries ADD COLUMN payload_text TEXT")
+        if "claimed_at" not in notify_cols:
+            conn.execute("ALTER TABLE notification_deliveries ADD COLUMN claimed_at TEXT")
 
         # 4. 记录迁移版本
         conn.execute(
@@ -1087,6 +1128,18 @@ class Database:
         ).fetchone()
         return row is not None and row["status"] == "APPLIED"
 
+    def execution_status(self, dedupe_key: str) -> str | None:
+        row = self.connect().execute(
+            "SELECT status FROM action_executions WHERE dedupe_key=?", (dedupe_key,)
+        ).fetchone()
+        return row["status"] if row else None
+
+    def mark_execution_result(self, dedupe_key: str, status: str) -> None:
+        self._conn.execute(
+            "UPDATE action_executions SET status=? WHERE dedupe_key=?",
+            (status, dedupe_key),
+        )
+
     # ─────────────────────── 工单基础读写（供 tickets/repository 使用） ───────────────────────
     def get_ticket(self, ticket_id: int) -> dict[str, Any] | None:
         row = self.connect().execute(
@@ -1112,6 +1165,15 @@ class Database:
         """群内全部工单（含终态，供 #重开工单 等定位终态工单）。"""
         rows = self.connect().execute(
             "SELECT * FROM tickets WHERE group_id=? ORDER BY id",
+            (group_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_group_pending_confirm_tickets(self, group_id: str) -> list[dict[str, Any]]:
+        """群内「待店长确认」工单，最早创建优先（完工确认窗口归档用）。"""
+        rows = self.connect().execute(
+            "SELECT * FROM tickets WHERE group_id=? AND status='PENDING_CONFIRM'"
+            " ORDER BY id",
             (group_id,),
         ).fetchall()
         return [dict(r) for r in rows]
@@ -1300,6 +1362,72 @@ class Database:
         )
         return cur.lastrowid
 
+    # ─────────────────────── 特殊情况暂停（2026-08-26） ───────────────────────
+    def add_special_case(
+        self,
+        ticket_id: int,
+        message_id: str,
+        reason: str,
+        expected_resume_text: str | None,
+        expected_resume_at: str | None,
+        submitted_by: str,
+        submitted_at: str,
+    ) -> int:
+        """登记一条特殊情况暂停（调用方须先关闭既有生效中的暂停，保证唯一索引）。
+
+        同时快照暂停开始时的截止时间 paused_deadline_at，供审计。
+        """
+        row = self._conn.execute(
+            "SELECT current_deadline_at FROM tickets WHERE id=?", (ticket_id,)
+        ).fetchone()
+        cur = self._conn.execute(
+            """INSERT INTO ticket_special_cases
+                   (ticket_id, source_message_id, reason, expected_resume_text,
+                    expected_resume_at, paused_deadline_at, submitted_by, submitted_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (ticket_id, message_id, reason, expected_resume_text,
+             expected_resume_at, row["current_deadline_at"] if row else None,
+             submitted_by, submitted_at),
+        )
+        return cur.lastrowid
+
+    def close_active_special_case(
+        self, ticket_id: int, resume_message_id: str, resumed_at: str
+    ) -> Optional[sqlite3.Row]:
+        """关闭生效中的暂停，返回被关闭的记录（含 submitted_at 供顺延计算）；无则 None。"""
+        row = self._conn.execute(
+            "SELECT * FROM ticket_special_cases"
+            " WHERE ticket_id=? AND resumed_at IS NULL ORDER BY id LIMIT 1",
+            (ticket_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        self._conn.execute(
+            "UPDATE ticket_special_cases SET resumed_at=?, resume_message_id=?"
+            " WHERE id=? AND resumed_at IS NULL",
+            (resumed_at, resume_message_id, row["id"]),
+        )
+        return row
+
+    def list_active_special_cases(self) -> list[dict[str, Any]]:
+        """活动工单上生效中的暂停（含工单号/群号，供到期跟进提醒）。"""
+        rows = self._conn.execute(
+            """SELECT s.*, t.ticket_no, t.group_id
+                 FROM ticket_special_cases s JOIN tickets t ON t.id = s.ticket_id
+                WHERE s.resumed_at IS NULL
+                  AND t.status IN ('ACTIVE', 'ACTIVE_OVERDUE', 'PENDING_CONFIRM')
+                ORDER BY s.id"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def set_ticket_deadline(self, ticket_id: int, new_deadline_at: str) -> bool:
+        """直接写截止时间（暂停顺延用，已在业务事务内，不做 CAS）。"""
+        cur = self._conn.execute(
+            "UPDATE tickets SET current_deadline_at=? WHERE id=?",
+            (new_deadline_at, ticket_id),
+        )
+        return cur.rowcount > 0
+
     def add_timeout_cycle_reason(
         self, ticket_id: int, message_id: str, timeout_reason: str, engineer_id: str
     ) -> bool:
@@ -1335,24 +1463,40 @@ class Database:
         target_type: str,
         target_id: str,
         scheduled_at: str | None = None,
+        payload_text: str | None = None,
     ) -> int:
         """在业务事务内预写通知（PENDING）。"""
         cur = self._conn.execute(
             """INSERT OR IGNORE INTO notification_deliveries
                    (dedupe_key, ticket_id, notification_type, target_type, target_id,
-                    scheduled_at, status)
-               VALUES (?,?,?,?,?,?, 'PENDING')""",
+                    scheduled_at, payload_text, status)
+               VALUES (?,?,?,?,?,?,?, 'PENDING')""",
             (dedupe_key, ticket_id, notification_type, target_type, target_id,
-             scheduled_at or _now_str()),
+             scheduled_at or _now_str(), payload_text),
         )
         return cur.lastrowid if cur.rowcount > 0 else 0
 
     def claim_pending_notifications(self, limit: int = 20) -> list[dict[str, Any]]:
-        rows = self.connect().execute(
-            "SELECT * FROM notification_deliveries WHERE status='PENDING'"
-            " ORDER BY scheduled_at LIMIT ?",
-            (limit,),
-        ).fetchall()
+        now = _now_str()
+        stale_before = (datetime.now() - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+        with self.transaction("claim_notifications"):
+            # 崩溃遗留的领取记录超过 5 分钟后可再次投递。
+            self._conn.execute(
+                "UPDATE notification_deliveries SET status='PENDING', claimed_at=NULL "
+                "WHERE status='CLAIMED' AND claimed_at < ?",
+                (stale_before,),
+            )
+            rows = self._conn.execute(
+                """UPDATE notification_deliveries
+                   SET status='CLAIMED', claimed_at=?
+                   WHERE id IN (
+                       SELECT id FROM notification_deliveries
+                       WHERE status='PENDING'
+                       ORDER BY scheduled_at LIMIT ?
+                   )
+                   RETURNING *""",
+                (now, limit),
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def clear_ticket_sla_dedupe(self, ticket_id: int) -> int:
@@ -1371,7 +1515,7 @@ class Database:
         self, notification_id: int, status: str, *, error: str | None = None
     ) -> None:
         self._conn.execute(
-            "UPDATE notification_deliveries SET status=?, sent_at=?, last_error=?"
+            "UPDATE notification_deliveries SET status=?, claimed_at=NULL, sent_at=?, last_error=?"
             " WHERE id=?",
             (status, _now_str() if status != "PENDING" else None, error, notification_id),
         )
@@ -1515,13 +1659,42 @@ class Database:
             f"UPDATE order_monitor SET {', '.join(sets)} WHERE order_id=?", params
         )
 
+    def mark_order_xlsx_synced(self, order_id: str, *, synced: bool = True) -> None:
+        """标记订单行已写入共享表 订单门店状态表.xlsx（写入兜底用，2026-08-25）。
+
+        追加成功或该行本已存在都算已同步；共享表写失败时保持 0，
+        由调度器 scan_shared_table_resync 周期重试。
+        """
+        self._conn.execute(
+            "UPDATE order_monitor SET xlsx_synced=?, updated_at=? WHERE order_id=?",
+            (1 if synced else 0, _now_str(), order_id),
+        )
+
+    def list_unsynced_orders(self) -> list[dict[str, Any]]:
+        """尚未确认写入共享表的订单（xlsx_synced=0），按登记先后排序。
+
+        排除 order_id 为空的占位行（无单号无法写共享表）。
+        """
+        rows = self.connect().execute(
+            "SELECT * FROM order_monitor"
+            " WHERE xlsx_synced=0 AND order_id IS NOT NULL ORDER BY created_at, rowid"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def list_received_active_tickets(self) -> list[dict[str, Any]]:
-        """有订单已签收、且仍处于活动态的工单（签收后每日提醒直至完成）。"""
+        """有订单已签收、且仍处于活动态的工单（签收后每日提醒直至完成）。
+
+        特殊情况暂停期间豁免（2026-08-26）。
+        """
         rows = self.connect().execute(
             """SELECT DISTINCT t.* FROM tickets t
                JOIN order_monitor om ON om.ticket_id = t.id
                WHERE om.received_at IS NOT NULL
                  AND t.status IN ('ACTIVE', 'ACTIVE_OVERDUE')
+                 AND NOT EXISTS (
+                     SELECT 1 FROM ticket_special_cases sc
+                     WHERE sc.ticket_id = t.id AND sc.resumed_at IS NULL
+                 )
                ORDER BY t.id""",
         ).fetchall()
         return [dict(r) for r in rows]

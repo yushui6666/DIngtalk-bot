@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import gc
 import os
 import subprocess
 import sys
@@ -65,14 +66,28 @@ from config import (  # noqa: E402  — 需在 _load_env_file 之后导入
 
 
 def _dws_sender(target_id: str, text: str) -> None:
-    """通过 dws CLI 发群消息（同步，低吞吐场景够用）。"""
-    cmd = [DWS_CMD, "chat", "message", "send", "--group", target_id, "--text", text]
+    """通过 dws CLI 发消息（同步，低吞吐场景够用）。
+
+    target_id 支持 "user:<userId>" 前缀走单聊（响应 SLA 升级提醒），
+    其余按群 openconversation_id 发送。
+
+    失败语义（2026-08-24 修复）：dws 非零退出码 / 超时 / 启动异常一律抛
+    RuntimeError，由 Notifier 据此标记 FAILED 或留 PENDING 重试；
+    此前只记 warning 正常返回，导致 Outbox 把失败误标 SENT。
+    """
+    if target_id.startswith("user:"):
+        cmd = [DWS_CMD, "chat", "message", "send",
+               "--user", target_id[len("user:"):], "--text", text]
+    else:
+        cmd = [DWS_CMD, "chat", "message", "send", "--group", target_id, "--text", text]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if proc.returncode != 0:
-            logger.warning("dws 发送失败 target=%s stderr=%s", target_id, proc.stderr[:200])
     except Exception as exc:
         logger.warning("dws 发送异常 target=%s err=%s", target_id, exc)
+        raise RuntimeError(f"dws 发送异常: {exc}") from exc
+    if proc.returncode != 0:
+        logger.warning("dws 发送失败 target=%s stderr=%s", target_id, proc.stderr[:200])
+        raise RuntimeError(f"dws 退出码 {proc.returncode}: {proc.stderr[:200]}")
 
 
 def _build_pipeline(mode: str):
@@ -182,8 +197,9 @@ async def main(
     tasks = [
         asyncio.create_task(run_listeners(groups, inbox_handler)),
         asyncio.create_task(worker.run()),
-        asyncio.create_task(scheduler.run()),
     ]
+    if mode != "SHADOW":
+        tasks.append(asyncio.create_task(scheduler.run()))
     logger.info("系统启动 mode=%s groups=%d", mode, len(groups))
 
     try:
@@ -198,6 +214,11 @@ async def main(
         await asyncio.gather(*tasks, return_exceptions=True)
         if archiver is not None:
             await archiver.aclose()
+        # 兜底：趁事件循环仍存活强制回收一次，让仍被引用链（异常回溯环等）
+        # 挂住的子进程 transport 在此刻完成关闭；否则解释器退出阶段 GC 会
+        # 刷屏「RuntimeError: Event loop is closed」（2026-08-26 停机日志）。
+        gc.collect()
+        await asyncio.sleep(0)  # 让 transport.close() 排队的回调跑一拍
         db.close()
         logger.info("系统停止")
 

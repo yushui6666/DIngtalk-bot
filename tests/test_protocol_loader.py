@@ -233,15 +233,16 @@ def test_compiler_is_reproducible_and_matches_committed_protocol(tmp_path):
     """同一业务源重复编译结果逐字节一致，并等于已提交运行时协议。"""
     from semantics.protocol_compiler import compile_business_protocol
 
-    project_root = Path(__file__).parents[2]
+    project_root = Path(__file__).parents[1]
     source = project_root / "dashbord" / "维修工单_流程关键词.json"
+    assert source.exists(), f"业务源文件不存在: {source}"
     first = tmp_path / "first.json"
     second = tmp_path / "second.json"
 
     compile_business_protocol(source, first)
     compile_business_protocol(source, second)
 
-    committed = project_root / "dingtalk_script" / "protocols" / "ticket_semantics.v4.json"
+    committed = project_root / "protocols" / "ticket_semantics.v4.json"
     assert first.read_bytes() == second.read_bytes()
     assert first.read_bytes() == committed.read_bytes()
 

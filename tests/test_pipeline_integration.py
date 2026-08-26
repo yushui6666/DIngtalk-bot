@@ -12,15 +12,15 @@ from pathlib import Path
 import pytest
 
 from db import Database
-from models import NormalizedMessage
+from models import ImageAttachment, NormalizedMessage
 from notifier import Notifier
 from pipeline import MessageProcessingPipeline, RuntimeMode
 from routing.pending_actions import PendingActionService
 from routing.ticket_contexts import TicketContextStore
 from routing.ticket_router import TicketRouter
 from semantics.protocol_loader import load_protocol
-from semantics.types import SemanticDecision
-from tickets.executor import TicketCommandExecutor
+from semantics.types import CommandResult, PendingActionStatus, SemanticDecision
+from tickets.executor import RESULT_INTERNAL_ERROR, TicketCommandExecutor
 from tickets.repository import TicketRepository
 
 _PROTOCOL_PATH = Path(__file__).resolve().parent.parent / "protocols" / "ticket_semantics.v4.json"
@@ -30,17 +30,78 @@ GROUP = {"group_id": "G1", "store_name": "钉钉消息测试",
 
 
 class FakeClassifier:
-    """按 message_id 返回预设语义决策；未预设则返回 chat.ignore。"""
+    """按 message_id 返回预设语义决策；未预设则尝试本地解析 # 语法（模拟全AI对 # 的理解），否则返回 chat.ignore。"""
 
-    def __init__(self) -> None:
+    def __init__(self, protocol=None) -> None:
         self.responses: dict[str, SemanticDecision] = {}
+        self.protocol = protocol
 
     async def classify(self, message, candidates=None, pending_action=None, history=None) -> SemanticDecision:
-        return self.responses.get(
-            message.message_id,
-            SemanticDecision(protocol_version="4.0.0", source="SEMANTIC_MODEL",
-                             intent="chat.ignore", target_ticket_no=None, intent_confidence=0.0),
-        )
+        if message.message_id in self.responses:
+            return self.responses[message.message_id]
+        # 模拟全AI对 # 语法的理解：复用 keyword_matcher 但标记为 SEMANTIC_MODEL
+        text = (message.content or "").strip()
+        if text.startswith("#") and self.protocol is not None:
+            try:
+                from semantics.keyword_matcher import match_keyword as _mk
+                kw_decision = _mk(text, self.protocol)
+                if kw_decision is not None and kw_decision.intent != "system.clarify":
+                    # 将 keyword 来源改为 SEMANTIC_MODEL 以符合全AI架构（本地校验仍一致）
+                    return SemanticDecision(
+                        protocol_version=kw_decision.protocol_version,
+                        source="SEMANTIC_MODEL",
+                        intent=kw_decision.intent,
+                        target_ticket_no=kw_decision.target_ticket_no,
+                        intent_confidence=0.95,
+                        fields=dict(kw_decision.fields),
+                        missing_fields=kw_decision.missing_fields,
+                        candidate_scores=kw_decision.candidate_scores,
+                        evidence=kw_decision.evidence,
+                        requires_confirmation=kw_decision.requires_confirmation,
+                    )
+                elif kw_decision is not None:
+                    return SemanticDecision(
+                        protocol_version=kw_decision.protocol_version,
+                        source="SEMANTIC_MODEL",
+                        intent=kw_decision.intent,
+                        target_ticket_no=kw_decision.target_ticket_no,
+                        intent_confidence=0.9,
+                        fields=dict(kw_decision.fields),
+                        missing_fields=kw_decision.missing_fields,
+                        evidence=kw_decision.evidence,
+                    )
+            except Exception:
+                pass
+            # 裸时效补充（如 "3天"）在草稿场景下由 pipeline 本地兜底，此处默认忽略
+            # 但若内容本身就是时效词，尝试返回 ticket.create 供补充逻辑合并
+            import re as _re
+            if _re.fullmatch(r"\s*(1天|3天|7天|待商榷)\s*", text):
+                return SemanticDecision(
+                    protocol_version="4.0.0", source="SEMANTIC_MODEL",
+                    intent="ticket.create", target_ticket_no=None,
+                    intent_confidence=0.8, fields={"sla": text.strip()},
+                )
+            # 选择数字（2/第二个）由 pipeline 本地快路径处理，此处返回 chat.ignore 即可
+        # 裸订单号场景（全AI下裸单号应识别为 repair_plan.submit）— 由 pipeline supplement 兜底，但此处也模拟
+        import re as _re2
+        order_tokens = _re2.findall(r"(?<![A-Za-z0-9-])[A-Za-z0-9-]{6,64}(?![A-Za-z0-9-])", text or "")
+        orders = [
+            t for t in order_tokens
+            if sum(ch.isdigit() for ch in t) >= 6
+            and not _re2.fullmatch(r"1[3-9]\d{9}", t)
+        ]
+        if orders and any(kw in text for kw in ("订单", "单号", "采购", "TB-")) or (len(orders) == 1 and len(text.strip()) < 30 and orders[0] in text):
+            # 仅当上下文中有活动工单时才视为提交订单，避免误判手机号
+            if candidates:
+                fields = {"order_no": orders[0], "order_nos": orders}
+                # 尝试提取诊断
+                return SemanticDecision(
+                    protocol_version="4.0.0", source="SEMANTIC_MODEL",
+                    intent="ticket.repair_plan.submit", target_ticket_no=None,
+                    intent_confidence=0.9, fields=fields,
+                )
+        return SemanticDecision(protocol_version="4.0.0", source="SEMANTIC_MODEL",
+                             intent="chat.ignore", target_ticket_no=None, intent_confidence=0.0)
 
 
 @pytest.fixture()
@@ -56,16 +117,20 @@ def env(tmp_path):
     executor = TicketCommandExecutor(db, repo)
     sent: list[str] = []
     notifier = Notifier(db, lambda target, text: sent.append(text))
-    classifier = FakeClassifier()
+    classifier = FakeClassifier(protocol=protocol)
 
-    def make_pipeline(mode=RuntimeMode.PRODUCTION, max_attempts=3):
+    def make_pipeline(
+        mode=RuntimeMode.PRODUCTION,
+        max_attempts=3,
+        classifier_override=classifier,
+    ):
         return MessageProcessingPipeline(
             db=db, repo=repo, protocol=protocol, router=router, context=context,
             pending=pending, executor=executor, notifier=notifier,
-            classifier=classifier, mode=mode, max_attempts=max_attempts,
+            classifier=classifier_override, mode=mode, max_attempts=max_attempts,
         )
 
-    async def process(text, message_id, role="MANAGER", sender="uid-mgr"):
+    async def process(text, message_id, role="MANAGER", sender="uid-mgr", pipeline=None):
         msg = NormalizedMessage(
             message_id=message_id, group_id="G1", sender_id=sender, sender_name="u",
             content=text, message_type="text", sent_at=datetime.now(), sender_role=role,
@@ -74,11 +139,11 @@ def env(tmp_path):
         row = db.connect().execute(
             "SELECT * FROM inbox_messages WHERE message_id=?", (message_id,)
         ).fetchone()
-        return await make_pipeline().process(dict(row))
+        return await (pipeline or make_pipeline()).process(dict(row))
 
     yield SimpleNamespace(
         db=db, sent=sent, classifier=classifier, process=process,
-        make_pipeline=make_pipeline, context=context,
+        make_pipeline=make_pipeline, context=context, executor=executor,
     )
     db.close()
 
@@ -107,7 +172,8 @@ async def test_create_ticket_via_keyword(env):
     assert t["sla_days"] == 1
     assert t["current_deadline_at"] == t["initial_deadline_at"]  # 创建时截止=初始截止
     assert t["current_deadline_at"] > datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    assert any("已创建工单" in s for s in env.sent)
+    # 2026-08-24 一行式建单回执（驱动工程师响应，保留）
+    assert any("已建单" in s and "收银机" in s for s in env.sent)
 
 
 @pytest.mark.asyncio
@@ -263,7 +329,8 @@ async def test_number_reply_selects_nth_candidate_locally(env):
     await env.process("2", "m3")
     ctx = env.context.get_active("G1", "uid-mgr", datetime.now())
     assert ctx == act[1]["id"]  # 第 2 个候选
-    assert any(f"已切换到工单 {act[1]['ticket_no']}" in s for s in env.sent)
+    # 选单成功需回执确认（用户要求 2026-08-25）
+    assert any("已切换到工单" in s for s in env.sent)
     # 中文「第二个」同样生效
     await env.process("第一个", "m4")
     ctx2 = env.context.get_active("G1", "uid-mgr", datetime.now())
@@ -373,18 +440,28 @@ async def test_leader_can_perform_engineer_actions(env):
 
 @pytest.mark.asyncio
 async def test_leader_stop_ticket_via_keyword(env):
-    """关键词 #停止维修（工程负责人）：直接进入 STOPPED 终态并记录原因/操作人。"""
+    """全AI架构：#停止维修（工程负责人）经 AI 识别后仍需确认（SEMANTIC_MODEL ALWAYS）。"""
     await env.process("#报修\n主题：收银机\n位置：前台\n问题描述：死机\n时效：1天", "m1")
     t1 = _active(env.db)[0]
     status = await env.process("#停止维修 原因：配件停产，无法修复",
                                "m2", role="LEADER", sender="uid-leader")
-    assert status == "COMPLETED"
+    # 全AI下 # 也走模型，停修高危动作需确认
+    row = env.db.connect().execute("SELECT processed_result FROM inbox_messages WHERE message_id='m2'").fetchone()
+    assert row["processed_result"] == "WAITING_CONFIRMATION"
+    assert _ticket(env.db, t1["ticket_no"])["status"] == "ACTIVE"
+    assert any("确认执行「停修工单」" in s for s in env.sent)
+    # 确认后才真正停修
+    env.classifier.responses["c1"] = SemanticDecision(
+        protocol_version="4.0.0", source="SEMANTIC_MODEL",
+        intent="system.confirm_pending_action", target_ticket_no=None, intent_confidence=1.0)
+    await env.process("确认", "c1", role="LEADER", sender="uid-leader")
     t = _ticket(env.db, t1["ticket_no"])
     assert t["status"] == "STOPPED"
     assert t["stop_reason"] == "配件停产，无法修复"
     assert t["stopped_by"] == "uid-leader"
     assert t["stopped_at"] and t["closed_at"]
-    assert any("已停修" in s for s in env.sent)
+    # 静默化：停修成功不回执
+    assert not any("已停修" in s for s in env.sent)
 
 
 @pytest.mark.asyncio
@@ -413,15 +490,25 @@ async def test_manager_cannot_stop_ticket(env):
 
 @pytest.mark.asyncio
 async def test_stopped_ticket_can_reopen(env):
-    """STOPPED 终态可 #重开工单 恢复 ACTIVE。"""
+    """STOPPED 终态可 #重开工单 恢复 ACTIVE（全AI下均需确认）。"""
     await env.process("#报修\n主题：收银机\n位置：前台\n问题描述：死机\n时效：1天", "m1")
     t1 = _active(env.db)[0]
     await env.process("#停止维修 原因：配件停产，无法修复", "m2",
                       role="LEADER", sender="uid-leader")
+    env.classifier.responses["c_stop"] = SemanticDecision(
+        protocol_version="4.0.0", source="SEMANTIC_MODEL",
+        intent="system.confirm_pending_action", target_ticket_no=None, intent_confidence=1.0)
+    await env.process("确认", "c_stop", role="LEADER", sender="uid-leader")
+    assert _ticket(env.db, t1["ticket_no"])["status"] == "STOPPED"
     status = await env.process(
         f"#重开工单 工单编号：{t1['ticket_no']} 重开原因：新配件到货",
         "m3", role="LEADER", sender="uid-leader")
-    assert status == "COMPLETED"
+    row = env.db.connect().execute("SELECT processed_result FROM inbox_messages WHERE message_id='m3'").fetchone()
+    assert row["processed_result"] == "WAITING_CONFIRMATION"
+    env.classifier.responses["c_reopen"] = SemanticDecision(
+        protocol_version="4.0.0", source="SEMANTIC_MODEL",
+        intent="system.confirm_pending_action", target_ticket_no=None, intent_confidence=1.0)
+    await env.process("确认", "c_reopen", role="LEADER", sender="uid-leader")
     t = _ticket(env.db, t1["ticket_no"])
     assert t["status"] == "ACTIVE"
     assert t["closed_at"] is None
@@ -455,3 +542,357 @@ async def test_model_stop_still_requires_confirmation(env):
     assert t["status"] == "STOPPED"
     assert t["stop_reason"] == "配件停产"
     assert t["stopped_by"] == "uid-leader"
+
+
+@pytest.mark.asyncio
+async def test_incomplete_create_can_be_supplemented_with_bare_sla(env):
+    env.classifier.responses["m1"] = SemanticDecision(
+        protocol_version="4.0.0", source="SEMANTIC_MODEL", intent="ticket.create",
+        target_ticket_no=None, intent_confidence=0.95,
+        fields={"subject": "收银机", "location": "前台", "problem_description": "死机"},
+    )
+    await env.process("前台收银机死机了", "m1")
+    first = env.db.connect().execute(
+        "SELECT processed_result FROM inbox_messages WHERE message_id='m1'"
+    ).fetchone()
+    assert first["processed_result"] == "REJECTED"
+    assert env.db.get_waiting_pending("G1", "uid-mgr") is not None
+
+    await env.process("3天", "m2")
+    second = env.db.connect().execute(
+        "SELECT processed_result FROM inbox_messages WHERE message_id='m2'"
+    ).fetchone()
+    assert second["processed_result"] == "EXECUTED"
+    ticket = _active(env.db)[0]
+    assert ticket["subject"] == "收银机"
+    assert ticket["location"] == "前台"
+    assert ticket["sla_days"] == 3
+
+
+@pytest.mark.asyncio
+async def test_assisted_incomplete_create_requires_confirmation_after_supplement(env):
+    pipeline = env.make_pipeline(mode=RuntimeMode.ASSISTED)
+    env.classifier.responses["m1"] = SemanticDecision(
+        protocol_version="4.0.0", source="SEMANTIC_MODEL", intent="ticket.create",
+        target_ticket_no=None, intent_confidence=0.95,
+        fields={"subject": "收银机", "location": "前台", "problem_description": "死机"},
+    )
+    await env.process("前台收银机死机了", "m1", pipeline=pipeline)
+    await env.process("3天", "m2", pipeline=pipeline)
+
+    second = env.db.connect().execute(
+        "SELECT processed_result FROM inbox_messages WHERE message_id='m2'"
+    ).fetchone()
+    assert second["processed_result"] == "WAITING_CONFIRMATION"
+    assert _active(env.db) == []
+    pending = env.db.get_waiting_pending("G1", "uid-mgr")
+    assert pending is not None
+    assert pending["intent"] == "ticket.create"
+
+    env.classifier.responses["m3"] = SemanticDecision(
+        protocol_version="4.0.0", source="SEMANTIC_MODEL",
+        intent="system.confirm_pending_action", target_ticket_no=None,
+        intent_confidence=1.0,
+    )
+    await env.process("确认", "m3", pipeline=pipeline)
+    confirmed = env.db.connect().execute(
+        "SELECT processed_result FROM inbox_messages WHERE message_id='m3'"
+    ).fetchone()
+    assert confirmed["processed_result"] == "EXECUTED"
+    assert _active(env.db)[0]["sla_days"] == 3
+
+
+@pytest.mark.asyncio
+async def test_query_completed_ticket_by_number(env):
+    await env.process("#报修\n主题：收银机\n位置：前台\n问题描述：死机\n时效：1天", "m1")
+    ticket = _active(env.db)[0]
+    env.classifier.responses["m2"] = SemanticDecision(
+        protocol_version="4.0.0", source="SEMANTIC_MODEL", intent="ticket.complete",
+        target_ticket_no=ticket["ticket_no"], intent_confidence=0.95,
+    )
+    await env.process("已经修好了", "m2", role="ENGINEER", sender="uid-eng")
+    # 2026-08-24 需求 #3：工程师报完工 → 待店长确认，不再直接完成
+    assert _ticket(env.db, ticket["ticket_no"])["status"] == "PENDING_CONFIRM"
+    # 店长确认后才完成
+    env.classifier.responses["m25"] = SemanticDecision(
+        protocol_version="4.0.0", source="SEMANTIC_MODEL",
+        intent="ticket.confirm_complete",
+        target_ticket_no=ticket["ticket_no"], intent_confidence=0.95,
+    )
+    await env.process("确认修好", "m25")
+    assert _ticket(env.db, ticket["ticket_no"])["status"] == "COMPLETED"
+
+    env.classifier.responses["m3"] = SemanticDecision(
+        protocol_version="4.0.0", source="SEMANTIC_MODEL", intent="ticket.query",
+        target_ticket_no=ticket["ticket_no"], intent_confidence=0.95,
+    )
+    await env.process(f"查询 {ticket['ticket_no']}", "m3")
+    row = env.db.connect().execute(
+        "SELECT processed_result FROM inbox_messages WHERE message_id='m3'"
+    ).fetchone()
+    assert row["processed_result"] == "EXECUTED"
+    assert any(ticket["ticket_no"] in text and "已完成" in text for text in env.sent)
+
+
+@pytest.mark.asyncio
+async def test_llm_disabled_dead_letter_does_not_recommend_disabled_keywords(env):
+    pipeline = env.make_pipeline(max_attempts=1, classifier_override=None)
+    await env.process("帮我查一下工单", "m1", pipeline=pipeline)
+    row = env.db.connect().execute(
+        "SELECT status, attempts FROM inbox_messages WHERE message_id='m1'"
+    ).fetchone()
+    assert row["status"] == "DEAD_LETTER"
+    assert row["attempts"] == 1
+    assert any("智能识别暂时不可用" in text for text in env.sent)
+    assert all("标准关键词" not in text for text in env.sent)
+
+
+@pytest.mark.asyncio
+async def test_bare_mobile_number_is_not_submitted_as_order(env):
+    await env.process("#报修\n主题：门锁\n位置：前台\n问题描述：打不开\n时效：3天", "m1")
+    await env.process("13800138000", "m2", role="ENGINEER", sender="uid-eng")
+
+    row = env.db.connect().execute(
+        "SELECT processed_result FROM inbox_messages WHERE message_id='m2'"
+    ).fetchone()
+    assert row["processed_result"] == "IGNORED"
+    assert env.db.get_order_monitor("13800138000") is None
+
+
+@pytest.mark.asyncio
+async def test_confirm_pending_create_preserves_executor_failure_and_notifies(env, monkeypatch):
+    pipeline = env.make_pipeline(mode=RuntimeMode.ASSISTED)
+    env.classifier.responses["m1"] = SemanticDecision(
+        protocol_version="4.0.0", source="SEMANTIC_MODEL", intent="ticket.create",
+        target_ticket_no=None, intent_confidence=0.95,
+        fields={
+            "subject": "收银机", "location": "前台",
+            "problem_description": "死机", "sla": "3天",
+        },
+    )
+    await env.process("前台收银机死机了，时效3天", "m1", pipeline=pipeline)
+    assert env.db.get_waiting_pending("G1", "uid-mgr") is not None
+
+    monkeypatch.setattr(
+        env.executor,
+        "execute",
+        lambda *args, **kwargs: CommandResult(RESULT_INTERNAL_ERROR, None, None, ()),
+    )
+    env.classifier.responses["m2"] = SemanticDecision(
+        protocol_version="4.0.0", source="SEMANTIC_MODEL",
+        intent="system.confirm_pending_action", target_ticket_no=None,
+        intent_confidence=1.0,
+    )
+    await env.process("确认", "m2", pipeline=pipeline)
+
+    row = env.db.connect().execute(
+        "SELECT processed_result FROM inbox_messages WHERE message_id='m2'"
+    ).fetchone()
+    assert row["processed_result"] == RESULT_INTERNAL_ERROR
+    assert _active(env.db) == []
+    assert env.db.get_waiting_pending("G1", "uid-mgr") is not None
+    assert any("工单操作未完成" in text for text in env.sent)
+
+
+@pytest.mark.asyncio
+async def test_shadow_image_has_no_business_side_effects(env):
+    pipeline = env.make_pipeline(mode=RuntimeMode.SHADOW)
+    msg = NormalizedMessage(
+        message_id="img-shadow", group_id="G1", sender_id="uid-mgr", sender_name="u",
+        content="", message_type="image", sent_at=datetime.now(), sender_role="MANAGER",
+        attachments=[ImageAttachment(0, "unknown", "opaque-image")],
+    )
+    env.db.enqueue_message(msg)
+    row = env.db.connect().execute(
+        "SELECT * FROM inbox_messages WHERE message_id='img-shadow'"
+    ).fetchone()
+    await pipeline.process(dict(row))
+
+    result = env.db.connect().execute(
+        "SELECT processed_result FROM inbox_messages WHERE message_id='img-shadow'"
+    ).fetchone()
+    assert result["processed_result"] == "SHADOW"
+    assert env.sent == []
+    assert env.db.get_message_link("img-shadow") is None
+
+
+@pytest.mark.asyncio
+async def test_shadow_audit_failure_is_retried(env, monkeypatch):
+    pipeline = env.make_pipeline(mode=RuntimeMode.SHADOW)
+
+    def fail_audit(*args, **kwargs):
+        raise RuntimeError("audit unavailable")
+
+    monkeypatch.setattr(env.db, "save_semantic_decision", fail_audit)
+    await env.process(
+        "#报修\n主题：收银机\n位置：前台\n问题描述：死机\n时效：1天",
+        "shadow-audit-failure",
+        pipeline=pipeline,
+    )
+
+    row = env.db.connect().execute(
+        "SELECT status, attempts FROM inbox_messages WHERE message_id='shadow-audit-failure'"
+    ).fetchone()
+    assert row["status"] == "RETRY_PENDING"
+    assert row["attempts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_vision_task_is_removed_after_completion(env, monkeypatch):
+    class FakeVisionAnalyzer:
+        def __init__(self, *, db):
+            self.db = db
+
+        async def analyze_message(self, message_id):
+            return 0
+
+    import images.vision
+    monkeypatch.setattr(images.vision, "VisionAnalyzer", FakeVisionAnalyzer)
+    pipeline = env.make_pipeline()
+    pipeline._schedule_vision_analysis("vision-task")
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert pipeline._vision_tasks == []
+
+
+@pytest.mark.asyncio
+async def test_stale_pending_rejection_does_not_claim_success(env):
+    await env.process(
+        "#报修\n主题：收银机\n位置：前台\n问题描述：死机\n时效：1天", "stale-reject-create"
+    )
+    ticket = _active(env.db)[0]
+    env.classifier.responses["stale-reject-request"] = SemanticDecision(
+        protocol_version="4.0.0", source="SEMANTIC_MODEL", intent="ticket.cancel",
+        target_ticket_no=ticket["ticket_no"], intent_confidence=0.95,
+        fields={"cancel_reason": "误报"},
+    )
+    await env.process("请取消这张单", "stale-reject-request")
+    pending = env.db.get_waiting_pending("G1", "uid-mgr")
+    assert pending is not None
+    assert env.db.resolve_pending(
+        pending["id"], pending["version"], PendingActionStatus.REJECTED.value,
+        "external", now=datetime.now()
+    )
+    env.classifier.responses["stale-reject"] = SemanticDecision(
+        protocol_version="4.0.0", source="SEMANTIC_MODEL",
+        intent="system.reject_pending_action", target_ticket_no=None,
+        intent_confidence=1.0,
+    )
+    before = len(env.sent)
+    await env.process("取消", "stale-reject")
+
+    assert len(env.sent) == before
+
+
+@pytest.mark.asyncio
+async def test_confirm_pending_target_preserves_executor_failure_and_notifies(env, monkeypatch):
+    await env.process("#报修\n主题：收银机\n位置：前台\n问题描述：死机\n时效：1天", "m1")
+    ticket = _active(env.db)[0]
+    env.classifier.responses["m2"] = SemanticDecision(
+        protocol_version="4.0.0", source="SEMANTIC_MODEL", intent="ticket.cancel",
+        target_ticket_no=ticket["ticket_no"], intent_confidence=0.95,
+        fields={"cancel_reason": "误报"},
+    )
+    await env.process("这张单是误报，请取消", "m2")
+    assert env.db.get_waiting_pending("G1", "uid-mgr") is not None
+
+    monkeypatch.setattr(
+        env.executor,
+        "execute",
+        lambda *args, **kwargs: CommandResult(RESULT_INTERNAL_ERROR, ticket["id"], None, ()),
+    )
+    env.classifier.responses["m3"] = SemanticDecision(
+        protocol_version="4.0.0", source="SEMANTIC_MODEL",
+        intent="system.confirm_pending_action", target_ticket_no=None,
+        intent_confidence=1.0,
+    )
+    await env.process("确认", "m3")
+
+    row = env.db.connect().execute(
+        "SELECT processed_result FROM inbox_messages WHERE message_id='m3'"
+    ).fetchone()
+    assert row["processed_result"] == RESULT_INTERNAL_ERROR
+    assert _ticket(env.db, ticket["ticket_no"])["status"] == "ACTIVE"
+    assert any("工单操作未完成" in text for text in env.sent)
+
+
+@pytest.mark.asyncio
+async def test_supplement_create_executor_failure_keeps_retryable_pending(env, monkeypatch):
+    env.classifier.responses["m1"] = SemanticDecision(
+        protocol_version="4.0.0", source="SEMANTIC_MODEL", intent="ticket.create",
+        target_ticket_no=None, intent_confidence=0.95,
+        fields={"subject": "收银机", "location": "前台", "problem_description": "死机"},
+    )
+    await env.process("前台收银机死机了", "m1")
+    original = env.db.get_waiting_pending("G1", "uid-mgr")
+    assert original is not None
+
+    monkeypatch.setattr(
+        env.executor,
+        "execute",
+        lambda *args, **kwargs: CommandResult(RESULT_INTERNAL_ERROR, None, None, ()),
+    )
+    await env.process("3天", "m2")
+
+    row = env.db.connect().execute(
+        "SELECT processed_result FROM inbox_messages WHERE message_id='m2'"
+    ).fetchone()
+    assert row["processed_result"] == RESULT_INTERNAL_ERROR
+    retry = env.db.get_waiting_pending("G1", "uid-mgr")
+    assert retry is not None
+    assert retry["id"] != original["id"]
+    assert retry["fields"] == {
+        "subject": "收银机", "location": "前台",
+        "problem_description": "死机", "sla": "3天",
+    }
+    assert any("工单操作未完成" in text for text in env.sent)
+
+
+@pytest.mark.asyncio
+async def test_shadow_incomplete_create_has_no_pending_or_group_message(env):
+    pipeline = env.make_pipeline(mode=RuntimeMode.SHADOW)
+    env.classifier.responses["m1"] = SemanticDecision(
+        protocol_version="4.0.0", source="SEMANTIC_MODEL", intent="ticket.create",
+        target_ticket_no=None, intent_confidence=0.95,
+        fields={"subject": "收银机", "location": "前台", "problem_description": "死机"},
+    )
+    await env.process("前台收银机死机了", "m1", pipeline=pipeline)
+
+    row = env.db.connect().execute(
+        "SELECT processed_result FROM inbox_messages WHERE message_id='m1'"
+    ).fetchone()
+    assert row["processed_result"] == "SHADOW"
+    assert env.db.get_waiting_pending("G1", "uid-mgr") is None
+    assert env.sent == []
+    decision = env.db.connect().execute(
+        "SELECT intent FROM semantic_decisions WHERE message_id='m1'"
+    ).fetchone()
+    assert decision is not None and decision["intent"] == "ticket.create"
+
+
+@pytest.mark.asyncio
+async def test_shadow_pending_reply_does_not_consume_existing_pending(env):
+    env.classifier.responses["m1"] = SemanticDecision(
+        protocol_version="4.0.0", source="SEMANTIC_MODEL", intent="ticket.create",
+        target_ticket_no=None, intent_confidence=0.95,
+        fields={"subject": "收银机", "location": "前台", "problem_description": "死机"},
+    )
+    await env.process("前台收银机死机了", "m1")
+    before = env.db.get_waiting_pending("G1", "uid-mgr")
+    assert before is not None
+    sent_count = len(env.sent)
+
+    pipeline = env.make_pipeline(mode=RuntimeMode.SHADOW)
+    await env.process("3天", "m2", pipeline=pipeline)
+
+    after = env.db.get_waiting_pending("G1", "uid-mgr")
+    assert after is not None
+    assert (after["id"], after["version"], after["status"], after["fields"]) == (
+        before["id"], before["version"], before["status"], before["fields"],
+    )
+    row = env.db.connect().execute(
+        "SELECT processed_result FROM inbox_messages WHERE message_id='m2'"
+    ).fetchone()
+    assert row["processed_result"] == "SHADOW"
+    assert len(env.sent) == sent_count

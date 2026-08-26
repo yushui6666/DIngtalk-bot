@@ -34,7 +34,8 @@ _ORDER_NO_PLACEHOLDERS = frozenset({"无", "暂无", "稍后补", "不知道"})
 # 订单号正则（去空白后 6-64 位字母数字连字符）
 _ORDER_NO_PATTERN = re.compile(r"^[A-Za-z0-9-]{6,64}$")
 
-# 五种允许维修方式
+# 维修方式已改为工程师自由填入（原五种枚举已废弃，仅保留兼容校验，2026-08-26）
+# 保留集合仅用于历史文档/提示，不再作为强校验；自由文本只要非空即可
 _ALLOWED_REPAIR_METHODS = frozenset({
     "淘宝采购后自行维修",
     "需要供应商维修",
@@ -64,6 +65,8 @@ _FIELD_LABELS = {
     "cancel_reason": "取消原因",
     "reopen_reason": "重开原因",
     "stop_reason": "停修原因",
+    "special_case_reason": "特殊情况原因",
+    "expected_resume_at": "预计恢复时间",
 }
 
 # 工单状态枚举 → 中文
@@ -134,14 +137,17 @@ def _validate_enum(field_name: str, value: Any, action: Any) -> str | None:
 
 
 def _validate_order_no(fields: dict[str, Any]) -> str | None:
-    """淘宝采购维修方式时校验订单号。"""
-    repair_method = fields.get("repair_method", "")
-    if repair_method != "淘宝采购后自行维修":
-        return None
+    """淘宝采购维修方式时校验订单号（自由文本后按关键词匹配）。"""
+    repair_method = str(fields.get("repair_method", "") or "")
+    # 自由文本：只要包含 淘宝/采购 即视为淘宝采购场景
+    if "淘宝" not in repair_method and "采购" not in repair_method:
+        # 兼容旧枚举的精确值
+        if repair_method != "淘宝采购后自行维修":
+            return None
 
     order_no = fields.get("order_no", "")
     if not order_no:
-        return "选择'淘宝采购后自行维修'必须提供订单号"
+        return "维修方式涉及淘宝采购时必须提供订单号"
 
     # 去除空白
     cleaned = "".join(order_no.split())
@@ -281,6 +287,10 @@ def validate_decision(
         return (DecisionStatus.WAITING_CONFIRMATION, None, decision.missing_fields)
 
     fields = dict(decision.fields)
+    # 兼容：模型把 diagnosis_items 误返回为字符串 → 归一为数组
+    if "diagnosis_items" in fields and isinstance(fields["diagnosis_items"], str):
+        v = fields["diagnosis_items"].strip()
+        fields["diagnosis_items"] = [v] if v else []
 
     # 字段分发：通用 "原因" → 按 intent 映射到具体字段
     _dispatch_reason_field(fields, decision.intent)
@@ -300,7 +310,13 @@ def validate_decision(
     # 2. 必填字段
     missing = _validate_required_fields(action, fields, decision.target_ticket_no)
     for mf in missing:
-        errors.append("消息缺失，请对照标准补充，如果没有主题请标注无主题")
+        label = _field_label(mf)
+        if mf == "sla":
+            errors.append(f"缺少「{label}」，请补充：时效：1天/3天/7天（或 待商榷）")
+        elif mf == "subject":
+            errors.append(f"缺少「{label}」，请补充：主题：xxx（无主题请写 无主题）")
+        else:
+            errors.append(f"缺少「{label}」，请对照标准补充")
 
     # 3. 枚举值校验
     for fname, fvalue in fields.items():
@@ -313,17 +329,33 @@ def validate_decision(
         if "sla" not in [f for f in errors if "sla" in f]:
             errors.append(f"时效 '{fields['sla']}' 无效，可选：1天、3天、7天、待商榷")
 
-    # 维修方式枚举校验
+    # 维修方式已改为自由文本（2026-08-26）：只要非空即可，不再枚举校验
     if "repair_method" in fields:
-        if fields["repair_method"] not in _ALLOWED_REPAIR_METHODS:
+        _rm = str(fields["repair_method"] or "").strip()
+        if not _rm:
             if "repair_method" not in [f for f in errors if "repair_method" in f]:
-                errors.append(f"维修方式 '{fields['repair_method']}' 无效，可选：{('、'.join(_ALLOWED_REPAIR_METHODS))}")
+                errors.append("维修方式不能为空")
+        # 超长兜底（避免一次性贴几千字）
+        elif len(_rm) > 500:
+            errors.append("维修方式过长（请控制在500字以内）")
 
-    # 4. 订单号校验（淘宝采购特例）
-    if fields.get("repair_method") == "淘宝采购后自行维修":
+    # 4. 订单号校验（淘宝采购特例）——自由文本下按关键词匹配
+    _rm_text = str(fields.get("repair_method") or "")
+    if "淘宝" in _rm_text or "采购" in _rm_text:
         order_err = _validate_order_no(fields)
         if order_err:
             errors.append(order_err)
+
+    # 4.1 维修计划至少需要维修方式或订单号其一（避免非枚举描述被剥离后空执行，产生“订单 None”误登记）
+    if decision.intent == "ticket.repair_plan.submit":
+        has_method = bool(fields.get("repair_method") and str(fields["repair_method"]).strip())
+        raw_order = fields.get("order_no")
+        has_order = bool(raw_order is not None and str(raw_order).strip() and str(raw_order).strip().lower() not in ("none", "null", "nil"))
+        # 兼容部分模型返回 order_nos 数组（虽然白名单已过滤，但历史数据可能携带）
+        if not has_order and isinstance(fields.get("order_nos"), list):
+            has_order = any(o is not None and str(o).strip() and str(o).strip().lower() not in ("none", "null", "nil") for o in fields["order_nos"])
+        if not has_method and not has_order:
+            errors.append("请明确维修方式（工程师自由填入，如：更换喇叭、木板打孔、淘宝采购等）或提供订单号")
 
     # 5. 目标工单、群归属和状态校验
     target, target_errors = _resolve_target_candidate(decision, action, message, candidates)
