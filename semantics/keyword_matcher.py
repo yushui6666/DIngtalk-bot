@@ -31,6 +31,7 @@ _FIELD_ALIAS_MAP: dict[str, str] = {
     "停修原因": "stop_reason",
     "停止维修原因": "stop_reason",
     "原因": "reason",  # 通用 "原因"，需按 intent 再分发
+    "内容": "content",
     "完成说明": "completion_note",
     "特殊情况": "special_case_reason",
     "特殊情况原因": "special_case_reason",

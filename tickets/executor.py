@@ -71,10 +71,13 @@ class TicketCommandExecutor:
         pending_version: int | None = None,
     ) -> CommandResult:
         """执行命令（需在事务外调用，内部自行开启短事务）。"""
+        # 幂等键含目标工单：多选归属（2026-08-27）对同一 pending 逐张执行，
+        # 缺目标维度会让第二张起命中「已 APPLIED」捷径被静默跳过。
         dedupe_key = (
             f"direct:{command.message_id}"
             if pending_action_id is None
             else f"confirm:{pending_action_id}:{pending_version}"
+                 f":{command.target_ticket_id if command.target_ticket_id is not None else 'none'}"
         )
         # 已有执行记录：只有 APPLIED 才能返回成功，失败/未完成不能伪装成成功。
         existing_status = self._db.execution_status(dedupe_key)
@@ -200,7 +203,9 @@ class TicketCommandExecutor:
         ticket = self._require_ticket(command)
         if ticket is None:
             return CommandResult(RESULT_INTERNAL_ERROR, None, None, ())
-        content = (message.content if message else "") or command.fields.get("content", "")
+        # 字段优先于消息原文：归属选择流程中 message 是用户的编号回复，
+        # 待补内容来自创建 pending 时的原始决策草稿（2026-08-27）
+        content = command.fields.get("content", "") or (message.content if message else "") or ""
         new_desc = (ticket["problem_description"] or "")
         if content:
             new_desc = f"{new_desc}\n{content}".strip()
@@ -490,8 +495,10 @@ class TicketCommandExecutor:
     ) -> None:
         """关闭生效中的特殊情况暂停；活动工单按实际暂停时长顺延截止时间。
 
-        只顺延 ACTIVE 且有时效的工单：已发生的超时（ACTIVE_OVERDUE）不冲销
-        （用户决策 2026-08-25 的同一原则）。待商榷（无截止）只留痕不动时间。
+        只顺延 ACTIVE 且有时效的工单：已发生的超时（ACTIVE_OVERDUE）不冲销。
+        待商榷（无截止）只留痕不动时间。响应 SLA 的等待起点平移由
+        db.close_active_special_case 统一停表结算（2026-08-27：暂停段不计入），
+        本处专注截止时钟；暂停前已流逝的等待不冲销原则不变。
         """
         closed = self._db.close_active_special_case(ticket_id, resume_message_id, resumed_at)
         if closed is None:

@@ -337,6 +337,125 @@ async def test_number_reply_selects_nth_candidate_locally(env):
     assert ctx2 == act[0]["id"]
 
 
+# ── 多候选归属问询：短编号识别与一次多选（规格 docs/superpowers/specs/
+#    2026-08-27-multi-ticket-assign-design.md，用户决策 2026-08-27）──
+
+
+async def _three_tickets_then_clarify(env):
+    """建三张不同主题工单并发一条多候选补充 → 触发归属问询 pending。"""
+    await env.process("#报修\n主题：古堡秘事\n位置：一楼\n问题描述：门锁失灵\n时效：1天", "c1")
+    await env.process("#报修\n主题：勇者斯巴达\n位置：二楼\n问题描述：灯不亮\n时效：3天", "c2")
+    await env.process("#报修\n主题：财阀继承人\n位置：三楼\n问题描述：音效断续\n时效：7天", "c3")
+    act = _active(env.db)
+    assert len(act) == 3
+    status = await env.process("#补充 内容：追加检查记录MARK", "m-cl")
+    row = env.db.connect().execute(
+        "SELECT processed_result FROM inbox_messages WHERE message_id='m-cl'").fetchone()
+    assert row["processed_result"] == "CLARIFY"
+    assert any("多张工单" in s for s in env.sent)
+    return [t["ticket_no"] for t in act]
+
+
+def _stub_select(env, message_id: str, target_no: str | None) -> None:
+    """模拟真实模型行为：把用户消息里的编号原样回显进 ticket_no。"""
+    env.classifier.responses[message_id] = SemanticDecision(
+        protocol_version="4.0.0", source="SEMANTIC_MODEL",
+        intent="ticket.select", target_ticket_no=target_no,
+        intent_confidence=0.9,
+    )
+
+
+@pytest.mark.asyncio
+async def test_short_suffix_select_assigns_correct_ticket(env):
+    """归属问询后回裸短编号「00X」→ 归到尾缀对应那张（截图事故回归）。"""
+    nos = await _three_tickets_then_clarify(env)
+    third = nos[2]
+    _stub_select(env, "m-sel", third.rsplit("-", 1)[-1])  # 用户写「003」而非全编号
+    status = await env.process(third.rsplit("-", 1)[-1], "m-sel")
+    row = env.db.connect().execute(
+        "SELECT processed_result FROM inbox_messages WHERE message_id='m-sel'").fetchone()
+    assert row["processed_result"] == "EXECUTED"
+    t3 = _ticket(env.db, third)
+    assert "追加检查记录MARK" in t3["problem_description"]
+    for other in nos[:2]:
+        assert "追加检查记录MARK" not in _ticket(env.db, other)["problem_description"]
+    assert env.db.get_waiting_pending("G1", "uid-mgr") is None
+
+
+@pytest.mark.asyncio
+async def test_multi_short_codes_assign_all(env):
+    """一次回多个编号「00X 00Y」→ 两张各落地一次（用户决策：支持读取多个）。"""
+    nos = await _three_tickets_then_clarify(env)
+    reply = f"{nos[0].rsplit('-', 1)[-1]} {nos[2].rsplit('-', 1)[-1]}"
+    _stub_select(env, "m-sel", reply)
+    await env.process(reply, "m-sel")
+    got = [n for n in nos if "追加检查记录MARK" in _ticket(env.db, n)["problem_description"]]
+    assert got == [nos[0], nos[2]]
+    assert env.db.get_waiting_pending("G1", "uid-mgr") is None
+
+
+@pytest.mark.asyncio
+async def test_unknown_token_rejects_whole_batch_atomically(env):
+    """混入无法识别的编号 → 整批拒绝零落地，指出坏段；pending 存活可重选。"""
+    nos = await _three_tickets_then_clarify(env)
+    reply = f"{nos[0].rsplit('-', 1)[-1]} 999"
+    _stub_select(env, "m-sel", reply)
+    status = await env.process(reply, "m-sel")
+    row = env.db.connect().execute(
+        "SELECT processed_result FROM inbox_messages WHERE message_id='m-sel'").fetchone()
+    assert row["processed_result"] == "REJECTED"
+    for n in nos:
+        assert "追加检查记录MARK" not in _ticket(env.db, n)["problem_description"]
+    assert any("没有找到对应工单" in s and "999" in s for s in env.sent)
+    assert env.db.get_waiting_pending("G1", "uid-mgr") is not None
+    # 重选合法单号仍可成功
+    second = nos[1]
+    _stub_select(env, "m-sel2", second.rsplit("-", 1)[-1])
+    await env.process(second.rsplit("-", 1)[-1], "m-sel2")
+    assert "追加检查记录MARK" in _ticket(env.db, second)["problem_description"]
+
+
+@pytest.mark.asyncio
+async def test_version_conflict_rejects_batch_before_executing(env):
+    """其中一张候选版本已被推进 → 整体拒绝、两张都不执行。"""
+    nos = await _three_tickets_then_clarify(env)
+    # 预检前先显式编号补充第 0 张，使其版本离开快照值
+    await env.process(f"#补充 内容：预检前变动\n工单编号:{nos[0]}", "m-bump")
+    reply = f"{nos[0].rsplit('-', 1)[-1]} {nos[1].rsplit('-', 1)[-1]}"
+    _stub_select(env, "m-sel", reply)
+    status = await env.process(reply, "m-sel")
+    row = env.db.connect().execute(
+        "SELECT processed_result FROM inbox_messages WHERE message_id='m-sel'").fetchone()
+    assert row["processed_result"] == "REJECTED"
+    assert any("状态已更新" in s for s in env.sent)
+    t1 = _ticket(env.db, nos[1])
+    assert "追加检查记录MARK" not in t1["problem_description"]
+    assert "追加检查记录MARK" not in _ticket(env.db, nos[0])["problem_description"]
+    assert env.db.get_waiting_pending("G1", "uid-mgr") is not None
+
+
+@pytest.mark.asyncio
+async def test_index_tokens_in_one_message_assign_both(env):
+    """回展示序号「1 3」→ 第 1 与第 3 张各落地（序号兜底语义）。"""
+    nos = await _three_tickets_then_clarify(env)
+    _stub_select(env, "m-sel", "1 3")
+    await env.process("1 3", "m-sel")
+    got = [n for n in nos if "追加检查记录MARK" in _ticket(env.db, n)["problem_description"]]
+    assert got == [nos[0], nos[2]]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_tokens_dedupe_single_apply(env):
+    """重复编号「00X 00X」去重，目标单只落一次。"""
+    nos = await _three_tickets_then_clarify(env)
+    dup = nos[0].rsplit("-", 1)[-1]
+    reply = f"{dup} {dup}"
+    _stub_select(env, "m-sel", reply)
+    await env.process(reply, "m-sel")
+    first = _ticket(env.db, nos[0])
+    assert first["problem_description"].count("追加检查记录MARK") == 1
+
+
 @pytest.mark.asyncio
 async def test_model_cancel_still_requires_confirmation(env):
     """取消/重开仍保持确认策略（高危误操作防护）。"""

@@ -511,43 +511,123 @@ class MessageProcessingPipeline:
             return self._assign_pending_target(item, msg, pending, decision)
         return None
 
+    def _resolve_assign_targets(
+        self, pending: Any, decision: SemanticDecision, msg: NormalizedMessage
+    ) -> tuple[list[int], list[str]]:
+        """归属问询目标解析（2026-08-27 设计 A）。
+
+        分层：① 全编号精确（兼容现状）→ ② 消息原文纯数字 token：
+        尾缀唯一匹配优先（去前导零对齐末段），其次按展示序号解释。
+        返回 (目标 id 列表去重保序, 无法识别的 token 列表)；调用方保证原子性。
+        """
+        no_map: dict[str, int] = {}
+        suffix_counts: dict[str, int] = {}
+        suffix_owner: dict[str, int] = {}
+        valid_ids: list[int] = []
+        for tid in pending.candidate_ticket_ids:
+            t = self._db.get_ticket(tid)
+            if t is None:
+                continue
+            valid_ids.append(tid)
+            no_map[t["ticket_no"]] = tid
+            suf = t["ticket_no"].rsplit("-", 1)[-1].lstrip("0")
+            if suf:
+                suffix_counts[suf] = suffix_counts.get(suf, 0) + 1
+                suffix_owner[suf] = tid
+
+        target_no = decision.target_ticket_no
+        if target_no and target_no in no_map:
+            return [no_map[target_no]], []
+
+        targets: list[int] = []
+        unknown: list[str] = []
+        seen: set[int] = set()
+        # 仅收独立的数字段：字母数字混排串（订单号/资产号）不算编号
+        for tok in re.findall(r"(?<![A-Za-z0-9])(\d{1,4})(?![A-Za-z0-9])", msg.content or ""):
+            suf = tok.lstrip("0")
+            tid: int | None = None
+            if suf and suffix_counts.get(suf) == 1:
+                tid = suffix_owner[suf]
+            elif 1 <= int(tok) <= len(valid_ids):
+                tid = valid_ids[int(tok) - 1]
+            if tid is None or tid in seen:
+                if tid is None and tok not in unknown:
+                    unknown.append(tok)
+                continue
+            seen.add(tid)
+            targets.append(tid)
+        return targets, unknown
+
     def _assign_pending_target(
         self, item: dict[str, Any], msg: NormalizedMessage, pending: Any, decision: SemanticDecision
     ) -> str:
         """归属问询后用户选择工单：把待归属动作落到所选工单执行。"""
-        target_id = None
-        target_no = decision.target_ticket_no
-        if target_no:
-            target_id = next(
-                (tid for tid in pending.candidate_ticket_ids
-                 if self._db.get_ticket(tid)["ticket_no"] == target_no),
-                None,
+        targets, unknown = self._resolve_assign_targets(pending, decision, msg)
+        if not targets or unknown:
+            # 原子拒绝：任一编号无法识别即整批不执行（不猜），pending 存活可重选
+            hint = f"\n无法识别：{'、'.join(unknown)}" if unknown else ""
+            self._notifier.send_group_now(
+                msg.group_id, f"没有找到对应工单，请重新选择。{hint}", message_id=msg.message_id
             )
-        if target_id is None:
+            return self._complete(item, msg, "REJECTED")
+
+        # 执行前逐张预检版本与状态允许集；任一冲突整体拒绝（镜像单目标语义）
+        action_def = self._protocol.get_action(pending.intent)
+        allowed_states = tuple(action_def.allowed_ticket_states) if action_def else ()
+        checked: list[tuple[int, dict[str, Any]]] = []
+        for tid in targets:
+            ticket = self._db.get_ticket(tid)
+            if ticket is None:
+                continue
+            expected = pending.expected_ticket_versions.get(tid)
+            if (
+                (expected is not None and ticket["version"] != expected)
+                or (allowed_states and ticket["status"] not in allowed_states)
+            ):
+                self._notifier.send_group_now(
+                    msg.group_id, "该工单状态已更新，请重新选择。", message_id=msg.message_id
+                )
+                return self._complete(item, msg, "REJECTED")
+            checked.append((tid, ticket))
+        if not checked:
             self._notifier.send_group_now(
                 msg.group_id, "没有找到对应工单，请重新选择。", message_id=msg.message_id
             )
             return self._complete(item, msg, "REJECTED")
-        ticket = self._db.get_ticket(target_id)
-        expected = pending.expected_ticket_versions.get(target_id)
-        if expected is not None and ticket["version"] != expected:
-            self._notifier.send_group_now(
-                msg.group_id, "该工单状态已更新，请重新选择。", message_id=msg.message_id
-            )
-            return self._complete(item, msg, "REJECTED")
+        targets = [tid for tid, _ in checked]
+
         if not self._pending.resolve(
             pending.id, pending.version, PendingActionStatus.CONFIRMED,
             msg.message_id, now=datetime.now()
         ):
             return self._complete(item, msg, "REJECTED")
 
-        cmd = _command_from_pending(msg, pending, target_id)
-        result = self._executor.execute(
-            cmd, message=msg, pending_action_id=pending.id, pending_version=pending.version
+        # 多选（2026-08-27 用户决策「一次读取多个」）：逐张执行同一待归属动作；
+        # 成功保持静默（用户裁定不加成功回执），失败沿用既有兜底文案一次。
+        results: list[Any] = []
+        cmds: list[Any] = []
+        for tid in targets:
+            cmd = _command_from_pending(msg, pending, tid)
+            results.append(
+                self._executor.execute(
+                    cmd, message=msg, pending_action_id=pending.id, pending_version=pending.version
+                )
+            )
+            cmds.append(cmd)
+        failures = [r for r in results if r.status != RESULT_OK]
+        for cmd, result in zip(cmds, results):
+            if result.status == RESULT_OK:
+                self._handle_order_submitted(cmd, result, msg)
+        if not failures:
+            return self._complete_execution_result(item, msg, results[0])
+        first_fail = failures[0].status
+        self._complete(item, msg, "EXECUTED" if len(failures) < len(results) else first_fail)
+        self._notifier.send_group_now(
+            msg.group_id,
+            f"工单操作未完成（{first_fail}），请重试或联系管理员。",
+            message_id=msg.message_id,
         )
-        if result.status == RESULT_OK:
-            self._handle_order_submitted(cmd, result, msg)
-        return self._complete_execution_result(item, msg, result)
+        return _INBOX_COMPLETED
 
     def _confirm_pending(self, item: dict[str, Any], msg: NormalizedMessage, pending: Any) -> str:
         """确认待执行动作：校验工单版本未变后执行。"""
