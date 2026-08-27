@@ -23,6 +23,7 @@ diagnosis_versions/repair_method_versions/timeout_cycles/notification_deliveries
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -518,6 +519,14 @@ class Database:
 
         幂等：仅当两列仍带 notnull 约束时重建一次表；数据原样保留。
         新库（按 _SCHEMA 建表）本身已可空，直接跳过。
+
+        复制策略（2026-08-26 回归修复）：按旧表 PRAGMA 动态推导全量列清单，
+        不再手工枚举——此前硬编码 29 列曾漏掉 completed_confirm_by/at，
+        重建即把完工确认留痕静默清零且不可恢复。两道防线：
+
+        - 迁移动手前先校验所有列名为纯标识符（防拼接面异常）；
+        - 新表建成后与旧表做差集，发现未收录的列立刻抛错并原样保留
+          ``tickets_old`` 供人工处置（绝不静默丢列）。
         """
         cols = {
             row["name"]: row["notnull"]
@@ -525,6 +534,18 @@ class Database:
         }
         if cols.get("initial_deadline_at") != 1 or cols.get("current_deadline_at") != 1:
             return  # 已是可空（或列不存在），无需重建
+        old_columns = [
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(tickets)").fetchall()
+        ]
+        bad_identifiers = [
+            c for c in old_columns
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", c)
+        ]
+        if bad_identifiers:
+            raise RuntimeError(
+                f"[migrate] tickets 存在非法列名，拒绝拼入复制语句: {bad_identifiers}"
+            )
         conn.executescript(
             """
             DROP INDEX IF EXISTS idx_tickets_group_status;
@@ -534,26 +555,27 @@ class Database:
             """
         )
         conn.executescript(_SCHEMA)
+        new_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(tickets)").fetchall()
+        }
+        uncovered = [c for c in old_columns if c not in new_columns]
+        if uncovered:
+            # 防线 2：新表未覆盖的旧列拒绝静默丢弃；完整旧数据保留在
+            # tickets_old，供人工核对处置后再手动清理。
+            raise RuntimeError(
+                f"[migrate] tickets 新表结构缺少旧表列，已中止复制: {uncovered}"
+                "（完整旧数据保留在 tickets_old）"
+            )
+        column_sql = ", ".join(old_columns)
         conn.execute(
-            """INSERT INTO tickets
-                   (id, ticket_no, group_id, store_name, reporter_id, subject, location,
-                    problem_description, sla_days, initial_deadline_at, current_deadline_at,
-                    current_timeout_cycle_id, status, waiting_side, waiting_since,
-                    current_responsibility_cycle_id, last_business_event_at,
-                    last_business_message_id, version, cancelled_at, cancelled_by,
-                    cancel_reason, stopped_at, stopped_by, stop_reason,
-                    duplicate_of_ticket_id, reopen_count, created_at, closed_at)
-                   SELECT id, ticket_no, group_id, store_name, reporter_id, subject, location,
-                    problem_description, sla_days, initial_deadline_at, current_deadline_at,
-                    current_timeout_cycle_id, status, waiting_side, waiting_since,
-                    current_responsibility_cycle_id, last_business_event_at,
-                    last_business_message_id, version, cancelled_at, cancelled_by,
-                    cancel_reason, stopped_at, stopped_by, stop_reason,
-                    duplicate_of_ticket_id, reopen_count, created_at, closed_at
-                   FROM tickets_old"""
+            f"INSERT INTO tickets ({column_sql}) SELECT {column_sql} FROM tickets_old"
         )
         conn.execute("DROP TABLE tickets_old")
-        logger.info("tickets deadline 列已改为可空（待商榷工单支持）")
+        logger.info(
+            "tickets deadline 列已改为可空（待商榷工单支持）；列清单动态复制 count=%d",
+            len(old_columns),
+        )
 
     def close(self) -> None:
         if self._conn is not None:
@@ -1407,18 +1429,33 @@ class Database:
             " WHERE id=? AND resumed_at IS NULL",
             (resumed_at, resume_message_id, row["id"]),
         )
+        # 真·停表（2026-08-27）：把本次暂停时长从等待起点中剔除——
+        # 只顺延早于暂停开始的等待周期（业务动作恢复时重置的新周期不动）；
+        # 停表不清零：暂停前已累计的等待原样保留。
+        try:
+            started = datetime.strptime(row["submitted_at"], "%Y-%m-%d %H:%M:%S")
+            ended = datetime.strptime(resumed_at, "%Y-%m-%d %H:%M:%S")
+            delta_seconds = int((ended - started).total_seconds())
+        except (TypeError, ValueError):
+            delta_seconds = 0
+        ticket_row = self._conn.execute(
+            "SELECT waiting_since FROM tickets WHERE id=?", (ticket_id,)
+        ).fetchone()
+        if (
+            delta_seconds > 0
+            and ticket_row is not None
+            and ticket_row["waiting_since"]
+            and ticket_row["waiting_since"] <= row["submitted_at"]
+        ):
+            new_since = (
+                datetime.strptime(ticket_row["waiting_since"], "%Y-%m-%d %H:%M:%S")
+                + timedelta(seconds=delta_seconds)
+            ).strftime("%Y-%m-%d %H:%M:%S")
+            self._conn.execute(
+                "UPDATE tickets SET waiting_since=? WHERE id=? AND waiting_since=?",
+                (new_since, ticket_id, ticket_row["waiting_since"]),
+            )
         return row
-
-    def list_active_special_cases(self) -> list[dict[str, Any]]:
-        """活动工单上生效中的暂停（含工单号/群号，供到期跟进提醒）。"""
-        rows = self._conn.execute(
-            """SELECT s.*, t.ticket_no, t.group_id
-                 FROM ticket_special_cases s JOIN tickets t ON t.id = s.ticket_id
-                WHERE s.resumed_at IS NULL
-                  AND t.status IN ('ACTIVE', 'ACTIVE_OVERDUE', 'PENDING_CONFIRM')
-                ORDER BY s.id"""
-        ).fetchall()
-        return [dict(r) for r in rows]
 
     def set_ticket_deadline(self, ticket_id: int, new_deadline_at: str) -> bool:
         """直接写截止时间（暂停顺延用，已在业务事务内，不做 CAS）。"""
@@ -1673,13 +1710,22 @@ class Database:
     def list_unsynced_orders(self) -> list[dict[str, Any]]:
         """尚未确认写入共享表的订单（xlsx_synced=0），按登记先后排序。
 
-        排除 order_id 为空的占位行（无单号无法写共享表）。
+        查询侧镜像写入侧清洗（pipeline._handle_order_submitted 的
+        none/null/nil/空串 规则，2026-08-26 回归加固）：此类占位形态是历史
+        幽灵行（order_id='None'）的特征，永远不允许进入补同步队列——否则
+        scan_shared_table_resync 会按周期反复尝试把垃圾行写进共享表。
         """
         rows = self.connect().execute(
             "SELECT * FROM order_monitor"
             " WHERE xlsx_synced=0 AND order_id IS NOT NULL ORDER BY created_at, rowid"
         ).fetchall()
-        return [dict(r) for r in rows]
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            oid = str(r["order_id"] or "").strip()
+            if not oid or oid.lower() in ("none", "null", "nil"):
+                continue  # 幽灵占位行：留在库中备查，但不入补同步队列
+            out.append(dict(r))
+        return out
 
     def list_received_active_tickets(self) -> list[dict[str, Any]]:
         """有订单已签收、且仍处于活动态的工单（签收后每日提醒直至完成）。

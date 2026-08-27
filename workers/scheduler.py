@@ -64,7 +64,6 @@ class SchedulerWorker:
         self.scan_sla_reminders(now)
         self.scan_received_reminders(now)
         self.scan_response_sla(now)
-        self.scan_special_case_follow_up(now)
         self.scan_order_status()
         self.scan_aitable_sync(now)
         self.scan_shared_table_resync(now)
@@ -285,43 +284,6 @@ class SchedulerWorker:
             if self._notifier.send_deduped_group(ticket["group_id"], text, dedupe_key=dedupe):
                 sent += 1
                 logger.info("签收后每日提醒 ticket=%s date=%s", ticket["ticket_no"], date_key)
-        return sent
-
-    # ─────────────────── 特殊情况暂停跟进（2026-08-26） ───────────────────
-    def scan_special_case_follow_up(self, now: datetime) -> int:
-        """特殊情况暂停到期未恢复 → 每日跟进提醒一次。
-
-        触发条件（满足其一）：
-        - 预计恢复时间已解析且已过期；
-        - 预计时间无法解析（如「尽快」）且暂停已超过 24 小时。
-
-        按 (暂停实例, 日期) 去重，一天一次；不自动恢复、不自动关闭，
-        恢复只能由实际业务动作或再次声明触发。
-        """
-        now_str = now.strftime("%Y-%m-%d %H:%M:%S")
-        date_key = now.strftime("%Y-%m-%d")
-        fallback_line = (now - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
-        sent = 0
-        for case in self._db.list_active_special_cases():
-            if case["expected_resume_at"]:
-                if case["expected_resume_at"] > now_str:
-                    continue
-                due_text = f"预计恢复 {case['expected_resume_at']} 已过"
-            elif case["submitted_at"] and case["submitted_at"] <= fallback_line:
-                due_text = "已暂停超过 24 小时"
-            else:
-                continue
-            dedupe = f"spc_daily:{case['id']}:{date_key}"
-            text = (
-                f"⏸️ 工单 {case['ticket_no']} 的特殊情况（{case['reason']}）{due_text}，"
-                f"请回复进展；已恢复处理则无需操作，时效将自动继续计时。"
-            )
-            if self._notifier.send_deduped_group(case["group_id"], text, dedupe_key=dedupe):
-                sent += 1
-                logger.info(
-                    "特殊情况跟进提醒 ticket=%s case=%s due_text=%s",
-                    case["ticket_no"], case["id"], due_text,
-                )
         return sent
 
     # ─────────────────── 响应 SLA（2026-08-24 需求 #4） ───────────────────

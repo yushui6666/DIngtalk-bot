@@ -409,3 +409,63 @@ async def test_scheduler_resyncs_failed_shared_rows(env, monkeypatch):
 
     # 已全部同步后再扫：无事可做
     assert env.worker.scan_shared_table_resync(datetime.now()) == 0
+
+
+# ─────────────────── 幽灵占位行查询侧防护（2026-08-26 回归） ───────────────────
+
+
+async def _insert_monitor_directly(env, order_id: str, ticket: dict) -> None:
+    """绕过清洗直插 order_monitor：精确复刻历史幽灵行落库形态（旧 bug 写入口）。"""
+    env.db.upsert_order_monitor(
+        order_id=order_id, ticket_id=ticket["id"],
+        store=ticket["store_name"], ticket_no=ticket["ticket_no"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_unsynced_orders_excludes_ghost_placeholder_rows(env):
+    """'' / None / null / nil 占位变体（含空白、大小写）不得进入补同步队列。
+
+    回归背景：历史上 str(None)="None" 以 TEXT 主键落库，成为幽灵行；
+    写入侧三层清洗已于 2026-08-26 补齐，本测试锁死查询侧最后一道闸。
+    """
+    ticket = await _create_ticket(env)
+    for oid in ("", "None", " null ", "NIL"):
+        await _insert_monitor_directly(env, oid, ticket)
+    await _insert_monitor_directly(env, "TB-GHOST-0001", ticket)
+
+    pending = [r["order_id"] for r in env.db.list_unsynced_orders()]
+    assert pending == ["TB-GHOST-0001"]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_resync_never_touches_ghost_placeholder_rows(env, monkeypatch):
+    """调度器对纯幽灵行待队列：零写盘、零标记翻转；合法订单正常补同步不受牵连。"""
+    import reconciling.order_store as order_store
+
+    ticket = await _create_ticket(env)
+    for oid in ("", "None"):
+        await _insert_monitor_directly(env, oid, ticket)
+
+    calls: list[tuple[tuple, dict]] = []
+    monkeypatch.setattr(
+        order_store, "append_order_row",
+        lambda *a, **kw: calls.append((a, kw)),
+    )
+
+    fixed = env.worker.scan_shared_table_resync(datetime.now())
+    assert fixed == 0
+    assert calls == []  # 幽灵行一次都不应被尝试写入共享表
+
+    # 正例对照：加入合法订单后同一路径立即恢复正常补同步
+    await _insert_monitor_directly(env, "TB-GHOST-0002", ticket)
+    fixed = env.worker.scan_shared_table_resync(datetime.now())
+    assert fixed == 1
+    assert len(calls) == 1 and calls[0][1].get("order_id") == "TB-GHOST-0002"
+    assert env.db.get_order_monitor("TB-GHOST-0002")["xlsx_synced"] == 1
+
+    # 脏行原样保留在库中（不动数据，仅不入队），仍是 xlsx_synced=0
+    raw_dirty = env.db.connect().execute(
+        "SELECT COUNT(*) FROM order_monitor WHERE xlsx_synced=0"
+    ).fetchone()[0]
+    assert raw_dirty == 2

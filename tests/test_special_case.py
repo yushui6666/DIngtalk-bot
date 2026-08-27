@@ -180,29 +180,23 @@ def test_response_sla_paused_while_special_case_active(tmp_path):
 # ───────────────────────── 3. 预计恢复到期每日跟进 ─────────────────────────
 
 
-def test_special_case_follow_up_daily_reminder(tmp_path):
+def test_special_case_follow_up_disabled(tmp_path):
+    """每日跟进已按用户决策彻底停用（2026-08-27）：预计恢复过期、
+    无法解析且超 24h、多日多次扫描，均不再发任何跟进提醒；
+    暂停期间彻底静默，恢复只能由业务动作或再次声明触发。"""
     db, notifier, worker = _sc_env(tmp_path)
-    tid = _insert_bare_ticket(db)
     now = datetime.now()
-    _add_case(db, tid, started=now - timedelta(hours=3),
-              expected=now - timedelta(hours=1))
+    tid_due = _insert_bare_ticket(db)
+    _add_case(db, tid_due, msg_id="spc-due",
+              started=now - timedelta(hours=3), expected=now - timedelta(hours=1))
+    tid_stale = _insert_bare_ticket(db)
+    _add_case(db, tid_stale, msg_id="spc-stale",
+              started=now - timedelta(hours=30), expected=None)
     worker.scan(now)
-    follow_ups = [t for _, t in notifier.calls if "特殊情况" in t and "预计恢复" in t]
-    assert len(follow_ups) == 1
-
-    worker.scan(now + timedelta(minutes=10))  # 同日重复扫描不重发
-    follow_ups = [t for _, t in notifier.calls if "特殊情况" in t and "预计恢复" in t]
-    assert len(follow_ups) == 1
-
-
-def test_special_case_no_reminder_before_expected_time(tmp_path):
-    db, notifier, worker = _sc_env(tmp_path)
-    tid = _insert_bare_ticket(db)
-    now = datetime.now()
-    _add_case(db, tid, started=now - timedelta(minutes=5),
-              expected=now + timedelta(hours=2))
-    worker.scan(now)
-    assert not any("特殊情况" in t and "预计恢复" in t for _, t in notifier.calls)
+    worker.scan(now + timedelta(minutes=10))
+    worker.scan(now + timedelta(days=2))
+    banned = ("请回复进展", "已暂停超过")
+    assert not any(b in t for _, t in notifier.calls for b in banned)
 
 
 # ───────────────────────── 4. 再次声明 = 续期 ─────────────────────────
@@ -304,3 +298,48 @@ def test_parse_resume_time_variants():
     # 解析不了 → None
     assert parse_resume_time("尽快", now) is None
     assert parse_resume_time("", now) is None
+
+
+# ───────────────── 7. 真·停表：暂停段不计入响应 SLA（2026-08-27） ─────────────────
+
+
+def test_pause_freezes_response_sla_accrual(tmp_path):
+    """停表语义：等待 30min 后暂停 70min，解除时有效等待仍≈30min，
+    解除瞬间不得补发提醒；真实等待满 1h 才发。"""
+    db, notifier, worker = _sc_env(tmp_path)
+    tid = _insert_bare_ticket(db)
+    now = datetime.now()
+    _set_waiting(db, tid, "ENGINEER_SIDE", now - timedelta(minutes=100))
+    _add_case(db, tid, started=now - timedelta(minutes=70),
+              expected=now + timedelta(hours=1))
+    worker.scan(now)
+    assert not any("无工程师响应" in t for _, t in notifier.calls)  # 暂停中豁免
+
+    closed = db.close_active_special_case(tid, "msg-resume", now.strftime(_FMT))
+    assert closed is not None
+    ws = db.connect().execute(
+        "SELECT waiting_since FROM tickets WHERE id=?", (tid,)
+    ).fetchone()["waiting_since"]
+    assert ws == (now - timedelta(minutes=30)).strftime(_FMT)  # 停表后移 70min
+
+    worker.scan(now)
+    assert not any("无工程师响应" in t for _, t in notifier.calls)
+
+    worker.scan(now + timedelta(minutes=31))
+    assert any("无工程师响应" in t for _, t in notifier.calls)
+
+
+def test_close_keeps_waiting_when_cycle_started_after_pause(tmp_path):
+    """守卫：等待周期起于暂停开始之后（恢复动作重置的新周期）→ 不顺延原值。
+    （当前实现本就不顺延；此用例钉住边界防未来回归。）"""
+    db, _, _ = _sc_env(tmp_path)
+    tid = _insert_bare_ticket(db)
+    now = datetime.now()
+    _add_case(db, tid, started=now - timedelta(hours=2))
+    fresh = (now - timedelta(minutes=10)).strftime(_FMT)
+    _set_waiting(db, tid, "ENGINEER_SIDE", datetime.strptime(fresh, _FMT))
+    db.close_active_special_case(tid, "msg-resume", now.strftime(_FMT))
+    ws = db.connect().execute(
+        "SELECT waiting_since FROM tickets WHERE id=?", (tid,)
+    ).fetchone()["waiting_since"]
+    assert ws == fresh
