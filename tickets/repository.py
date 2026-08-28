@@ -12,7 +12,7 @@ from typing import Any
 
 from db import Database
 from logger import get_logger
-from models import TICKET_ACTIVE
+from models import TICKET_ACTIVE, TICKET_NEGOTIATING
 from semantics.types import TicketCandidate
 
 logger = get_logger(__name__)
@@ -57,7 +57,7 @@ class TicketRepository:
             "sla_days": sla_days,
             "initial_deadline_at": deadline,
             "current_deadline_at": deadline,
-            "status": TICKET_ACTIVE,
+            "status": TICKET_NEGOTIATING if sla_days == 0 else TICKET_ACTIVE,
         })
         logger.info("创建工单 id=%s ticket_no=%s group=%s", ticket_id, ticket_no, group["group_id"])
         return ticket_id

@@ -66,6 +66,7 @@ _FIELD_LABELS = {
     "reopen_reason": "重开原因",
     "stop_reason": "停修原因",
     "special_case_reason": "特殊情况原因",
+    "negotiate_reason": "待商榷原因",
     "expected_resume_at": "预计恢复时间",
 }
 
@@ -73,6 +74,8 @@ _FIELD_LABELS = {
 _TICKET_STATUS_LABELS = {
     "ACTIVE": "进行中",
     "ACTIVE_OVERDUE": "已超时",
+    "PENDING_CONFIRM": "待店长确认",
+    "PENDING_NEGOTIATION": "待商榷",
     "COMPLETED": "已完成",
     "CANCELLED": "已取消",
     "STOPPED": "已停修",

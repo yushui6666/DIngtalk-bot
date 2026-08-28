@@ -82,7 +82,7 @@ _EXTRA_ACTIONS: list[dict[str, Any]] = [
         "explicit_keywords": ["#取消工单"],
         "semantic_enabled": True,
         "allowed_roles": ["MANAGER"],
-        "allowed_ticket_states": ["ACTIVE", "ACTIVE_OVERDUE", "PENDING_CONFIRM"],
+        "allowed_ticket_states": ["ACTIVE", "ACTIVE_OVERDUE", "PENDING_CONFIRM", "PENDING_NEGOTIATION"],
         "required_fields": ["ticket_no", "cancel_reason"],
         "optional_fields": [],
         "target_ticket_policy": "MUST_EXIST",
@@ -112,7 +112,7 @@ _EXTRA_ACTIONS: list[dict[str, Any]] = [
         "explicit_keywords": ["#停止维修"],
         "semantic_enabled": True,
         "allowed_roles": ["LEADER"],
-        "allowed_ticket_states": ["ACTIVE", "ACTIVE_OVERDUE", "PENDING_CONFIRM"],
+        "allowed_ticket_states": ["ACTIVE", "ACTIVE_OVERDUE", "PENDING_CONFIRM", "PENDING_NEGOTIATION"],
         "required_fields": ["ticket_no", "stop_reason"],
         "optional_fields": [],
         "target_ticket_policy": "MUST_EXIST",
@@ -352,6 +352,50 @@ _EXTRA_ACTIONS: list[dict[str, Any]] = [
         "executor": "submit_special_case",
         "field_definitions": {},
     },
+    # ── 2026-08-28 待商榷（时效待定，完全暂停）──
+    {
+        "intent_id": "ticket.negotiate.submit",
+        "display_name": "设为待商榷",
+        "explicit_keywords": ["#待商榷", "#改待商榷"],
+        "semantic_enabled": True,
+        "allowed_roles": ["MANAGER", "ENGINEER"],
+        "allowed_ticket_states": ["ACTIVE", "ACTIVE_OVERDUE"],
+        "required_fields": ["negotiate_reason"],
+        "optional_fields": ["ticket_no"],
+        "target_ticket_policy": "MUST_EXIST",
+        "risk_level": "NORMAL",
+        "confirmation_policy": {
+            "EXPLICIT_KEYWORD": "REQUIRED",
+            "SEMANTIC_MODEL": "ALWAYS",
+        },
+        "positive_examples": [
+            "#待商榷 客户要求改方案",
+            "改成待商榷吧，方案没定",
+            "时效待定，先待商榷",
+            "这个单先待商榷，方案还没定",
+            "时效先待商榷，等客户确认",
+            "改成待商榷吧，价格没谈拢",
+            "先待商榷，等领导定方案",
+            "这个工单待商榷，暂时不设时效",
+            "业务表达1：#待商榷 客户要求改方案",
+            "业务表达2：改成待商榷吧，方案没定",
+        ],
+        "negative_examples": [
+            "待商榷怎么填",
+            "待商榷怎么操作",
+            "是不是要待商榷",
+            "待商榷的流程是怎样的",
+            "待商榷是什么意思",
+            "边界反例1：待商榷怎么填",
+            "边界反例2：待商榷怎么操作",
+            "边界反例3：是不是要待商榷",
+            "边界反例4：待商榷的流程是怎样的",
+            "边界反例5：待商榷是什么意思",
+        ],
+        "confirmation_template": "",
+        "executor": "submit_negotiate",
+        "field_definitions": {},
+    },
     # ── 2026-08-24 店长确认完工流（需求 #3）──
     {
         "intent_id": "ticket.confirm_complete",
@@ -470,6 +514,7 @@ _FIELD_DICTIONARY: dict[str, dict[str, Any]] = {
     "content": {"type": "text", "aliases": ["内容", "补充说明"]},
     "special_case_reason": {"type": "text", "aliases": ["特殊情况", "特殊情况原因"]},
     "expected_resume_at": {"type": "text", "aliases": ["预计恢复", "预计恢复时间"]},
+    "negotiate_reason": {"type": "text", "aliases": ["待商榷原因", "商榷原因"]},
 }
 
 
@@ -757,8 +802,11 @@ def _ticket_states_for(intent_id: str) -> list[str]:
     if intent_id in ("ticket.create",):
         return []
     elif intent_id in ("ticket.cancel", "ticket.stop"):
-        # 2026-08-24：待店长确认工单仍可取消/停修
-        return ["ACTIVE", "ACTIVE_OVERDUE", "PENDING_CONFIRM"]
+        # 2026-08-24：待店长确认工单仍可取消/停修；2026-08-28：待商榷亦可
+        return ["ACTIVE", "ACTIVE_OVERDUE", "PENDING_CONFIRM", "PENDING_NEGOTIATION"]
+    elif intent_id in ("ticket.complete",):
+        # 2026-08-28：待商榷可直接完工
+        return ["ACTIVE", "ACTIVE_OVERDUE", "PENDING_NEGOTIATION"]
     elif intent_id in ("ticket.reopen",):
         return ["COMPLETED", "CANCELLED", "STOPPED"]
     elif intent_id in ("ticket.add_detail",):

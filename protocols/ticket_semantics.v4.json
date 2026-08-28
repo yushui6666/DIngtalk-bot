@@ -74,7 +74,8 @@
    "allowed_ticket_states": [
     "ACTIVE",
     "ACTIVE_OVERDUE",
-    "PENDING_CONFIRM"
+    "PENDING_CONFIRM",
+    "PENDING_NEGOTIATION"
    ],
    "required_fields": [
     "ticket_no",
@@ -128,7 +129,8 @@
    ],
    "allowed_ticket_states": [
     "ACTIVE",
-    "ACTIVE_OVERDUE"
+    "ACTIVE_OVERDUE",
+    "PENDING_NEGOTIATION"
    ],
    "required_fields": [],
    "optional_fields": [],
@@ -355,6 +357,62 @@
      "required": false
     }
    }
+  },
+  {
+   "intent_id": "ticket.negotiate.submit",
+   "display_name": "设为待商榷",
+   "explicit_keywords": [
+    "#待商榷",
+    "#改待商榷"
+   ],
+   "semantic_enabled": true,
+   "allowed_roles": [
+    "MANAGER",
+    "ENGINEER"
+   ],
+   "allowed_ticket_states": [
+    "ACTIVE",
+    "ACTIVE_OVERDUE"
+   ],
+   "required_fields": [
+    "negotiate_reason"
+   ],
+   "optional_fields": [
+    "ticket_no"
+   ],
+   "target_ticket_policy": "MUST_EXIST",
+   "risk_level": "NORMAL",
+   "confirmation_policy": {
+    "EXPLICIT_KEYWORD": "REQUIRED",
+    "SEMANTIC_MODEL": "ALWAYS"
+   },
+   "positive_examples": [
+    "#待商榷 客户要求改方案",
+    "改成待商榷吧，方案没定",
+    "时效待定，先待商榷",
+    "这个单先待商榷，方案还没定",
+    "时效先待商榷，等客户确认",
+    "改成待商榷吧，价格没谈拢",
+    "先待商榷，等领导定方案",
+    "这个工单待商榷，暂时不设时效",
+    "业务表达1：#待商榷 客户要求改方案",
+    "业务表达2：改成待商榷吧，方案没定"
+   ],
+   "negative_examples": [
+    "待商榷怎么填",
+    "待商榷怎么操作",
+    "是不是要待商榷",
+    "待商榷的流程是怎样的",
+    "待商榷是什么意思",
+    "边界反例1：待商榷怎么填",
+    "边界反例2：待商榷怎么操作",
+    "边界反例3：是不是要待商榷",
+    "边界反例4：待商榷的流程是怎样的",
+    "边界反例5：待商榷是什么意思"
+   ],
+   "confirmation_template": "",
+   "executor": "submit_negotiate",
+   "field_definitions": {}
   },
   {
    "intent_id": "ticket.query",
@@ -690,7 +748,8 @@
    "allowed_ticket_states": [
     "ACTIVE",
     "ACTIVE_OVERDUE",
-    "PENDING_CONFIRM"
+    "PENDING_CONFIRM",
+    "PENDING_NEGOTIATION"
    ],
    "required_fields": [
     "ticket_no",
@@ -1107,6 +1166,13 @@
    "aliases": [
     "预计恢复",
     "预计恢复时间"
+   ]
+  },
+  "negotiate_reason": {
+   "type": "text",
+   "aliases": [
+    "待商榷原因",
+    "商榷原因"
    ]
   }
  },

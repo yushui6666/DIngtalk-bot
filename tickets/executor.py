@@ -19,6 +19,7 @@ from models import (
     TICKET_ACTIVE,
     TICKET_CANCELLED,
     TICKET_COMPLETED,
+    TICKET_NEGOTIATING,
     TICKET_PENDING_CONFIRM,
     TICKET_STOPPED,
     NormalizedMessage,
@@ -43,6 +44,7 @@ _READONLY_INTENTS = frozenset({"ticket.query", "ticket.select", "ticket.cancel",
 # 不参与 finalize 通用责任方切换的意图（自行处理或无需切换）
 _NO_SWITCH_INTENTS = frozenset({
     "ticket.confirm_complete", "ticket.complete",
+    "ticket.negotiate.submit",
     # 特殊情况声明（2026-08-26）：等待方答复「暂时无法推进」，责任仍在原方；
     # 暂停期间响应 SLA 由调度器豁免，不需要把责任切给对面。
     "ticket.special_case.submit",
@@ -490,7 +492,41 @@ class TicketCommandExecutor:
         self._finalize(command, updated, LINK_EXECUTED, message, payload_text=receipt or None)
         return CommandResult(RESULT_OK, updated["id"], updated["version"], ())
 
+    def _execute_negotiate(
+        self, command: ValidatedCommand, message: NormalizedMessage | None
+    ) -> CommandResult:
+        """设为待商榷（2026-08-28）：ACTIVE/OVERDUE → PENDING_NEGOTIATION，需确认。
+
+        清空 deadline / sla_days，冻结 waiting_since（完全暂停），切状态后版本+1。
+        """
+        ticket = self._require_ticket(command)
+        if ticket is None:
+            return CommandResult(RESULT_INTERNAL_ERROR, None, None, ())
+        if ticket["status"] not in (TICKET_ACTIVE, "ACTIVE_OVERDUE"):
+            return CommandResult(RESULT_REJECTED, ticket["id"], ticket["version"], ())
+        reason = str(command.fields.get("negotiate_reason") or "").strip()
+        if not reason:
+            return CommandResult(RESULT_REJECTED, ticket["id"], ticket["version"], ())
+        # 乐观锁切状态
+        ok = self._db.update_ticket_cas(
+            ticket["id"], ticket["version"], "status=?, current_deadline_at=?, sla_days=?",
+            (TICKET_NEGOTIATING, None, 0),
+        )
+        if not ok:
+            return CommandResult(RESULT_REJECTED, ticket["id"], ticket["version"], ())
+        # 记录业务经办 message
+        self._db.add_ticket_message(
+            command.message_id, ticket["id"], command.actor_id, command.actor_role,
+            f"设为待商榷：{reason}", "text",
+            self._now(),
+        )
+        updated = self._db.get_ticket(ticket["id"])
+        receipt = f"⏸️ 工单 {updated['ticket_no']} 已设为“待商榷”（原因：{reason}）。期间时效与催办暂停，完工后可直接完成。"
+        self._finalize(command, updated, LINK_EXECUTED, message, payload_text=receipt)
+        return CommandResult(RESULT_OK, updated["id"], updated["version"], ())
+
     def _close_and_true_up_special_case(
+
         self, ticket_id: int, resume_message_id: str, resumed_at: str
     ) -> None:
         """关闭生效中的特殊情况暂停；活动工单按实际暂停时长顺延截止时间。
@@ -594,6 +630,7 @@ _HANDLERS: dict[str, Callable[..., CommandResult]] = {
     "ticket.repair_plan.submit": lambda self, c, m: self._execute_submit_version(c, m, kind="repair"),
     "ticket.timeout_reason.submit": lambda self, c, m: self._execute_submit_version(c, m, kind="timeout"),
     "ticket.special_case.submit": TicketCommandExecutor._execute_special_case,
+    "ticket.negotiate.submit": TicketCommandExecutor._execute_negotiate,
     "ticket.complete": TicketCommandExecutor._execute_complete,
     "ticket.confirm_complete": TicketCommandExecutor._execute_confirm_complete,
     "ticket.reject_complete": TicketCommandExecutor._execute_reject_complete,

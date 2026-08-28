@@ -38,6 +38,7 @@ def role_label(role: str) -> str:
 TICKET_ACTIVE = "ACTIVE"
 TICKET_OVERDUE = "ACTIVE_OVERDUE"
 TICKET_PENDING_CONFIRM = "PENDING_CONFIRM"  # 工程师已报完工，待店长确认（2026-08-24）
+TICKET_NEGOTIATING = "PENDING_NEGOTIATION"  # 待商榷（2026-08-28）：时效待定，完全暂停
 TICKET_COMPLETED = "COMPLETED"
 TICKET_CANCELLED = "CANCELLED"  # v4.0: #取消工单 或 AI 取消确认后的终态
 TICKET_STOPPED = "STOPPED"      # v4.2: #停止维修 终态（工程负责人决定不再维修，可重开）

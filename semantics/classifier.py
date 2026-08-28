@@ -79,6 +79,7 @@ _BUSINESS_ACTION_CUES: dict[str, tuple[str, ...]] = {
     "ticket.cancel": ("取消工单",),
     "ticket.stop": ("停止维修", "停修", "不再维修"),
     "ticket.reopen": ("重开工单",),
+    "ticket.negotiate.submit": ("待商榷", "改待商榷", "时效待定"),
 }
 
 
@@ -332,10 +333,13 @@ class SemanticClassifier:
             ticket_no = str(ticket_no).strip() or None
         candidate_nos = {candidate.ticket_no for candidate in candidates}
         if ticket_no and ticket_no not in candidate_nos:
-            # 重开/查询可指向已完结工单（不在活动候选内），保留编号交由校验层用全量候选判定
-            if intent in ("ticket.reopen", "ticket.query"):
+            # 重开/查询可指向已完结工单（不在活动候选内），保留编号交由校验层用全量候选判定；
+            # 选单（2026-08-28）保留用户所写短编号原样（如「007」），由 pipeline
+            # _handle_select 做尾缀解析或明确拒绝——此前被过滤为 None 后会静默
+            # 落入单候选兜底，导致「007号单」被切到无关工单还回「✅ 已切换」。
+            if intent in ("ticket.reopen", "ticket.query", "ticket.select"):
                 logger.debug(
-                    "保留候选集合外目标 ticket_no=%s intent=%s message_id=%s（交由校验层判定）",
+                    "保留候选集合外目标 ticket_no=%s intent=%s message_id=%s（交由校验层/选单解析判定）",
                     ticket_no,
                     intent,
                     message.message_id,
@@ -494,6 +498,7 @@ def _build_payload(
         + "\n\n规则：\n"
         "- 只抽取用户明确表达的信息\n"
         "- 不要猜测位置、设备名称、时效等；时效(sla)只有用户明确说 1天/3天/7天/待商榷 时才填，否则留空让校验层提示补充\n"
+        "- 用户说“改成待商榷/暂时不定/先待商榷吧/时效待定/改待商榷” → ticket.negotiate.submit，negotiate_reason 为原因原文（至少1字）\n"
         "- 字段键名使用英文字段名；用户可能写“1主题:xxx、2位置:xxx、3问题描述:xxx;可选:时效(7天)”或“#报修”前缀，编号/顿号/括号均为分隔装饰，请自动剥离后识别主题/位置/问题描述/时效，“#”为可选前缀，不影响意图\n"
         "- 报修时字段拆分：subject=场馆/空间名（如「博物馆奇妙夜」），"
         "location=更具体的发生位置（如「里面的那间房子」「一楼大厅」），"
@@ -503,13 +508,13 @@ def _build_payload(
         "- 如果消息没有明确报修/诊断/完成等意图，返回 chat.ignore\n"
         "- 同一消息包含两个或更多业务动作时，即使后一个动作是未来或条件动作，也返回 system.clarify\n"
         "- 用户从候选工单中明确选择编号或序号时，返回 ticket.select\n"
-        "- 用户回复裸短编号（如「003」）或多个编号/序号（如「003 007」「1 3」）时同样返回 ticket.select：ticket_no 字段原样保留用户所写文本（含空格与位数），不要猜测展开为完整编号、也不要截取部分\n"
+        "- 用户回复裸短编号（如「003」）或多个编号/序号（如「003 007」「1 3」）时同样返回 ticket.select：ticket_no 字段原样保留用户所写文本（含空格与位数），不要猜测展开为完整编号、也不要截取部分；候选列表中没有对应编号时同样原样返回，绝不允许改用候选中的编号顶替\n"
         "- 用户说「第N个/第一个/第二个」指候选工单列表的第 N 项：据此确定目标工单，把该项的完整工单编号填入 ticket_no 字段，并返回用户实际意图（如「第一个完成了」→ ticket.complete 且 ticket_no=第1项编号）\n"
         "- 报修时若用户是在补充上一条未完成报修的缺失字段（如上一条因缺少时效/主题等被提示补充，且历史中最近一条系统消息明确要求补充），可结合历史中最近的未完成报修内容补齐缺失字段，但不得编造历史中不存在的字段；其他情况下当前报修的主题/位置/问题描述/时效必须来自当前消息原文，缺失字段留空让校验提示补充；历史还可用于理解「第N个」「它」等指代\n"
         "- 工程师使用‘可能’‘应该是’等保留表达给出具体故障判断时，仍可返回 ticket.diagnosis.submit，但应降低置信度\n"
         "- 疑问句但明确描述故障（含设备/位置/问题）时，仍返回 ticket.create；纯笼统询问、否定句返回 chat.ignore\n"
         "- 用户表示问题已解决、恢复正常、可以使用（如「正常了」「搞定了」「弄好了」「没问题了」「修好了」）→ 返回 ticket.complete\n"
-        "- 用户回复「特殊情况：原因；预计恢复：时间」（通常是对系统一小时提醒的答复，声明等待到货/等待工程师上门/等待门店或客户配合/等待第三方等外部依赖暂时无法推进）→ 返回 ticket.special_case.submit：special_case_reason=原因原文，expected_resume_at=恢复时间原文（保留「一小时内」「明天下午」等用户原话，不要换算）\n"
+        "- 用户回复「特殊情况：原因；预计恢复：时间」（通常是对系统一小时提醒的答复，声明等待到货/等待工程师上门/等待门店或客户配合/等待第三方等外部依赖暂时无法推进）→ 返回 ticket.special_case.submit：special_case_reason=原因原文，expected_resume_at=恢复时间原文（保留「一小时内」「明天下午」等用户原话，不要换算）；消息若以短编号开头（如「007今日胶未干」），该编号可能指其他工单：把编号放入 ticket_no 字段、不要并入 special_case_reason（原因从编号之后提取）\n"
         "- 取消工单(ticket.cancel)、重开工单(ticket.reopen) 只在用户非常确定时才返回\n"
     )
 

@@ -15,7 +15,7 @@ ALLOWED_EXECUTORS = frozenset({
     "cancel_ticket", "stop_ticket", "reopen_ticket", "query_ticket", "select_ticket",
     "clarify", "confirm_pending_action", "reject_pending_action",
     "correct_pending_action", "ignore_message",
-    "submit_special_case",
+    "submit_special_case", "submit_negotiate",
 })
 
 # 意图 → 中文可读文案（用户看到的提示/回执用，避免出现 system.clarify 这类英文 ID）
@@ -26,6 +26,7 @@ INTENT_LABELS: dict[str, str] = {
     "ticket.repair_plan.submit": "提交维修方式/订单号",
     "ticket.timeout_reason.submit": "提交超时原因",
     "ticket.special_case.submit": "登记特殊情况",
+    "ticket.negotiate.submit": "设为待商榷",
     "ticket.complete": "报完工",
     "ticket.confirm_complete": "店长确认完成",
     "ticket.reject_complete": "店长反馈未修好",
@@ -52,6 +53,7 @@ TICKET_STATUS_LABELS: dict[str, str] = {
     "ACTIVE": "处理中",
     "ACTIVE_OVERDUE": "已超时",
     "PENDING_CONFIRM": "待店长确认",
+    "PENDING_NEGOTIATION": "待商榷",
     "COMPLETED": "已完成",
     "CANCELLED": "已取消",
     "STOPPED": "已停修",
@@ -147,6 +149,9 @@ def reply_text(intent: str, ticket: dict[str, Any] | None, fields: dict[str, Any
         if expected:
             line += f"｜预计恢复：{expected}"
         return line + "。暂停期间时效与催办暂停，恢复处理后继续计时。"
+    if intent == "ticket.negotiate.submit" and ticket:
+        reason = str(fields.get("negotiate_reason") or "").strip() or "未说明"
+        return f"⏸️ 工单 {ticket_no} 已设为“待商榷”（原因：{reason}）。期间时效与催办暂停，完工后可直接完成。"
     if intent in SILENT_INTENTS:
         return ""
     if intent == "ticket.query" and ticket:

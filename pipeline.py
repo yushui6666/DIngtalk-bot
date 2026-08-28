@@ -29,7 +29,12 @@ from models import (
 from ordering import parse_naive_dt
 from routing.pending_actions import PendingActionService
 from routing.ticket_contexts import TicketContextStore
-from routing.ticket_router import TicketRouter, RoutingConfig
+from routing.ticket_router import (
+    LINK_CONTEXT,
+    LINK_SINGLE,
+    TicketRouter,
+    RoutingConfig,
+)
 from semantics.keyword_matcher import match_keyword
 from semantics.protocol_loader import TicketProtocol
 from semantics.types import (
@@ -280,6 +285,41 @@ class MessageProcessingPipeline:
             msg.message_id, route.decision.value, route.link_type,
             route.target_ticket_id, len(route.candidate_ticket_ids),
         )
+
+        # ── 特殊情况归属守卫（2026-08-28）：消息开头显式提到无法解析的短编号
+        #    （如「007今日胶未干…」而本群无 …-007）时，禁止静默落到选单上下文/
+        #    单候选工单登记暂停——错误停表完全静默且会冻结无关工单，宁可多问一轮。
+        #    显式编号/引用/尾缀命中等已被印证的归属不受影响。──
+        if (
+            route.decision == RouteDecision.ROUTED
+            and decision.intent == "ticket.special_case.submit"
+            and route.link_type in (LINK_CONTEXT, LINK_SINGLE)
+        ):
+            unresolved_no = _leading_unresolved_no(msg.content, candidates)
+            if unresolved_no is not None:
+                target_c = next(
+                    (c for c in candidates if c.ticket_id == route.target_ticket_id), None
+                )
+                active_list = "、".join(c.ticket_no for c in candidates)
+                suffix_hint = (
+                    target_c.ticket_no.rsplit("-", 1)[-1] if target_c is not None else "工单号"
+                )
+                text = (
+                    f"⚠️ 消息开头提到编号「{unresolved_no}」，但当前群活动工单中没有对应编号"
+                    f"（{active_list}）。为避免记错工单，这条特殊情况未登记。"
+                )
+                text += self._explain_non_active_reference(msg, unresolved_no)
+                text += (
+                    f"如确认记到该工单，请带上工单号重发，"
+                    f"如「{suffix_hint} 特殊情况：原因；预计恢复：时间」。"
+                )
+                self._notifier.send_group_now(
+                    msg.group_id, text, message_id=msg.message_id
+                )
+                logger.info(
+                    "特殊情况前导编号未解析 msg=%s no=%s", msg.message_id, unresolved_no
+                )
+                return self._complete(item, msg, "REJECTED")
 
         if route.decision == RouteDecision.CLARIFY:
             return self._create_clarify_pending(item, msg, decision, candidates, route)
@@ -816,17 +856,64 @@ class MessageProcessingPipeline:
         )
         return self._complete(item, msg, "WAITING_CONFIRMATION")
 
+    def _explain_non_active_reference(self, msg: NormalizedMessage, hint: str) -> str:
+        """编号指向本群非活动工单（待确认/终态）时返回解释性文案，否则空串。
+
+        编号解析失败常因目标不在活动候选集（如待店长确认、已完结），
+        与其笼统报「没有找到」，不如直接说明该编号对应哪张单、什么状态
+        （2026-08-28：事故「财阀的007号单」指向待店长确认工单）。
+        """
+        from tickets.commands import ticket_status_label as _status_label
+
+        target, _status = _resolve_ticket_reference(
+            hint, self._repo.snapshot_group_tickets(msg.group_id)
+        )
+        if target is None or target.status in ("ACTIVE", "ACTIVE_OVERDUE"):
+            return ""
+        return (
+            f"编号对应工单 {target.ticket_no}（{_status_label(target.status)}），"
+            f"不是当前可操作的活动工单。"
+        )
+
     def _handle_select(
         self, item: dict[str, Any], msg: NormalizedMessage, decision: SemanticDecision, candidates: list[Any]
     ) -> str:
         target = None
+        resolve_status = "NOT_FOUND"
         if decision.target_ticket_no:
-            target = next((c for c in candidates if c.ticket_no == decision.target_ticket_no), None)
-        elif len(candidates) == 1:
+            # 编号解析（2026-08-28）：全编号精确 → 短编号尾缀唯一匹配。
+            # 此前仅精确匹配，「007号单」即使本群存在 …-007 也会误报没有找到。
+            target, resolve_status = _resolve_ticket_reference(
+                decision.target_ticket_no, candidates
+            )
+            # 编号印证守卫（2026-08-28）：模型可能违反提示词把用户短编号
+            # （如「007号单」）展开成候选完整编号（如 …-005）。消息存在显式
+            # 工单指代且与解析目标尾号不符 → 按「没有找到」拒绝，绝不静默切错。
+            mentioned = _mentioned_ticket_numbers(msg.content)
+            if (
+                target is not None
+                and mentioned
+                and target.ticket_no.rsplit("-", 1)[-1].lstrip("0") not in mentioned
+            ):
+                logger.info(
+                    "选单编号印证失败 msg=%s mentioned=%s target=%s",
+                    msg.message_id, sorted(mentioned), target.ticket_no,
+                )
+                target, resolve_status = None, "MISMATCH"
+        elif len(candidates) == 1 and not _mentioned_ticket_numbers(msg.content):
+            # 单候选兜底仅适用于无编号指代（如「就切到这张」）；消息显式提到
+            # 「XX号单」但模型未返回编号 → 不猜测，明确拒绝（2026-08-28）。
             target = candidates[0]
         if target is None:
+            text = (
+                "该编号匹配多张工单，请提供完整工单编号。"
+                if resolve_status == "AMBIGUOUS"
+                else "没有找到该工单，请检查编号。"
+            )
+            if decision.target_ticket_no:
+                text += self._explain_non_active_reference(msg, decision.target_ticket_no)
             self._notifier.send_group_now(
-                msg.group_id, "没有找到该工单，请检查编号。", message_id=msg.message_id
+                msg.group_id, text, message_id=msg.message_id
             )
             return self._complete(item, msg, "REJECTED")
         self._context.select(
@@ -848,10 +935,19 @@ class MessageProcessingPipeline:
     ) -> str:
         """查询工单：无编号时列出当前活动工单。"""
         if decision.target_ticket_no:
-            target = next((c for c in candidates if c.ticket_no == decision.target_ticket_no), None)
+            # 编号解析与选单一致（2026-08-28）：全编号精确 → 尾缀唯一，
+            # 「查007号单」可命中已完结的 …-007，不再误报没有找到。
+            target, resolve_status = _resolve_ticket_reference(
+                decision.target_ticket_no, candidates
+            )
             if target is None:
+                text = (
+                    "该编号匹配多张工单，请提供完整工单编号。"
+                    if resolve_status == "AMBIGUOUS"
+                    else "没有找到该工单，请检查编号。"
+                )
                 self._notifier.send_group_now(
-                    msg.group_id, "没有找到该工单，请检查编号。", message_id=msg.message_id
+                    msg.group_id, text, message_id=msg.message_id
                 )
                 return self._complete(item, msg, "REJECTED")
             ticket = self._db.get_ticket(target.ticket_id)
@@ -1216,6 +1312,64 @@ def _extract_diagnosis_text(content: str, order_numbers: list[str]) -> str | Non
 
 _CHINESE_DIGITS = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
                    "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+
+
+def _resolve_ticket_reference(hint: str, candidates: list[Any]) -> tuple[Any | None, str]:
+    """工单编号引用解析（2026-08-28）：① 全编号精确 → ② 短编号尾缀唯一匹配。
+
+    返回 (候选, 状态)，状态 ∈ EXACT / SUFFIX / AMBIGUOUS / NOT_FOUND。
+    尾缀规则与 TicketRouter._route_by_suffix 对齐：工单号形如 店名-主题-时效-005，
+    取末段去前导零对齐，数字至少 2 位。
+    """
+    hint = (hint or "").strip()
+    exact = next((c for c in candidates if c.ticket_no == hint), None)
+    if exact is not None:
+        return exact, "EXACT"
+    for num in re.findall(r"\d{2,}", hint):
+        normalized = num.lstrip("0")
+        matches = [
+            c for c in candidates
+            if c.ticket_no.rsplit("-", 1)[-1].lstrip("0") == normalized
+        ]
+        if len(matches) == 1:
+            return matches[0], "SUFFIX"
+        if len(matches) > 1:
+            return None, "AMBIGUOUS"
+    return None, "NOT_FOUND"
+
+
+_TICKET_REF_RE = re.compile(r"(\d{2,4})(?!\s*号?机)[^，。,、；;\dA-Za-z]{0,4}工?单")
+
+
+def _mentioned_ticket_numbers(content: str) -> set[str]:
+    """消息中「编号+单」形态的显式工单指代（如「007号单」「007那张单」）。
+
+    返回去前导零后的编号集合。仅匹配紧跟「单」结尾的 2-4 位数字段；
+    「12号机」等设备指代不算工单编号。用于选单编号印证与单候选兜底防误切
+    （2026-08-28：事故「财阀的007号单」被静默切到 …-005）。
+    """
+    return {m.lstrip("0") for m in _TICKET_REF_RE.findall(content or "")}
+
+
+_LEADING_NO_RE = re.compile(r"^\s*(?:工单|#|第|-)?\s*(\d{2,4})(?![\dA-Za-z-])")
+
+
+def _leading_unresolved_no(content: str, candidates: list[Any]) -> str | None:
+    """消息开头显式短编号未指向任何候选工单时返回该编号（特殊情况归属守卫）。
+
+    「独立」= 后面不紧跟数字/字母/连字符，排除订单号、资产号等长串；
+    「007今日胶未干…」而本群无尾缀 007 的活动工单 → 返回 "007"。
+    """
+    m = _LEADING_NO_RE.match(content or "")
+    if not m:
+        return None
+    normalized = m.group(1).lstrip("0")
+    if not normalized:
+        return None
+    for c in candidates:
+        if c.ticket_no.rsplit("-", 1)[-1].lstrip("0") == normalized:
+            return None
+    return m.group(1)
 
 
 def _extract_selection_number(content: str) -> int | None:

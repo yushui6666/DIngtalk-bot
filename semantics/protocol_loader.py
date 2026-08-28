@@ -35,7 +35,7 @@ ALLOWED_EXECUTORS = frozenset({
     "cancel_ticket", "stop_ticket", "reopen_ticket", "query_ticket", "select_ticket",
     "clarify", "confirm_pending_action", "reject_pending_action",
     "correct_pending_action", "ignore_message",
-    "submit_special_case",
+    "submit_special_case", "submit_negotiate",
 })
 
 ALLOWED_ROLES = frozenset({"MANAGER", "ENGINEER", "LEADER", "OTHER", "SYSTEM"})
