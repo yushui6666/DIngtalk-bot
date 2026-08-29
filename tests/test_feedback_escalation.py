@@ -21,6 +21,7 @@ from tickets.repository import TicketRepository
 
 from qa.advisor import TicketAdvisor
 from qa.kb_store import KBStore
+from test_pipeline_integration import FakeClassifier
 
 GROUP = {"group_id": "G1", "store_name": "测试店",
          "manager_ids": ["mgr"], "engineer_ids": ["eng"]}
@@ -75,7 +76,9 @@ class TestEscalationAndAutoRecord:
             router=TicketRouter(), context=TicketContextStore(db),
             pending=PendingActionService(db),
             executor=TicketCommandExecutor(db, TicketRepository(db)),
-            notifier=notifier, advisor=advisor, mode=RuntimeMode.PRODUCTION,
+            notifier=notifier, advisor=advisor,
+            classifier=FakeClassifier(protocol=protocol),
+            mode=RuntimeMode.PRODUCTION,
         )
 
         async def process(text, message_id, role="MANAGER", sender="mgr"):

@@ -2,7 +2,7 @@
 
 用法::
 
-    python scripts/export_tickets.py                    # 导出全部工单到 data/tickets_export.csv
+    python scripts/export_tickets.py                    # 按时间戳导出到 data/
     python scripts/export_tickets.py --group 测试群      # 只导某个群
     python scripts/export_tickets.py -o /tmp/工单.csv    # 指定输出路径
 """
@@ -26,6 +26,7 @@ from db import Database  # noqa: E402
 _STATUS_LABELS = {
     "ACTIVE": "进行中",
     "ACTIVE_OVERDUE": "已超时",
+    "PENDING_CONFIRM": "待店长确认",
     "COMPLETED": "已完成",
     "CANCELLED": "已取消",
     "STOPPED": "已停修",
@@ -111,7 +112,10 @@ def main() -> None:
     parser.add_argument("-o", "--output", type=Path, default=None, help="输出文件路径")
     args = parser.parse_args()
 
-    output = args.output or (BASE_DIR / "data" / f"tickets_export_{datetime.now():%Y%m%d_%H%M%S}.csv")
+    output = args.output or (
+        BASE_DIR / "data" / f"tickets_export_{datetime.now():%Y%m%d_%H%M%S}.csv"
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
     export(args.group, output)
 
 

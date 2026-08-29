@@ -29,6 +29,58 @@ GROUP = {"group_id": "G1", "store_name": "测试店",
          "manager_ids": ["mgr"], "engineer_ids": ["eng"], "other_member_ids": ["staff"]}
 
 
+class _OrderFakeClassifier:
+    """模拟全AI对 # 语法及裸订单号的识别，供订单流测试使用。"""
+    def __init__(self, protocol):
+        self.protocol = protocol
+
+    async def classify(self, message, candidates=None, pending_action=None, history=None):
+        from semantics.types import SemanticDecision
+        text = (message.content or "").strip()
+        if text.startswith("#") and self.protocol is not None:
+            try:
+                from semantics.keyword_matcher import match_keyword as _mk
+                kw = _mk(text, self.protocol)
+                if kw is not None:
+                    return SemanticDecision(
+                        protocol_version=kw.protocol_version, source="SEMANTIC_MODEL",
+                        intent=kw.intent, target_ticket_no=kw.target_ticket_no,
+                        intent_confidence=0.95, fields=dict(kw.fields),
+                        missing_fields=kw.missing_fields, evidence=kw.evidence,
+                    )
+            except Exception:
+                pass
+        # 裸订单号 / 诊断+订单 混合
+        import re as _re
+        order_tokens = _re.findall(r"(?<![A-Za-z0-9-])[A-Za-z0-9-]{6,64}(?![A-Za-z0-9-])", text or "")
+        orders = [
+            t for t in order_tokens
+            if sum(ch.isdigit() for ch in t) >= 6
+            and not _re.fullmatch(r"1[3-9]\d{9}", t)
+        ]
+        if orders:
+            # 只要含订单号且候选中或消息明显像订单提交，就视为 repair_plan.submit
+            if any(kw in text for kw in ("订单", "单号", "采购", "TB-", "估计", "铰链", "坏")) or len(orders) >= 1:
+                # 提取诊断（若有）
+                fields: dict = {"order_no": orders[0], "order_nos": orders}
+                # 简易诊断提取：含铰链/故障等则加入
+                if any(cue in text for cue in ("铰链", "判断", "估计", "应该", "可能", "坏", "故障")):
+                    # 取整句作为诊断
+                    diag = text
+                    for o in orders:
+                        diag = diag.replace(o, " ")
+                    diag = diag.strip()
+                    if diag:
+                        fields["diagnosis_items"] = [diag[:100]]
+                return SemanticDecision(
+                    protocol_version="4.0.0", source="SEMANTIC_MODEL",
+                    intent="ticket.repair_plan.submit", target_ticket_no=None,
+                    intent_confidence=0.9, fields=fields,
+                )
+        return SemanticDecision(protocol_version="4.0.0", source="SEMANTIC_MODEL",
+                                 intent="chat.ignore", target_ticket_no=None, intent_confidence=0.0)
+
+
 @pytest.fixture()
 def env(tmp_path, monkeypatch):
     db = Database(tmp_path / "order.db")
@@ -44,10 +96,11 @@ def env(tmp_path, monkeypatch):
     executor = TicketCommandExecutor(db, repo)
     sent: list[str] = []
     notifier = Notifier(db, lambda target, text: sent.append(text))
+    classifier = _OrderFakeClassifier(protocol)
     pipeline = MessageProcessingPipeline(
         db=db, repo=repo, protocol=protocol, router=router, context=context,
         pending=pending, executor=executor, notifier=notifier,
-        classifier=None, mode=RuntimeMode.PRODUCTION,
+        classifier=classifier, mode=RuntimeMode.PRODUCTION,
     )
     worker = SchedulerWorker(db=db, notifier=notifier, interval=60)
     yield SimpleNamespace(db=db, sent=sent, pipeline=pipeline, worker=worker, shared=shared)
@@ -106,7 +159,8 @@ async def test_order_submit_registers_without_extension(env):
     wb.close()
     assert len(rows) == 1
     assert rows[0][1] == "测试店" and rows[0][2] == ticket["ticket_no"]
-    assert any("已登记" in s for s in env.sent)
+    # 2026-08-24 静默化：订单登记成功属纯告知，不再群内回执
+    assert not any("已登记" in s for s in env.sent)
     assert not any("自动延期" in s for s in env.sent)
 
 
@@ -121,7 +175,8 @@ async def test_order_submit_by_any_role(env):
     row = env.db.connect().execute("SELECT * FROM inbox_messages WHERE message_id='r-staff'").fetchone()
     await env.pipeline.process(dict(row))
     assert env.db.get_order_monitor("TB-ANY-0001") is not None
-    assert any("已登记" in s for s in env.sent)
+    # 静默化：登记成功不回执
+    assert not any("已登记" in s for s in env.sent)
 
 
 @pytest.mark.asyncio
@@ -145,8 +200,8 @@ async def test_bare_order_number_registers_without_extension(env):
         "SELECT COUNT(*) FROM repair_method_versions WHERE ticket_id=?", (ticket["id"],)
     ).fetchone()[0]
     assert rows == 0
-    # 只弹「订单已登记」，不再弹多余的「已记录维修方式」
-    assert any("已登记" in s for s in env.sent)
+    # 静默化：裸单号登记成功不回执，也不弹「已记录维修方式」
+    assert not any("已登记" in s for s in env.sent)
     assert not any("已记录维修方式" in s for s in env.sent)
 
 
@@ -174,8 +229,10 @@ async def test_multiple_orders_with_diagnosis_registered(env):
         "SELECT items_json FROM diagnosis_versions WHERE ticket_id=? AND is_current=1", (ticket["id"],)
     ).fetchone()
     assert diag is not None and "铰链" in diag["items_json"]
-    # 回执包含两个订单号
-    assert any("5127629004214178517" in s and "5127628896203022943" in s for s in env.sent)
+    # 静默化：多订单登记成功也不回执
+    assert not any(
+        "5127629004214178517" in s and "5127628896203022943" in s for s in env.sent
+    )
 
 
 @pytest.mark.asyncio
@@ -294,3 +351,121 @@ async def test_sla_reminder_skips_received_ticket(env):
     env.worker.scan_sla_reminders(datetime.now())
     assert not any("超时效" in s for s in env.sent)
     assert not any("时效即将到期" in s for s in env.sent)
+
+
+# ─────────────────── 共享表写入兜底（2026-08-25） ───────────────────
+@pytest.mark.asyncio
+async def test_order_submit_marks_xlsx_synced(env):
+    """登记成功（或行已存在）后，订单标记 xlsx_synced=1。"""
+    await _create_ticket(env)
+    await _submit_order(env, "TB-SYNC-0001")
+    monitor = env.db.get_order_monitor("TB-SYNC-0001")
+    assert monitor is not None
+    assert monitor["xlsx_synced"] == 1
+
+
+@pytest.mark.asyncio
+async def test_order_submit_tolerates_shared_table_failure(env, monkeypatch):
+    """共享表被占用写失败 → 不阻断登记、不向群里抛错，订单留在待补同步队列。"""
+    await _create_ticket(env)
+
+    def _boom(*_args, **_kw):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr("reconciling.order_store.append_order_row", _boom)
+    await _submit_order(env, "TB-LOCK-0001")  # 不应抛异常
+    monitor = env.db.get_order_monitor("TB-LOCK-0001")
+    assert monitor is not None and monitor["xlsx_synced"] == 0
+
+
+@pytest.mark.asyncio
+async def test_scheduler_resyncs_failed_shared_rows(env, monkeypatch):
+    """故障解除后调度器补同步：把未同步订单补进共享表并翻转标记；无待同步时不动。"""
+    import reconciling.order_store as order_store
+
+    await _create_ticket(env)
+    real = order_store.append_order_row
+    state = {"fail": True}
+
+    def _flaky(*args, **kwargs):
+        if state["fail"]:
+            raise PermissionError(1, "Operation not permitted")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(order_store, "append_order_row", _flaky)
+    await _submit_order(env, "TB-RETRY-0001")
+    assert env.db.get_order_monitor("TB-RETRY-0001")["xlsx_synced"] == 0
+
+    # 故障解除 → 一轮调度扫描即补写成功
+    state["fail"] = False
+    fixed = env.worker.scan_shared_table_resync(datetime.now())
+    assert fixed == 1
+    wb = openpyxl.load_workbook(env.shared)
+    ws = wb.active
+    rows = [r for r in ws.iter_rows(min_row=2, values_only=True) if r[0] == "TB-RETRY-0001"]
+    wb.close()
+    assert len(rows) == 1 and rows[0][2] is not None
+    assert env.db.get_order_monitor("TB-RETRY-0001")["xlsx_synced"] == 1
+
+    # 已全部同步后再扫：无事可做
+    assert env.worker.scan_shared_table_resync(datetime.now()) == 0
+
+
+# ─────────────────── 幽灵占位行查询侧防护（2026-08-26 回归） ───────────────────
+
+
+async def _insert_monitor_directly(env, order_id: str, ticket: dict) -> None:
+    """绕过清洗直插 order_monitor：精确复刻历史幽灵行落库形态（旧 bug 写入口）。"""
+    env.db.upsert_order_monitor(
+        order_id=order_id, ticket_id=ticket["id"],
+        store=ticket["store_name"], ticket_no=ticket["ticket_no"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_unsynced_orders_excludes_ghost_placeholder_rows(env):
+    """'' / None / null / nil 占位变体（含空白、大小写）不得进入补同步队列。
+
+    回归背景：历史上 str(None)="None" 以 TEXT 主键落库，成为幽灵行；
+    写入侧三层清洗已于 2026-08-26 补齐，本测试锁死查询侧最后一道闸。
+    """
+    ticket = await _create_ticket(env)
+    for oid in ("", "None", " null ", "NIL"):
+        await _insert_monitor_directly(env, oid, ticket)
+    await _insert_monitor_directly(env, "TB-GHOST-0001", ticket)
+
+    pending = [r["order_id"] for r in env.db.list_unsynced_orders()]
+    assert pending == ["TB-GHOST-0001"]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_resync_never_touches_ghost_placeholder_rows(env, monkeypatch):
+    """调度器对纯幽灵行待队列：零写盘、零标记翻转；合法订单正常补同步不受牵连。"""
+    import reconciling.order_store as order_store
+
+    ticket = await _create_ticket(env)
+    for oid in ("", "None"):
+        await _insert_monitor_directly(env, oid, ticket)
+
+    calls: list[tuple[tuple, dict]] = []
+    monkeypatch.setattr(
+        order_store, "append_order_row",
+        lambda *a, **kw: calls.append((a, kw)),
+    )
+
+    fixed = env.worker.scan_shared_table_resync(datetime.now())
+    assert fixed == 0
+    assert calls == []  # 幽灵行一次都不应被尝试写入共享表
+
+    # 正例对照：加入合法订单后同一路径立即恢复正常补同步
+    await _insert_monitor_directly(env, "TB-GHOST-0002", ticket)
+    fixed = env.worker.scan_shared_table_resync(datetime.now())
+    assert fixed == 1
+    assert len(calls) == 1 and calls[0][1].get("order_id") == "TB-GHOST-0002"
+    assert env.db.get_order_monitor("TB-GHOST-0002")["xlsx_synced"] == 1
+
+    # 脏行原样保留在库中（不动数据，仅不入队），仍是 xlsx_synced=0
+    raw_dirty = env.db.connect().execute(
+        "SELECT COUNT(*) FROM order_monitor WHERE xlsx_synced=0"
+    ).fetchone()[0]
+    assert raw_dirty == 2

@@ -10,6 +10,7 @@ import pytest
 from db import Database
 from qa.advisor import TicketAdvisor
 from qa.kb_store import KBStore
+from test_pipeline_integration import FakeClassifier
 
 
 def _vec(seed: int, dim: int = 8) -> np.ndarray:
@@ -141,6 +142,7 @@ class TestPipelineIntegration:
             pending=PendingActionService(env.db),
             executor=TicketCommandExecutor(env.db, TicketRepository(env.db)),
             notifier=env.notifier, advisor=env.advisor,
+            classifier=FakeClassifier(protocol=protocol),
             mode=RuntimeMode.PRODUCTION,
         )
 
@@ -161,7 +163,7 @@ class TestPipelineIntegration:
             "SELECT * FROM inbox_messages WHERE message_id='m1'").fetchone()
         await pl.process(dict(row))
         assert len(env.sent) == 2                       # 建单回执 + 建议
-        assert "已创建工单" in env.sent[0]
+        assert "已建单" in env.sent[0]
         assert "相似案例参考" in env.sent[1]
         # 台账
         ticket = env.db.connect().execute(
@@ -184,7 +186,7 @@ class TestPipelineIntegration:
             "SELECT * FROM inbox_messages WHERE message_id='m2'").fetchone()
         status = await pl.process(dict(row))
         assert status == "COMPLETED"
-        assert len(env.sent) == 1 and "已创建工单" in env.sent[0]
+        assert len(env.sent) == 1 and "已建单" in env.sent[0]
 
 
 class _Env:

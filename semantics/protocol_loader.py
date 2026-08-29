@@ -31,11 +31,13 @@ class ProtocolValidationError(ValueError):
 ALLOWED_EXECUTORS = frozenset({
     "create_ticket", "add_ticket_detail", "submit_diagnosis",
     "submit_repair_plan", "submit_timeout_reason", "complete_ticket",
+    "confirm_complete_ticket", "reject_complete_ticket",
     "cancel_ticket", "stop_ticket", "reopen_ticket", "query_ticket", "select_ticket",
     "clarify", "confirm_pending_action", "reject_pending_action",
     "correct_pending_action", "ignore_message",
     # v4.3 RAG 闭环：AI 建议未解决 → 升级转工程师（pipeline 层处理，不进执行器）
     "qa_unresolved",
+    "submit_special_case",
 })
 
 ALLOWED_ROLES = frozenset({"MANAGER", "ENGINEER", "LEADER", "OTHER", "SYSTEM"})

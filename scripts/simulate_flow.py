@@ -1,4 +1,4 @@
-"""整套业务流程模拟（2026-08-12 新流程）。
+"""整套业务流程模拟（2026-08-24 更新：含店长完成确认流）。
 
 用假分类器模拟云端模型的语义判断，驱动真实 pipeline，打印每一步：
 消息 → 决策 → 动作 → 数据库变化 → 群回执。
@@ -7,7 +7,9 @@
 
     python scripts/simulate_flow.py
 
-流程覆盖：报修(多单并行)→选单→诊断→维修方式+订单号→快递确认→补充→完工→取消(需确认)→查询。
+流程覆盖：报修(多单并行)→选单→诊断→维修方式+订单号→快递确认→补充
+→工程师完工(待店长确认)→店长「确认修好」完成→取消(需确认)→查询。
+共享表演示用临时副本，不写真实 订单门店状态表.xlsx。
 """
 
 from __future__ import annotations
@@ -47,7 +49,7 @@ class FakeClassifier:
     def __init__(self) -> None:
         self.responses: dict[str, SemanticDecision] = {}
 
-    async def classify(self, message, candidates=None, pending_action=None) -> SemanticDecision:
+    async def classify(self, message, candidates=None, pending_action=None, history=None) -> SemanticDecision:
         return self.responses.get(
             message.message_id,
             SemanticDecision(protocol_version="4.0.0", source="SEMANTIC_MODEL",
@@ -134,7 +136,7 @@ async def main() -> None:
         print()
 
     print("=" * 72)
-    print("  钉钉报修工单系统 · 完整流程模拟（新流程 2026-08-12）")
+    print("  钉钉报修工单系统 · 完整流程模拟（2026-08-24 含店长确认流）")
     print("=" * 72)
     print()
 
@@ -156,12 +158,14 @@ async def main() -> None:
 
     # ── 2.5 查询当前活动工单 ──
     print("【2.5】店长查询当前活动工单（应列出两张）")
-    await send("m2x", "#查询工单", MG)
+    await send("m2x", "#查询工单", MG, preset=_decision("ticket.query"))
     print()
 
     # ── 3. 工程师选单 + 故障判断 ──
     print("【3】工程师选中第一张工单，给出故障判断")
-    await send("m3", "#选择工单 钉钉消息测试-博物馆奇妙夜-3天-001", EG)
+    await send("m3", "#选择工单 钉钉消息测试-博物馆奇妙夜-3天-001", EG,
+               preset=_decision("ticket.select",
+                                ticket_no="钉钉消息测试-博物馆奇妙夜-3天-001"))
     await send("m4", "门下沉了，我判断是合页松动", EG,
                preset=_decision("ticket.diagnosis.submit",
                                 {"diagnosis_items": ["门体下沉", "上侧合页松动"]}))
@@ -177,21 +181,21 @@ async def main() -> None:
     # ── 4.5 模拟：另一个 AI 回传订单状态「卖家已发货」→ 调度器读表 → 群通知 ──
     print("【4.5】另一个 AI 回传订单状态 → 调度器读到「已发货」→ 群内提醒一次")
     replies.clear()
-    from reconciling.order_store import read_order_rows  # noqa: E402
     from workers.scheduler import SchedulerWorker  # noqa: E402
 
-    # 模拟外部 AI 把共享表的 status 更新为已发货
+    # 共享表用临时副本（不写真实 订单门店状态表.xlsx）
     import openpyxl  # noqa: E402
-    from config import ORDER_STORE_TABLE_PATH  # noqa: E402
+    import config as _cfg  # noqa: E402
 
-    _wb = openpyxl.load_workbook(ORDER_STORE_TABLE_PATH)
+    _tmp_xlsx = db.db_path.parent / "sim_order_table.xlsx"
+    _wb = openpyxl.Workbook()
     _ws = _wb.active
-    for _r in _ws.iter_rows(min_row=2):
-        if _r[0].value == "TB-2024-0001":
-            _r[3].value = "卖家已发货"
-            _r[4].value = "SF-1234567890"
-    _wb.save(ORDER_STORE_TABLE_PATH)
+    _ws.append(["order_id", "store", "ticket_no", "status", "tracking_number", "updated_at"])
+    _ws.append(["TB-2024-0001", "钉钉消息测试", "钉钉消息测试-博物馆奇妙夜-3天-001",
+                "卖家已发货", "SF-1234567890", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+    _wb.save(_tmp_xlsx)
     _wb.close()
+    _cfg.ORDER_STORE_TABLE_PATH = _tmp_xlsx
 
     sched = SchedulerWorker(db=db, notifier=notifier)
     sched.scan_order_status()
@@ -201,17 +205,25 @@ async def main() -> None:
 
     # ── 6. 店长切换到第二张工单，补充信息 ──
     print("【6】店长切换到第二张工单，补充钥匙也断了")
-    await send("m7", "#选择工单 钉钉消息测试-仓库门锁-3天-002", MG)
+    await send("m7", "#选择工单 钉钉消息测试-仓库门锁-3天-002", MG,
+               preset=_decision("ticket.select",
+                                ticket_no="钉钉消息测试-仓库门锁-3天-002"))
     await send("m8", "门锁的钥匙也断了，补充一下", MG,
                preset=_decision("ticket.add_detail", {"content": "钥匙也断了"}))
     db_summary("补充后")
 
-    # ── 7. 工程师完工（新策略：直接完成，无需确认）──
-    print("【7】工程师回复博物馆的门修好了 → 直接完成（无需二次确认）")
+    # ── 7. 工程师完工（新流程：→ 待店长确认）──
+    print("【7】工程师回复博物馆的门修好了 → 转待店长确认（群内请店长确认）")
     await send("m9", "博物馆的门修好了，测试正常", EG,
                preset=_decision("ticket.complete", {"completion_note": "已维修测试正常"},
                                 ticket_no="钉钉消息测试-博物馆奇妙夜-3天-001"))
-    db_summary("第一张完成")
+    db_summary("第一张待店长确认")
+
+    # ── 7.5 店长「确认修好」→ 完成（新流程 2026-08-24 #3）──
+    print("【7.5】店长回复「确认修好」（不写编号，单候选兜底）→ 工单完成")
+    await send("m9c", "确认修好", MG,
+               preset=_decision("ticket.confirm_complete"))
+    db_summary("店长确认后")
 
     # ── 8. 店长取消第二张（高危，需确认）──
     print("【8】店长取消第二张工单（取消需确认）")
@@ -226,7 +238,7 @@ async def main() -> None:
 
     # ── 9. 查询工单 ──
     print("【9】查询当前工单")
-    await send("m12", "#查询工单", MG)
+    await send("m12", "#查询工单", MG, preset=_decision("ticket.query"))
 
     print("=" * 72)
     print("  模拟完成 · 数据库汇总")

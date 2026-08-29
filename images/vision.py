@@ -62,6 +62,9 @@ class VisionAnalyzer:
                 continue
             try:
                 text = await self._analyze_one(row)
+                # 仅保留最终识别结果：若模型回显 system-reminder/memory 流程包装，视为污染丢弃
+                if "system-reminder" in text or "# auto memory" in text or '"type": "message"' in text:
+                    raise ValueError("模型返回系统提示泄露，已标记失败")
                 self._db.update_attachment_vision(
                     row["id"], result=text, status="ANALYZED",
                 )

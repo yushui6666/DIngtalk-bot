@@ -222,7 +222,14 @@ class DingTalkMediaResolver:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=self._timeout)
         except asyncio.TimeoutError:
             proc.kill()
+            await proc.wait()  # 回收子进程，避免僵尸
             raise ValueError("钉钉媒体下载超时")
+        finally:
+            # 显式关闭 transport：communicate() 只读到 EOF，不会关闭子进程
+            # transport 本身；残留到事件循环关闭后会刷屏 Event loop is closed
+            transport = getattr(proc, "_transport", None)
+            if transport is not None and not transport.is_closing():
+                transport.close()
         if proc.returncode != 0:
             raise ValueError(
                 f"dws 下载失败 code={proc.returncode} stderr={stderr.decode('utf-8', 'replace')[:200]}"

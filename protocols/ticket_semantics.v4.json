@@ -2,7 +2,7 @@
  "protocol_version": "4.0.0",
  "compiled_at": "2026-08-18T00:00:00+08:00",
  "compiled_by": "protocol_compiler",
- "source_sha256": "5687e936efa4feff3f072275506f20d2363bfc2033f59debc7fc8aeeaaf4fff7",
+ "source_sha256": "92a2e09a869561642e5a6677c6944b720ed86ccfb0ac0cd13d7cd048fa6497bf",
  "actions": [
   {
    "intent_id": "qa.unresolved",
@@ -69,8 +69,8 @@
    ],
    "semantic_enabled": true,
    "allowed_roles": [
-    "ENGINEER",
     "MANAGER",
+    "ENGINEER",
     "OTHER"
    ],
    "allowed_ticket_states": [
@@ -92,15 +92,15 @@
    },
    "positive_examples": [
     "麻烦补充一下工单信息，问题描述：空调漏水更严重了",
-    "#补充 工单编号：W001 问题描述：空调漏水更严重了",
+    "#补充 主题已更新为空调不制冷",
+    "#补充 问题描述：空调漏水更严重了",
     "业务表达1：麻烦补充一下工单信息，问题描述：空调漏水更严重了",
-    "业务表达2：#补充 工单编号：W001 问题描述：空调漏水更严重了",
-    "业务表达3：麻烦补充一下工单信息，问题描述：空调漏水更严重了",
-    "业务表达4：#补充 工单编号：W001 问题描述：空调漏水更严重了",
-    "业务表达5：麻烦补充一下工单信息，问题描述：空调漏水更严重了",
-    "业务表达6：#补充 工单编号：W001 问题描述：空调漏水更严重了",
-    "业务表达7：麻烦补充一下工单信息，问题描述：空调漏水更严重了",
-    "业务表达8：#补充 工单编号：W001 问题描述：空调漏水更严重了"
+    "业务表达2：#补充 主题已更新为空调不制冷",
+    "业务表达3：#补充 问题描述：空调漏水更严重了",
+    "业务表达4：麻烦补充一下工单信息，问题描述：空调漏水更严重了",
+    "业务表达5：#补充 主题已更新为空调不制冷",
+    "业务表达6：#补充 问题描述：空调漏水更严重了",
+    "业务表达7：麻烦补充一下工单信息，问题描述：空调漏水更严重了"
    ],
    "negative_examples": [
     "补充说明一下",
@@ -116,12 +116,7 @@
    ],
    "confirmation_template": "",
    "executor": "add_ticket_detail",
-   "field_definitions": {
-    "ticket_no": {
-     "type": "string",
-     "required": true
-    }
-   }
+   "field_definitions": {}
   },
   {
    "intent_id": "ticket.cancel",
@@ -135,7 +130,8 @@
    ],
    "allowed_ticket_states": [
     "ACTIVE",
-    "ACTIVE_OVERDUE"
+    "ACTIVE_OVERDUE",
+    "PENDING_CONFIRM"
    ],
    "required_fields": [
     "ticket_no",
@@ -149,41 +145,32 @@
     "SEMANTIC_MODEL": "ALWAYS"
    },
    "positive_examples": [
-    "帮我把这个误报工单取消掉",
-    "#取消工单 工单编号：W001 取消原因：误报",
-    "业务表达1：帮我把这个误报工单取消掉",
-    "业务表达2：#取消工单 工单编号：W001 取消原因：误报",
-    "业务表达3：帮我把这个误报工单取消掉",
-    "业务表达4：#取消工单 工单编号：W001 取消原因：误报",
-    "业务表达5：帮我把这个误报工单取消掉",
-    "业务表达6：#取消工单 工单编号：W001 取消原因：误报",
-    "业务表达7：帮我把这个误报工单取消掉",
-    "业务表达8：#取消工单 工单编号：W001 取消原因：误报"
+    "帮我把这个工单取消掉，是误报，实际没有故障",
+    "#取消工单 原因：误报，实际无故障",
+    "#取消工单 原因：已由其他门店维修",
+    "业务表达1：帮我把这个工单取消掉，是误报，实际没有故障",
+    "业务表达2：#取消工单 原因：误报，实际无故障",
+    "业务表达3：#取消工单 原因：已由其他门店维修",
+    "业务表达4：帮我把这个工单取消掉，是误报，实际没有故障",
+    "业务表达5：#取消工单 原因：误报，实际无故障",
+    "业务表达6：#取消工单 原因：已由其他门店维修",
+    "业务表达7：帮我把这个工单取消掉，是误报，实际没有故障"
    ],
    "negative_examples": [
     "这个工单可以取消吗",
     "要不要取消工单",
     "我可能想取消这个工单",
+    "工单取消是否可行",
     "边界反例1：这个工单可以取消吗",
     "边界反例2：要不要取消工单",
     "边界反例3：我可能想取消这个工单",
-    "边界反例4：这个工单可以取消吗",
-    "边界反例5：要不要取消工单",
-    "边界反例6：我可能想取消这个工单",
-    "边界反例7：这个工单可以取消吗"
+    "边界反例4：工单取消是否可行",
+    "边界反例5：这个工单可以取消吗",
+    "边界反例6：要不要取消工单"
    ],
-   "confirmation_template": "",
+   "confirmation_template": "⚠️ 确认取消工单 {ticket_no}？操作不可逆，请明确回复。",
    "executor": "cancel_ticket",
-   "field_definitions": {
-    "ticket_no": {
-     "type": "string",
-     "required": true
-    },
-    "cancel_reason": {
-     "type": "text",
-     "required": true
-    }
-   }
+   "field_definitions": {}
   },
   {
    "intent_id": "ticket.complete",
@@ -234,6 +221,59 @@
    ],
    "confirmation_template": "",
    "executor": "complete_ticket",
+   "field_definitions": {}
+  },
+  {
+   "intent_id": "ticket.confirm_complete",
+   "display_name": "店长确认完成",
+   "explicit_keywords": [
+    "确认修好",
+    "#确认修好",
+    "#确认完成"
+   ],
+   "semantic_enabled": true,
+   "allowed_roles": [
+    "MANAGER"
+   ],
+   "allowed_ticket_states": [
+    "PENDING_CONFIRM"
+   ],
+   "required_fields": [],
+   "optional_fields": [
+    "ticket_no"
+   ],
+   "target_ticket_policy": "MUST_EXIST",
+   "risk_level": "NORMAL",
+   "confirmation_policy": {
+    "EXPLICIT_KEYWORD": "NOT_REQUIRED",
+    "SEMANTIC_MODEL": "NOT_REQUIRED"
+   },
+   "positive_examples": [
+    "确认修好",
+    "确认修好 工单编号：钉钉消息测试-收银机-1天-001",
+    "#确认修好 已恢复正常",
+    "#确认完成",
+    "可以，收银机能正常用了，完成吧",
+    "没问题了，确认完成",
+    "修好了确认一下，可以关单了",
+    "好的确认修好了",
+    "测试通过，确认修好 工单编号：钉钉消息测试-门锁-3天-002",
+    "店长确认：已修复，完成这张工单"
+   ],
+   "negative_examples": [
+    "还没修好",
+    "应该快修好了吧",
+    "帮我确认一下维修方式",
+    "等会儿再确认",
+    "你确认过故障原因吗",
+    "还没试，等下确认",
+    "需要供应商上门后再确认",
+    "先别关单，我还没验收",
+    "确认收到货了",
+    "确认一下上门时间"
+   ],
+   "confirmation_template": "",
+   "executor": "confirm_complete_ticket",
    "field_definitions": {}
   },
   {
@@ -300,20 +340,20 @@
      "type": "text",
      "required": true
     },
+    "sla": {
+     "type": "enum",
+     "required": true,
+     "allowed": [
+      "1天",
+      "3天",
+      "7天",
+      "待商榷"
+     ]
+    },
     "device": {
      "type": "text",
      "required": false
-    },
-"sla": {
-      "type": "enum",
-      "required": true,
-      "allowed": [
-       "1天",
-       "3天",
-       "7天",
-       "待商榷"
-      ]
-     }
+    }
    }
   },
   {
@@ -381,14 +421,11 @@
    ],
    "semantic_enabled": true,
    "allowed_roles": [
-    "ENGINEER",
     "MANAGER",
+    "ENGINEER",
     "OTHER"
    ],
-   "allowed_ticket_states": [
-    "ACTIVE",
-    "ACTIVE_OVERDUE"
-   ],
+   "allowed_ticket_states": [],
    "required_fields": [],
    "optional_fields": [
     "ticket_no"
@@ -397,7 +434,7 @@
    "risk_level": "LOW",
    "confirmation_policy": {
     "EXPLICIT_KEYWORD": "NOT_REQUIRED",
-    "SEMANTIC_MODEL": "BY_CONFIDENCE"
+    "SEMANTIC_MODEL": "NOT_REQUIRED"
    },
    "positive_examples": [
     "现在有多少单在处理",
@@ -425,6 +462,60 @@
    ],
    "confirmation_template": "",
    "executor": "query_ticket",
+   "field_definitions": {}
+  },
+  {
+   "intent_id": "ticket.reject_complete",
+   "display_name": "店长反馈未修好",
+   "explicit_keywords": [
+    "没修好",
+    "#没修好",
+    "还未修好"
+   ],
+   "semantic_enabled": true,
+   "allowed_roles": [
+    "MANAGER"
+   ],
+   "allowed_ticket_states": [
+    "PENDING_CONFIRM"
+   ],
+   "required_fields": [],
+   "optional_fields": [
+    "ticket_no",
+    "reject_reason"
+   ],
+   "target_ticket_policy": "MUST_EXIST",
+   "risk_level": "NORMAL",
+   "confirmation_policy": {
+    "EXPLICIT_KEYWORD": "NOT_REQUIRED",
+    "SEMANTIC_MODEL": "BY_CONFIDENCE"
+   },
+   "positive_examples": [
+    "没修好",
+    "没修好，还是不制冷",
+    "#没修好 问题还在",
+    "还未修好，门还是打不开",
+    "不行，还是老样子，没修好",
+    "试了一下还是不行，没修好",
+    "没修好 工单编号：钉钉消息测试-收银机-1天-001 还会死机",
+    "店长反馈：尚未修复，继续处理",
+    "还是闪屏，没修好",
+    "问题没有解决，还未修好"
+   ],
+   "negative_examples": [
+    "确认修好",
+    "上次说没修好，现在好了",
+    "维修方式没确定",
+    "还没开始修",
+    "修好了",
+    "应该快修好了",
+    "没修好的话再叫一次工程师",
+    "之前没修好，这次换了配件",
+    "不确定是不是修好了，再观察下",
+    "没时间验收，明天再说"
+   ],
+   "confirmation_template": "",
+   "executor": "reject_complete_ticket",
    "field_definitions": {}
   },
   {
@@ -456,41 +547,32 @@
     "SEMANTIC_MODEL": "ALWAYS"
    },
    "positive_examples": [
-    "门又坏了，把之前的工单重开吧",
-    "#重开工单 工单编号：W001 重开原因：故障复发",
-    "业务表达1：门又坏了，把之前的工单重开吧",
-    "业务表达2：#重开工单 工单编号：W001 重开原因：故障复发",
-    "业务表达3：门又坏了，把之前的工单重开吧",
-    "业务表达4：#重开工单 工单编号：W001 重开原因：故障复发",
-    "业务表达5：门又坏了，把之前的工单重开吧",
-    "业务表达6：#重开工单 工单编号：W001 重开原因：故障复发",
-    "业务表达7：门又坏了，把之前的工单重开吧",
-    "业务表达8：#重开工单 工单编号：W001 重开原因：故障复发"
+    "门又坏了，把之前的工单重开吧，门再次下沉需要重新维修",
+    "#重开工单 原因：门再次下沉，需要重新维修",
+    "#重开工单 原因：上次维修未解决根本问题",
+    "业务表达1：门又坏了，把之前的工单重开吧，门再次下沉需要重新维修",
+    "业务表达2：#重开工单 原因：门再次下沉，需要重新维修",
+    "业务表达3：#重开工单 原因：上次维修未解决根本问题",
+    "业务表达4：门又坏了，把之前的工单重开吧，门再次下沉需要重新维修",
+    "业务表达5：#重开工单 原因：门再次下沉，需要重新维修",
+    "业务表达6：#重开工单 原因：上次维修未解决根本问题",
+    "业务表达7：门又坏了，把之前的工单重开吧，门再次下沉需要重新维修"
    ],
    "negative_examples": [
     "能不能重开工单",
     "我感觉需要重开",
     "重新开一个吧",
+    "是否应该重开这个工单",
     "边界反例1：能不能重开工单",
     "边界反例2：我感觉需要重开",
     "边界反例3：重新开一个吧",
-    "边界反例4：能不能重开工单",
-    "边界反例5：我感觉需要重开",
-    "边界反例6：重新开一个吧",
-    "边界反例7：能不能重开工单"
+    "边界反例4：是否应该重开这个工单",
+    "边界反例5：能不能重开工单",
+    "边界反例6：我感觉需要重开"
    ],
-   "confirmation_template": "",
+   "confirmation_template": "⚠️ 确认重开工单 {ticket_no}？将恢复为活动状态。",
    "executor": "reopen_ticket",
-   "field_definitions": {
-    "ticket_no": {
-     "type": "string",
-     "required": true
-    },
-    "reopen_reason": {
-     "type": "text",
-     "required": true
-    }
-   }
+   "field_definitions": {}
   },
   {
    "intent_id": "ticket.repair_plan.submit",
@@ -552,14 +634,11 @@
    ],
    "semantic_enabled": true,
    "allowed_roles": [
-    "ENGINEER",
     "MANAGER",
+    "ENGINEER",
     "OTHER"
    ],
-   "allowed_ticket_states": [
-    "ACTIVE",
-    "ACTIVE_OVERDUE"
-   ],
+   "allowed_ticket_states": [],
    "required_fields": [
     "ticket_no"
    ],
@@ -568,7 +647,7 @@
    "risk_level": "LOW",
    "confirmation_policy": {
     "EXPLICIT_KEYWORD": "NOT_REQUIRED",
-    "SEMANTIC_MODEL": "BY_CONFIDENCE"
+    "SEMANTIC_MODEL": "NOT_REQUIRED"
    },
    "positive_examples": [
     "#选择工单 W001",
@@ -595,85 +674,127 @@
     "边界反例8：第二张工单是什么问题"
    ],
    "confirmation_template": "",
-    "executor": "select_ticket",
-    "field_definitions": {
-     "ticket_no": {
-      "type": "string",
-      "required": true
-     }
-    }
+   "executor": "select_ticket",
+   "field_definitions": {}
+  },
+  {
+   "intent_id": "ticket.special_case.submit",
+   "display_name": "登记特殊情况",
+   "explicit_keywords": [
+    "#特殊情况"
+   ],
+   "semantic_enabled": true,
+   "allowed_roles": [
+    "MANAGER",
+    "ENGINEER"
+   ],
+   "allowed_ticket_states": [
+    "ACTIVE",
+    "ACTIVE_OVERDUE",
+    "PENDING_CONFIRM"
+   ],
+   "required_fields": [
+    "special_case_reason"
+   ],
+   "optional_fields": [
+    "ticket_no",
+    "expected_resume_at"
+   ],
+   "target_ticket_policy": "MUST_EXIST",
+   "risk_level": "LOW",
+   "confirmation_policy": {
+    "EXPLICIT_KEYWORD": "NOT_REQUIRED",
+    "SEMANTIC_MODEL": "NOT_REQUIRED"
    },
-   {
-    "intent_id": "ticket.stop",
-    "display_name": "停修工单",
-    "explicit_keywords": [
-     "#停止维修"
-    ],
-    "semantic_enabled": true,
-    "allowed_roles": [
-     "LEADER"
-    ],
-    "allowed_ticket_states": [
-     "ACTIVE",
-     "ACTIVE_OVERDUE"
-    ],
-    "required_fields": [
-     "ticket_no",
-     "stop_reason"
-    ],
-    "optional_fields": [],
-    "target_ticket_policy": "MUST_EXIST",
-    "risk_level": "HIGH",
-    "confirmation_policy": {
-     "EXPLICIT_KEYWORD": "NOT_REQUIRED",
-     "SEMANTIC_MODEL": "ALWAYS"
-    },
-    "positive_examples": [
-     "这个工单不要再修了，停止维修，配件已停产无法修复",
-     "#停止维修 原因：配件停产，无法修复",
-     "工单 W001 停止维修，原因：设备已报废不再维修",
-     "业务表达1：这个工单不要再修了，停止维修，配件已停产无法修复",
-     "业务表达2：#停止维修 原因：配件停产，无法修复",
-     "业务表达3：工单 W001 停止维修，原因：设备已报废不再维修",
-     "业务表达4：这个工单不要再修了，停止维修，配件已停产无法修复",
-     "业务表达5：#停止维修 原因：配件停产，无法修复",
-     "业务表达6：工单 W001 停止维修，原因：设备已报废不再维修",
-     "业务表达7：这个工单不要再修了，停止维修，配件已停产无法修复",
-     "业务表达8：#停止维修 原因：配件停产，无法修复"
-    ],
-    "negative_examples": [
-     "这个工单还要继续修吗",
-     "停止维修是终态吗",
-     "我不太确定要不要停修",
-     "边界反例1：这个工单还要继续修吗",
-     "边界反例2：停止维修是终态吗",
-     "边界反例3：我不太确定要不要停修",
-     "边界反例4：这个工单还要继续修吗",
-     "边界反例5：停止维修是终态吗",
-     "边界反例6：我不太确定要不要停修",
-     "边界反例7：这个工单还要继续修吗",
-     "边界反例8：停止维修是终态吗"
-    ],
-    "confirmation_template": "⚠️ 确认停止维修工单 {ticket_no}？该工单将进入停修终态，可随时重开。请明确回复。",
-    "executor": "stop_ticket",
-    "field_definitions": {
-     "ticket_no": {
-      "type": "string",
-      "required": true
-     },
-     "stop_reason": {
-      "type": "text",
-      "required": true
-     }
-    }
+   "positive_examples": [
+    "特殊情况：等待门店接客两场连场 预计恢复：一小时内",
+    "特殊情况：等待到货；预计恢复：明天下午",
+    "特殊情况：等待工程师上门，预计恢复：2026-08-28 10:00",
+    "有特殊情况，门店现在接客走不开，预计一小时内恢复处理",
+    "特殊情况 等待客户配合 预计恢复 半小时",
+    "业务表达1：特殊情况：等待门店接客两场连场 预计恢复：一小时内",
+    "业务表达2：特殊情况：等待到货；预计恢复：明天下午",
+    "业务表达3：特殊情况：等待工程师上门，预计恢复：2026-08-28 10:00",
+    "业务表达4：有特殊情况，门店现在接客走不开，预计一小时内恢复处理",
+    "业务表达5：特殊情况 等待客户配合 预计恢复 半小时"
+   ],
+   "negative_examples": [
+    "特殊情况怎么填",
+    "没有什么特殊情况",
+    "是不是有特殊情况",
+    "特殊情况下你们一般怎么处理",
+    "这单挺特殊的",
+    "边界反例1：特殊情况怎么填",
+    "边界反例2：没有什么特殊情况",
+    "边界反例3：是不是有特殊情况",
+    "边界反例4：特殊情况下你们一般怎么处理",
+    "边界反例5：这单挺特殊的"
+   ],
+   "confirmation_template": "",
+   "executor": "submit_special_case",
+   "field_definitions": {}
+  },
+  {
+   "intent_id": "ticket.stop",
+   "display_name": "停修工单",
+   "explicit_keywords": [
+    "#停止维修"
+   ],
+   "semantic_enabled": true,
+   "allowed_roles": [
+    "LEADER"
+   ],
+   "allowed_ticket_states": [
+    "ACTIVE",
+    "ACTIVE_OVERDUE",
+    "PENDING_CONFIRM"
+   ],
+   "required_fields": [
+    "ticket_no",
+    "stop_reason"
+   ],
+   "optional_fields": [],
+   "target_ticket_policy": "MUST_EXIST",
+   "risk_level": "HIGH",
+   "confirmation_policy": {
+    "EXPLICIT_KEYWORD": "NOT_REQUIRED",
+    "SEMANTIC_MODEL": "ALWAYS"
    },
-   {
-    "intent_id": "ticket.timeout_reason.submit",
-    "display_name": "",
-    "explicit_keywords": [
-     "#超时原因"
-    ],
-    "semantic_enabled": true,
+   "positive_examples": [
+    "这个工单不要再修了，停止维修，配件已停产无法修复",
+    "#停止维修 原因：配件停产，无法修复",
+    "工单 W001 停止维修，原因：设备已报废不再维修",
+    "业务表达1：这个工单不要再修了，停止维修，配件已停产无法修复",
+    "业务表达2：#停止维修 原因：配件停产，无法修复",
+    "业务表达3：工单 W001 停止维修，原因：设备已报废不再维修",
+    "业务表达4：这个工单不要再修了，停止维修，配件已停产无法修复",
+    "业务表达5：#停止维修 原因：配件停产，无法修复",
+    "业务表达6：工单 W001 停止维修，原因：设备已报废不再维修",
+    "业务表达7：这个工单不要再修了，停止维修，配件已停产无法修复"
+   ],
+   "negative_examples": [
+    "这个工单还要继续修吗",
+    "停止维修是终态吗",
+    "我不太确定要不要停修",
+    "边界反例1：这个工单还要继续修吗",
+    "边界反例2：停止维修是终态吗",
+    "边界反例3：我不太确定要不要停修",
+    "边界反例4：这个工单还要继续修吗",
+    "边界反例5：停止维修是终态吗",
+    "边界反例6：我不太确定要不要停修",
+    "边界反例7：这个工单还要继续修吗"
+   ],
+   "confirmation_template": "⚠️ 确认停止维修工单 {ticket_no}？该工单将进入停修终态，可随时重开。请明确回复。",
+   "executor": "stop_ticket",
+   "field_definitions": {}
+  },
+  {
+   "intent_id": "ticket.timeout_reason.submit",
+   "display_name": "",
+   "explicit_keywords": [
+    "#超时原因"
+   ],
+   "semantic_enabled": true,
    "allowed_roles": [
     "ENGINEER"
    ],
@@ -972,14 +1093,7 @@
    ]
   },
   "repair_method": {
-   "type": "enum",
-   "allowed": [
-    "淘宝采购后自行维修",
-    "需要供应商维修",
-    "需要木工维修",
-    "需要工程师上门",
-    "远程视频维修"
-   ],
+   "type": "text",
    "aliases": [
     "维修方式"
    ]
@@ -1037,24 +1151,38 @@
     "内容",
     "补充说明"
    ]
+  },
+  "special_case_reason": {
+   "type": "text",
+   "aliases": [
+    "特殊情况",
+    "特殊情况原因"
+   ]
+  },
+  "expected_resume_at": {
+   "type": "text",
+   "aliases": [
+    "预计恢复",
+    "预计恢复时间"
+   ]
   }
  },
  "routing": {
   "min_confidence": 0.6,
   "clarify_threshold": 1.5
  },
-"risk_policies": {
-   "ticket.complete": {
-    "SEMANTIC_MODEL": "NOT_REQUIRED"
-   },
-   "ticket.cancel": {
-    "SEMANTIC_MODEL": "ALWAYS"
-   },
-   "ticket.stop": {
-    "SEMANTIC_MODEL": "ALWAYS"
-   },
-   "ticket.reopen": {
-    "SEMANTIC_MODEL": "ALWAYS"
-   }
+ "risk_policies": {
+  "ticket.complete": {
+   "SEMANTIC_MODEL": "NOT_REQUIRED"
+  },
+  "ticket.cancel": {
+   "SEMANTIC_MODEL": "ALWAYS"
+  },
+  "ticket.stop": {
+   "SEMANTIC_MODEL": "ALWAYS"
+  },
+  "ticket.reopen": {
+   "SEMANTIC_MODEL": "ALWAYS"
   }
  }
+}

@@ -172,10 +172,25 @@ class GroupListener:
         logger.info("收到群消息 %s", msg.brief())
         await self.handler(msg)
 
+    @staticmethod
+    def _close_transport(proc: Optional[asyncio.subprocess.Process]) -> None:
+        """显式关闭子进程 transport（含 stdout/stderr 管道）。
+
+        只 terminate+wait 不会关闭 transport；残留对象若被引用链（异常回溯
+        环等）拖到事件循环关闭之后才 GC，__del__ 里关管道会刷屏
+        「RuntimeError: Event loop is closed」（2026-08-26 停机日志）。
+        """
+        if proc is None:
+            return
+        transport = getattr(proc, "_transport", None)
+        if transport is not None and not transport.is_closing():
+            transport.close()
+
     async def _terminate_proc(self) -> None:
         """终止当前监听子进程（若存活）。防止取消任务后残留进程占用订阅。"""
         proc = self._proc
         if proc is None or proc.returncode is not None:
+            self._close_transport(proc)
             return
         proc.terminate()
         try:
@@ -184,6 +199,7 @@ class GroupListener:
             proc.kill()
             await asyncio.wait_for(proc.wait(), timeout=3)
         logger.info("监听子进程已终止 group_id=%s pid=%s", self.group["group_id"], proc.pid)
+        self._close_transport(proc)
 
     async def stop(self) -> None:
         """优雅停止：请求退出并终止子进程。"""

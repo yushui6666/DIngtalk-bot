@@ -37,7 +37,11 @@ _STORE_CSV = Path("/Users/yushui/WorkBuddy/2026-08-13-16-38-27/dingtalk_stores/�
 
 
 def _load_store_name_map() -> dict[str, str]:
-    """从门店 CSV 提取 openDingtalkId → 姓名 映射。"""
+    """从门店 CSV 提取 ID → 姓名 映射。
+
+    同时索引 openDingtalkId 与 userId 两套 ID（库内消息/群配置存的是数字
+    userId，导出时两者都可能遇到）。
+    """
     import csv
 
     mapping: dict[str, str] = {}
@@ -45,17 +49,18 @@ def _load_store_name_map() -> dict[str, str]:
         return mapping
     with open(_STORE_CSV, encoding="utf-8-sig") as fh:
         for row in csv.DictReader(fh):
-            for name_col, oid_col in [
-                ("店长姓名", "店长openDingtalkId"),
-                ("区域负责人姓名", "区域负责人openDingtalkId"),
-                ("总工程师姓名", "总工程师openDingtalkId"),
-                ("工程师姓名", "工程师openDingtalkId"),
+            for name_col, oid_cols in [
+                ("店长姓名", ("店长openDingtalkId", "店长userId")),
+                ("区域负责人姓名", ("区域负责人openDingtalkId", "区域负责人userId")),
+                ("总工程师姓名", ("总工程师openDingtalkId", "总工程师userId")),
+                ("工程师姓名", ("工程师openDingtalkId", "工程师userId")),
             ]:
                 names = [n.strip() for n in (row.get(name_col) or "").split(";") if n.strip()]
-                oids = [o.strip() for o in (row.get(oid_col) or "").split(";") if o.strip()]
-                for name, oid in zip(names, oids):
-                    if name and oid:
-                        mapping[oid] = name
+                for oid_col in oid_cols:
+                    oids = [o.strip() for o in (row.get(oid_col) or "").split(";") if o.strip()]
+                    for name, oid in zip(names, oids):
+                        if name and oid:
+                            mapping[oid] = name
     return mapping
 
 
@@ -72,13 +77,16 @@ _ROLE_LABELS = {
 _STATUS_LABELS = {
     "ACTIVE": "进行中",
     "ACTIVE_OVERDUE": "已超时",
+    "PENDING_CONFIRM": "待店长确认",
     "COMPLETED": "已完成",
     "CANCELLED": "已取消",
     "STOPPED": "已停修",
 }
 
 
-def _name(oid: str) -> str:
+def _name(oid: str | None) -> str:
+    if not oid:
+        return "—"
     return NAME_MAP.get(oid, oid[:8] + "…")
 
 
@@ -335,6 +343,25 @@ def render_ticket(t: dict, conn) -> str:
             lines.append("")
         lines.append("")
 
+    # 完成确认（需求 2026-08-24 #3：工程师报完工 → 店长「确认修好」后才算完成）
+    if t["status"] == "PENDING_CONFIRM":
+        lines.append("## 完成确认\n")
+        lines.append("- 工程师已报完工，等待店长回复「确认修好」或「没修好」")
+        if t.get("waiting_since"):
+            lines.append(f"- 等待开始：{_fmt(t['waiting_since'])}（超时将按响应 SLA 提醒/升级）")
+        lines.append("")
+    elif t["status"] == "COMPLETED":
+        lines.append("## 完成确认\n")
+        if t.get("completed_confirm_by"):
+            lines.append(f"- 确认人：{_name(t['completed_confirm_by'])}（店长）")
+            lines.append(f"- 确认时间：{_fmt(t['completed_confirm_at'])}")
+            reject_note = _reject_history(conn, tid)
+            for r in reject_note:
+                lines.append(f"- 此前店长曾反馈未修好：{r}")
+        else:
+            lines.append("- 店长本人报完工，直接完成（无独立确认环节）")
+        lines.append("")
+
     # 关闭信息
     lines.append("## 关闭信息\n")
     if t["status"] == "COMPLETED":
@@ -371,6 +398,25 @@ def _completion_message(conn, ticket_id: int, t: dict) -> dict | None:
         if m["sender_role"] in ("MANAGER", "ENGINEER"):
             return m
     return None
+
+
+def _reject_history(conn, ticket_id: int) -> list[str]:
+    """店长驳回完工（「没修好」）的历史记录，按时间排列。
+
+    驳回理由不落独立列，从消息归档中按链接类型 CONFIRM_WINDOW + 内容识别。
+    """
+    rows = conn.execute(
+        "SELECT m.content, m.sent_at FROM messages m "
+        "JOIN message_ticket_links l ON l.message_id = m.message_id "
+        "WHERE m.ticket_id=? AND l.link_type='CONFIRM_WINDOW' "
+        "AND m.sender_role='MANAGER' AND (m.content LIKE '%没修好%' OR m.content LIKE '%还未修好%') "
+        "ORDER BY m.sent_at, m.id",
+        (ticket_id,),
+    ).fetchall()
+    return [
+        f"「{(r['content'] or '').strip()[:60]}」（{_fmt(r['sent_at'])}）"
+        for r in rows
+    ]
 
 
 def _closer_name(conn, ticket_id: int, t: dict) -> str:

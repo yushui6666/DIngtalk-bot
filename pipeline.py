@@ -21,7 +21,11 @@ from typing import Any
 from config import LLM_ENABLED, LLM_MAX_ATTEMPTS, LLM_RETRY_DELAYS_SECONDS
 from db import Database
 from logger import get_logger
-from models import NormalizedMessage
+from models import (
+    ROLE_SYSTEM,
+    TICKET_PENDING_CONFIRM,
+    NormalizedMessage,
+)
 from ordering import parse_naive_dt
 from routing.pending_actions import PendingActionService
 from routing.ticket_contexts import TicketContextStore
@@ -36,7 +40,9 @@ from semantics.types import (
     SemanticDecision,
 )
 from semantics.validator import validate_decision
+from tickets.commands import wrong_number_text
 from tickets.executor import (
+    RESULT_INTERNAL_ERROR,
     RESULT_OK,
     TicketCommandExecutor,
 )
@@ -47,6 +53,25 @@ logger = get_logger(__name__)
 _INBOX_COMPLETED = "COMPLETED"
 _INBOX_RETRY = "RETRY_PENDING"
 _INBOX_DEAD = "DEAD_LETTER"
+
+# 这些意图自带编号容错（自拉全量/新建/交互式选择），不做前置编号硬校验
+_NUMBER_TOLERANT_INTENTS = frozenset({
+    "ticket.create", "ticket.select", "ticket.query", "ticket.reopen",
+})
+# 店长确认/驳回完工：候选只取 PENDING_CONFIRM 工单
+_CONFIRM_COMPLETE_INTENTS = frozenset({"ticket.confirm_complete", "ticket.reject_complete"})
+
+
+def _suggest_ticket_no(wrong_no: str, ticket_nos: list[str]) -> str | None:
+    """编号纠错的近似建议：末段数字一致优先，其次 difflib 相似度。"""
+    import difflib
+
+    wrong_suffix = wrong_no.rsplit("-", 1)[-1].lstrip("0") or "0"
+    for no in ticket_nos:
+        if no.rsplit("-", 1)[-1].lstrip("0") == wrong_suffix and len(wrong_suffix) >= 2:
+            return no
+    matches = difflib.get_close_matches(wrong_no, ticket_nos, n=1, cutoff=0.72)
+    return matches[0] if matches else None
 
 
 class RuntimeMode(StrEnum):
@@ -122,7 +147,8 @@ class MessageProcessingPipeline:
             "消息处理开始 msg=%s group=%s sender=%s role=%s type=%s",
             msg.message_id, msg.group_id, msg.sender_id[:8], msg.sender_role, msg.message_type,
         )
-        await self._archive_attachments(msg)
+        if self._mode != RuntimeMode.SHADOW:
+            await self._archive_attachments(msg)
         try:
             status = await self._handle(msg, item)
             logger.info("消息处理完成 msg=%s status=%s", msg.message_id, status)
@@ -133,6 +159,8 @@ class MessageProcessingPipeline:
 
     # ─────────────────────── 主流程 ───────────────────────
     async def _handle(self, msg: NormalizedMessage, item: dict[str, Any]) -> str:
+        if self._mode == RuntimeMode.SHADOW and msg.attachments:
+            return self._complete(item, msg, "SHADOW")
         # 图片消息（含附件）→ 补图归属 + 多模态解析，不走文本模型
         if msg.attachments:
             return self._handle_image_attachment(item, msg)
@@ -145,6 +173,13 @@ class MessageProcessingPipeline:
             msg.message_id, decision.source, decision.intent, decision.intent_confidence,
             decision.target_ticket_no, decision.missing_fields or "-",
         )
+
+        # SHADOW 只记录语义决策：不解决既有 Pending，不路由、校验、建 Pending 或发消息。
+        if self._mode == RuntimeMode.SHADOW:
+            self._save_decision(msg, decision)
+            logger.info("影子模式：只记录不执行 message_id=%s intent=%s", msg.message_id, decision.intent)
+            return self._complete(item, msg, "SHADOW")
+
         if pending is not None:
             resolved = await self._resolve_pending_reply(item, msg, pending, decision)
             if resolved is not None:
@@ -157,6 +192,20 @@ class MessageProcessingPipeline:
         # 语义决策审计
         self._save_decision(msg, decision)
 
+        # ── 待店长确认窗口：该群存在 PENDING_CONFIRM 工单时，
+        # 所有成员消息（含闲聊）强制归档到最早的待确认工单，作为完工沟通记录
+        # （需求 2026-08-24 #3「维修完成的聊天需要记录到工单内」）。──
+        pending_confirm = self._db.get_group_pending_confirm_tickets(msg.group_id)
+        if pending_confirm and msg.sender_role != ROLE_SYSTEM:
+            t0 = pending_confirm[0]
+            self._db.link_message(msg.message_id, t0["id"], "CONFIRM_WINDOW", 0.0)
+            self._db.add_ticket_message(
+                msg.message_id, t0["id"], msg.sender_id, msg.sender_role,
+                msg.content or "", msg.message_type,
+                msg.sent_at.strftime("%Y-%m-%d %H:%M:%S"),
+            )
+            if decision.intent == "chat.ignore":
+                return self._complete(item, msg, "ARCHIVED")
         if decision.intent == "chat.ignore":
             return self._complete(item, msg, "IGNORED")
 
@@ -165,9 +214,52 @@ class MessageProcessingPipeline:
             return self._handle_clarify(item, msg, decision)
 
         candidates = self._repo.snapshot_candidates(msg.group_id)
-        # #重开工单 需定位终态工单（STOPPED/COMPLETED/CANCELLED），候选扩大为群内全部工单
-        if decision.intent == "ticket.reopen":
+        # 重开及指定编号查询需定位终态工单（STOPPED/COMPLETED/CANCELLED）。
+        # 无编号查询仍只列活动工单，保持原有查询语义。
+        if decision.intent == "ticket.reopen" or (
+            decision.intent == "ticket.query" and decision.target_ticket_no
+        ):
             candidates = self._repo.snapshot_group_tickets(msg.group_id)
+
+        # 店长确认/驳回完工：候选只取待店长确认工单（含编号定位与单候选兜底）
+        if decision.intent in _CONFIRM_COMPLETE_INTENTS:
+            candidates = [
+                c for c in self._repo.snapshot_group_tickets(msg.group_id)
+                if c.status == TICKET_PENDING_CONFIRM
+            ]
+
+        # ── 编号硬校验（需求 2026-08-24 #1）：显式编号必须存在且状态允许，
+        # 否则明确报错，绝不静默 fall-through 归属到其他工单。──
+        if decision.target_ticket_no and decision.intent not in _NUMBER_TOLERANT_INTENTS:
+            full_tickets = self._repo.snapshot_group_tickets(msg.group_id)
+            exact = next(
+                (c for c in full_tickets if c.ticket_no == decision.target_ticket_no), None
+            )
+            if exact is None:
+                suggestion = _suggest_ticket_no(
+                    decision.target_ticket_no, [c.ticket_no for c in full_tickets]
+                )
+                self._notifier.send_group_now(
+                    msg.group_id,
+                    wrong_number_text(decision.target_ticket_no, full_tickets, suggestion),
+                    message_id=msg.message_id,
+                )
+                logger.info("编号纠错拒绝 msg=%s target=%s", msg.message_id, decision.target_ticket_no)
+                return self._complete(item, msg, "REJECTED")
+            action_def = self._protocol.get_action(decision.intent)
+            states = tuple(action_def.allowed_ticket_states) if action_def else ()
+            if states and exact.status not in states:
+                from tickets.commands import intent_label as _intent_label
+                from tickets.commands import ticket_status_label as _status_label
+
+                self._notifier.send_group_now(
+                    msg.group_id,
+                    f"⚠️ 工单「{exact.ticket_no}」当前状态「{_status_label(exact.status)}」，"
+                    f"不能执行「{_intent_label(decision.intent)}」。"
+                    f"如需继续处理请 #重开工单 并说明原因。",
+                    message_id=msg.message_id,
+                )
+                return self._complete(item, msg, "REJECTED")
 
         # 选择工单：建立用户上下文（不走执行器）
         if decision.intent == "ticket.select":
@@ -221,6 +313,9 @@ class MessageProcessingPipeline:
             msg.message_id, status.value, "；".join(errors) if errors else "-",
         )
         if status == DecisionStatus.VALIDATION_REJECTED:
+            # 自然语言分步补充：ticket.create 因缺少必填字段被拒 → 创建待补充草稿，下条消息可直接补缺失字段
+            if decision.intent == "ticket.create" and _is_missing_fields_error(errors):
+                return self._handle_incomplete_create(item, msg, decision, errors)
             return self._reject(item, msg, errors)
         if status == DecisionStatus.IGNORE:
             return self._complete(item, msg, "IGNORED")
@@ -232,11 +327,6 @@ class MessageProcessingPipeline:
         # 协议确认策略（如模型来源 complete/cancel/reopen ALWAYS）→ 待确认
         if status == DecisionStatus.WAITING_CONFIRMATION:
             return self._create_confirm_pending(item, msg, decision, cmd, route, validate_candidates)
-
-        # 运行模式门禁
-        if self._mode == RuntimeMode.SHADOW:
-            logger.info("影子模式：只记录不执行 message_id=%s intent=%s", msg.message_id, decision.intent)
-            return self._complete(item, msg, "SHADOW")
 
         if self._mode == RuntimeMode.ASSISTED and decision.source == "SEMANTIC_MODEL":
             return self._create_confirm_pending(item, msg, decision, cmd, route, validate_candidates)
@@ -352,8 +442,16 @@ class MessageProcessingPipeline:
 
         if cmd.intent != "ticket.repair_plan.submit" or result.status != RESULT_OK:
             return
-        order_nos = cmd.fields.get("order_nos") or [cmd.fields.get("order_no")]
-        order_nos = [str(o).strip() for o in order_nos if str(o).strip()]
+        raw_order_nos = cmd.fields.get("order_nos") or [cmd.fields.get("order_no")]
+        # 防御：模型可能返回 null/None → str(None)会变成"None"，必须先判空再转字符串
+        order_nos: list[str] = []
+        for _o in raw_order_nos:
+            if _o is None:
+                continue
+            _s = str(_o).strip()
+            if not _s or _s.lower() in ("none", "null", "nil"):
+                continue
+            order_nos.append(_s)
         if not order_nos or result.ticket_id is None:
             return
         ticket = self._db.get_ticket(result.ticket_id)
@@ -372,10 +470,21 @@ class MessageProcessingPipeline:
                 order_id=order_no, ticket_id=result.ticket_id,
                 store=ticket["store_name"], ticket_no=ticket["ticket_no"],
             )
-            append_order_row(
-                ORDER_STORE_TABLE_PATH, order_id=order_no,
-                store=ticket["store_name"], ticket_no=ticket["ticket_no"],
-            )
+            # 共享表写失败不阻断登记（2026-08-25 兜底）：订单留在 xlsx_synced=0，
+            # 由调度器 scan_shared_table_resync 周期补写。
+            try:
+                append_order_row(
+                    ORDER_STORE_TABLE_PATH, order_id=order_no,
+                    store=ticket["store_name"], ticket_no=ticket["ticket_no"],
+                )
+            except Exception as exc:
+                logger.error(
+                    "共享表写入失败，待调度器补同步 order=%s ticket=%s err=%s",
+                    order_no, ticket["ticket_no"], exc,
+                )
+            else:
+                # 追加成功或该行本已存在 → 均视为已同步
+                self._db.mark_order_xlsx_synced(order_no)
             registered.append(order_no)
 
         if not registered:
@@ -388,52 +497,19 @@ class MessageProcessingPipeline:
                 )
             return
 
-        order_text = "、".join(registered)
-        text = (
-            f"📦 订单 {order_text} 已登记，工单 {ticket['ticket_no']}。"
-            f"到货签收后开始计时维修，请留意群内提醒。"
-        )
-        if already_registered:
-            text += f"\n注：订单 {'、'.join(already_registered)} 已在其他工单登记过。"
-        # 若对账表已导入首个订单，附注收货地址（增强）
-        order = self._db.get_taobao_order(registered[0]) if hasattr(self._db, "get_taobao_order") else None
-        if order and order.get("address"):
-            text += f"\n📍 收货地址：{order['address']}"
-        self._notifier.send_group_now(msg.group_id, text, message_id=msg.message_id)
-        logger.info(
-            "订单已登记 orders=%s ticket=%s",
-            order_text, ticket["ticket_no"],
-        )
+        # 静默化（2026-08-24 #2）：订单登记成功属纯告知，不再回执；
+        # 后续「已发货/已签收/已关闭」状态变化由调度器按需通知。
+        logger.info("订单已登记 orders=%s ticket=%s", "、".join(registered), ticket["ticket_no"])
 
     # ─────────────────────── 决策 ───────────────────────
     async def _decide(self, msg: NormalizedMessage) -> SemanticDecision:
-        keyword = match_keyword(msg.content, self._protocol)
+        # 2026-08-20 用户决策：全面取消 #关键词，全部由 AI 判断（关键词快路径已停用）
+        keyword = None  # match_keyword(msg.content, self._protocol)
         if keyword is not None:
             logger.info("关键词快路径命中 msg=%s intent=%s", msg.message_id, keyword.intent)
             return keyword
-        # 订单号快路径：消息里含订单号（可混有故障判断）→ 视为提交订单，全部登记
-        order_numbers = _extract_order_numbers(msg.content)
-        if order_numbers:
-            fields: dict[str, Any] = {
-                "order_no": order_numbers[0],
-                "order_nos": order_numbers,
-            }
-            diagnosis = _extract_diagnosis_text(msg.content, order_numbers)
-            if diagnosis:
-                fields["diagnosis_items"] = [diagnosis]
-            logger.info(
-                "订单号快路径命中 msg=%s orders=%s diagnosis=%s",
-                msg.message_id, order_numbers, bool(diagnosis),
-            )
-            return SemanticDecision(
-                protocol_version=self._protocol.protocol_version,
-                source="local",
-                intent="ticket.repair_plan.submit",
-                target_ticket_no=None,
-                intent_confidence=1.0,
-                fields=fields,
-                evidence=("order_numbers",),
-            )
+        # 订单提交已全面交由 AI 判断（避免纯数字手机号/资产号被本地正则误判为淘宝订单号）
+        # 原本地订单号快路径已移除， bare order 等由模型识别为 ticket.repair_plan.submit
         # 候选选择快路径：消息是「2」「选2」「第二个」→ 选第 N 个活动工单
         selection_no = _extract_selection_number(msg.content)
         if selection_no is not None:
@@ -453,14 +529,14 @@ class MessageProcessingPipeline:
                     evidence=(f"selection:{selection_no}",),
                 )
         if not self._llm_enabled:
-            logger.info("模型未启用 msg=%s 走降级 ignore", msg.message_id)
+            logger.warning("模型未启用 msg=%s 走降级 retry（全AI架构下LLM为必选）", msg.message_id)
             return SemanticDecision(
                 protocol_version=self._protocol.protocol_version,
-                source="local",
+                source="SEMANTIC_MODEL",
                 intent="chat.ignore",
                 target_ticket_no=None,
                 intent_confidence=0.0,
-                evidence=("llm_disabled",),
+                evidence=(f"model_fallback:llm_disabled:{msg.message_id}",),
             )
         candidates = self._repo.snapshot_candidates(msg.group_id)
         pending = self._pending.get_waiting(msg.group_id, msg.sender_id)
@@ -485,25 +561,27 @@ class MessageProcessingPipeline:
             logger.warning("消息图片归档异常 msg=%s err=%s", msg.message_id, exc)
 
     def _save_decision(self, msg: NormalizedMessage, decision: SemanticDecision) -> None:
-        try:
-            self._db.save_semantic_decision(
-                msg.message_id,
-                protocol_version=decision.protocol_version,
-                source=decision.source,
-                intent=decision.intent,
-                target_ticket_no=decision.target_ticket_no,
-                confidence=decision.intent_confidence,
-                fields=decision.fields,
-                missing_fields=decision.missing_fields,
-                evidence=decision.evidence,
-            )
-        except Exception as exc:
-            logger.warning("语义决策审计失败 message_id=%s err=%s", msg.message_id, exc)
+        self._db.save_semantic_decision(
+            msg.message_id,
+            protocol_version=decision.protocol_version,
+            source=decision.source,
+            intent=decision.intent,
+            target_ticket_no=decision.target_ticket_no,
+            confidence=decision.intent_confidence,
+            fields=decision.fields,
+            missing_fields=decision.missing_fields,
+            evidence=decision.evidence,
+        )
 
     # ─────────────────────── 待确认回复 ───────────────────────
     async def _resolve_pending_reply(
         self, item: dict[str, Any], msg: NormalizedMessage, pending: Any, decision: SemanticDecision
     ) -> str | None:
+        # 自然语言分步补充：上一条因缺字段的 ticket.create 草稿，当前消息补充缺失字段
+        if pending.intent == "ticket.create":
+            supplement = await self._try_supplement_create_pending(item, msg, pending, decision)
+            if supplement is not None:
+                return supplement
         if decision.intent == "system.confirm_pending_action":
             logger.info("待确认动作确认 msg=%s pending=%s intent=%s", msg.message_id, pending.id, pending.intent)
             return self._confirm_pending(item, msg, pending)
@@ -520,44 +598,123 @@ class MessageProcessingPipeline:
             return self._assign_pending_target(item, msg, pending, decision)
         return None
 
+    def _resolve_assign_targets(
+        self, pending: Any, decision: SemanticDecision, msg: NormalizedMessage
+    ) -> tuple[list[int], list[str]]:
+        """归属问询目标解析（2026-08-27 设计 A）。
+
+        分层：① 全编号精确（兼容现状）→ ② 消息原文纯数字 token：
+        尾缀唯一匹配优先（去前导零对齐末段），其次按展示序号解释。
+        返回 (目标 id 列表去重保序, 无法识别的 token 列表)；调用方保证原子性。
+        """
+        no_map: dict[str, int] = {}
+        suffix_counts: dict[str, int] = {}
+        suffix_owner: dict[str, int] = {}
+        valid_ids: list[int] = []
+        for tid in pending.candidate_ticket_ids:
+            t = self._db.get_ticket(tid)
+            if t is None:
+                continue
+            valid_ids.append(tid)
+            no_map[t["ticket_no"]] = tid
+            suf = t["ticket_no"].rsplit("-", 1)[-1].lstrip("0")
+            if suf:
+                suffix_counts[suf] = suffix_counts.get(suf, 0) + 1
+                suffix_owner[suf] = tid
+
+        target_no = decision.target_ticket_no
+        if target_no and target_no in no_map:
+            return [no_map[target_no]], []
+
+        targets: list[int] = []
+        unknown: list[str] = []
+        seen: set[int] = set()
+        # 仅收独立的数字段：字母数字混排串（订单号/资产号）不算编号
+        for tok in re.findall(r"(?<![A-Za-z0-9])(\d{1,4})(?![A-Za-z0-9])", msg.content or ""):
+            suf = tok.lstrip("0")
+            tid: int | None = None
+            if suf and suffix_counts.get(suf) == 1:
+                tid = suffix_owner[suf]
+            elif 1 <= int(tok) <= len(valid_ids):
+                tid = valid_ids[int(tok) - 1]
+            if tid is None or tid in seen:
+                if tid is None and tok not in unknown:
+                    unknown.append(tok)
+                continue
+            seen.add(tid)
+            targets.append(tid)
+        return targets, unknown
+
     def _assign_pending_target(
         self, item: dict[str, Any], msg: NormalizedMessage, pending: Any, decision: SemanticDecision
     ) -> str:
         """归属问询后用户选择工单：把待归属动作落到所选工单执行。"""
-        target_id = None
-        target_no = decision.target_ticket_no
-        if target_no:
-            target_id = next(
-                (tid for tid in pending.candidate_ticket_ids
-                 if self._db.get_ticket(tid)["ticket_no"] == target_no),
-                None,
+        targets, unknown = self._resolve_assign_targets(pending, decision, msg)
+        if not targets or unknown:
+            # 原子拒绝：任一编号无法识别即整批不执行（不猜），pending 存活可重选
+            hint = f"\n无法识别：{'、'.join(unknown)}" if unknown else ""
+            self._notifier.send_group_now(
+                msg.group_id, f"没有找到对应工单，请重新选择。{hint}", message_id=msg.message_id
             )
-        if target_id is None:
+            return self._complete(item, msg, "REJECTED")
+
+        # 执行前逐张预检版本与状态允许集；任一冲突整体拒绝（镜像单目标语义）
+        action_def = self._protocol.get_action(pending.intent)
+        allowed_states = tuple(action_def.allowed_ticket_states) if action_def else ()
+        checked: list[tuple[int, dict[str, Any]]] = []
+        for tid in targets:
+            ticket = self._db.get_ticket(tid)
+            if ticket is None:
+                continue
+            expected = pending.expected_ticket_versions.get(tid)
+            if (
+                (expected is not None and ticket["version"] != expected)
+                or (allowed_states and ticket["status"] not in allowed_states)
+            ):
+                self._notifier.send_group_now(
+                    msg.group_id, "该工单状态已更新，请重新选择。", message_id=msg.message_id
+                )
+                return self._complete(item, msg, "REJECTED")
+            checked.append((tid, ticket))
+        if not checked:
             self._notifier.send_group_now(
                 msg.group_id, "没有找到对应工单，请重新选择。", message_id=msg.message_id
             )
             return self._complete(item, msg, "REJECTED")
-        ticket = self._db.get_ticket(target_id)
-        expected = pending.expected_ticket_versions.get(target_id)
-        if expected is not None and ticket["version"] != expected:
-            self._notifier.send_group_now(
-                msg.group_id, "该工单状态已更新，请重新选择。", message_id=msg.message_id
-            )
-            return self._complete(item, msg, "REJECTED")
+        targets = [tid for tid, _ in checked]
+
         if not self._pending.resolve(
             pending.id, pending.version, PendingActionStatus.CONFIRMED,
             msg.message_id, now=datetime.now()
         ):
             return self._complete(item, msg, "REJECTED")
 
-        cmd = _command_from_pending(msg, pending, target_id)
-        result = self._executor.execute(
-            cmd, message=msg, pending_action_id=pending.id, pending_version=pending.version
+        # 多选（2026-08-27 用户决策「一次读取多个」）：逐张执行同一待归属动作；
+        # 成功保持静默（用户裁定不加成功回执），失败沿用既有兜底文案一次。
+        results: list[Any] = []
+        cmds: list[Any] = []
+        for tid in targets:
+            cmd = _command_from_pending(msg, pending, tid)
+            results.append(
+                self._executor.execute(
+                    cmd, message=msg, pending_action_id=pending.id, pending_version=pending.version
+                )
+            )
+            cmds.append(cmd)
+        failures = [r for r in results if r.status != RESULT_OK]
+        for cmd, result in zip(cmds, results):
+            if result.status == RESULT_OK:
+                self._handle_order_submitted(cmd, result, msg)
+        if not failures:
+            return self._complete_execution_result(item, msg, results[0])
+        first_fail = failures[0].status
+        self._complete(item, msg, "EXECUTED" if len(failures) < len(results) else first_fail)
+        self._notifier.send_group_now(
+            msg.group_id,
+            f"工单操作未完成（{first_fail}），请重试或联系管理员。",
+            message_id=msg.message_id,
         )
-        if result.status == RESULT_OK:
-            self._handle_order_submitted(cmd, result, msg)
-            self._notifier.flush()
-        return self._complete(item, msg, "EXECUTED" if result.status == RESULT_OK else result.status)
+        return _INBOX_COMPLETED
 
     def _confirm_pending(self, item: dict[str, Any], msg: NormalizedMessage, pending: Any) -> str:
         """确认待执行动作：校验工单版本未变后执行。"""
@@ -572,9 +729,9 @@ class MessageProcessingPipeline:
             result = self._executor.execute(
                 cmd, message=msg, pending_action_id=pending.id, pending_version=pending.version
             )
-            if result.status == RESULT_OK:
-                self._notifier.flush()
-            return self._complete(item, msg, "EXECUTED")
+            if result.status == RESULT_INTERNAL_ERROR:
+                self._create_retry_pending(msg, pending)
+            return self._complete_execution_result(item, msg, result)
 
         target_ids = pending.candidate_ticket_ids
         target_id = target_ids[0] if len(target_ids) == 1 else None
@@ -602,14 +759,41 @@ class MessageProcessingPipeline:
         result = self._executor.execute(
             cmd, message=msg, pending_action_id=pending.id, pending_version=pending.version
         )
-        if result.status == RESULT_OK:
-            self._notifier.flush()
-        return self._complete(item, msg, "EXECUTED")
+        if result.status == RESULT_INTERNAL_ERROR:
+            self._create_retry_pending(msg, pending)
+        return self._complete_execution_result(item, msg, result)
+
+    def _create_retry_pending(self, msg: NormalizedMessage, pending: Any) -> None:
+        """执行器内部失败时保留可再次确认的草稿。"""
+        decision = SemanticDecision(
+            protocol_version=self._protocol.protocol_version,
+            source="PENDING_RETRY",
+            intent=pending.intent,
+            target_ticket_no=None,
+            intent_confidence=1.0,
+            fields=dict(pending.fields),
+            requires_confirmation=True,
+            evidence=("executor_failure_retry",),
+        )
+        draft = PendingActionDraft(
+            source_message_id=msg.message_id,
+            group_id=pending.group_id,
+            user_id=pending.user_id,
+            decision=decision,
+            expected_ticket_versions=dict(pending.expected_ticket_versions),
+            expires_at=datetime.now(),
+        )
+        self._pending.create_or_supersede(draft, datetime.now())
 
     def _reject_pending(self, item: dict[str, Any], msg: NormalizedMessage, pending: Any) -> str:
-        self._pending.resolve(
+        resolved = self._pending.resolve(
             pending.id, pending.version, PendingActionStatus.REJECTED, msg.message_id, now=datetime.now()
         )
+        if not resolved:
+            self._notifier.send_group_now(
+                msg.group_id, "该待办已处理或已失效，请重新发起操作。", message_id=msg.message_id
+            )
+            return self._complete(item, msg, "REJECTED")
         self._notifier.send_group_now(msg.group_id, "已取消该操作。", message_id=msg.message_id)
         return self._complete(item, msg, "REJECTED")
 
@@ -625,16 +809,18 @@ class MessageProcessingPipeline:
             return self._create_clarify_pending_from(
                 item, msg, pending.intent, merged, pending.candidate_ticket_ids, "请明确工单编号",
             )
-        self._pending.resolve(
+        if not self._pending.resolve(
             pending.id, pending.version, PendingActionStatus.CONFIRMED, msg.message_id, now=datetime.now()
-        )
+        ):
+            self._notifier.send_group_now(
+                msg.group_id, "该待办已处理或已失效，请重新发起操作。", message_id=msg.message_id
+            )
+            return self._complete(item, msg, "REJECTED")
         cmd = _command_from_pending(msg, pending, target_id, fields=merged)
         result = self._executor.execute(
             cmd, message=msg, pending_action_id=pending.id, pending_version=pending.version
         )
-        if result.status == RESULT_OK:
-            self._notifier.flush()
-        return self._complete(item, msg, "EXECUTED")
+        return self._complete_execution_result(item, msg, result)
 
     # ─────────────────────── 澄清/确认待办 ───────────────────────
     def _handle_clarify(
@@ -735,8 +921,12 @@ class MessageProcessingPipeline:
             order_key=f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}|{msg.message_id}",
             now=datetime.now(),
         )
+        # 选单成功需回执确认（用户要求 2026-08-25）：让用户明确知道后续消息归属哪张工单
         self._notifier.send_group_now(
-            msg.group_id, f"已切换到工单 {target.ticket_no}。", message_id=msg.message_id
+            msg.group_id,
+            f"✅ 已切换到工单 {target.ticket_no}（{target.subject}），"
+            f"30 分钟内你的消息默认归到这张工单。",
+            message_id=msg.message_id,
         )
         return self._complete(item, msg, "EXECUTED")
 
@@ -752,12 +942,14 @@ class MessageProcessingPipeline:
                 )
                 return self._complete(item, msg, "REJECTED")
             ticket = self._db.get_ticket(target.ticket_id)
+            from tickets.commands import ticket_status_label as _status_label
+
             deadline = ticket.get("current_deadline_at")
             deadline_text = (
                 f"预计完成：{deadline}" if deadline else "时效：待商榷（暂不设截止时间）"
             )
             text = (
-                f"📋 {ticket['ticket_no']}  {ticket['status']}\n"
+                f"📋 {ticket['ticket_no']}  {_status_label(ticket['status'])}\n"
                 f"主题：{ticket['subject']}\n位置：{ticket['location']}\n"
                 f"问题：{ticket['problem_description'][:80]}\n"
                 f"{deadline_text}"
@@ -772,7 +964,9 @@ class MessageProcessingPipeline:
             return self._complete(item, msg, "EXECUTED")
 
         lines = "\n".join(
-            f"- {c.ticket_no}：{c.subject} @ {c.location}（{c.status}）" for c in candidates
+            f"- {c.ticket_no}：{c.subject} @ {c.location}（{c.status}）"
+            + (f" — {c.problem_summary}" if getattr(c, 'problem_summary', '') else "")
+            for c in candidates
         )
         self._notifier.send_group_now(
             msg.group_id, f"当前活动工单：\n{lines}", message_id=msg.message_id
@@ -802,7 +996,8 @@ class MessageProcessingPipeline:
             target_id = candidates[0].ticket_id
 
         if target_id is None:
-            # 无法确定归属：让用户选择
+            # 无法确定归属：让用户选择，但仍需解析图片内容（不阻塞工单归属）
+            self._schedule_vision_analysis(msg.message_id)
             if candidates:
                 lines = "\n".join(
                     f"{i + 1}. {c.ticket_no}（{c.subject}）" for i, c in enumerate(candidates)
@@ -844,10 +1039,17 @@ class MessageProcessingPipeline:
             if loop is not None:
                 task = loop.create_task(_run())
                 self._vision_tasks.append(task)
+                task.add_done_callback(self._remove_vision_task)
             else:
                 asyncio.run(_run())
         except Exception as exc:
             logger.warning("图片解析任务调度失败 msg=%s err=%s", message_id, exc)
+
+    def _remove_vision_task(self, task: asyncio.Task) -> None:
+        try:
+            self._vision_tasks.remove(task)
+        except ValueError:
+            pass
 
     # ─────────────────────── 收尾 ───────────────────────
     def _quoted_ticket_id(self, msg: NormalizedMessage) -> int | None:
@@ -862,7 +1064,7 @@ class MessageProcessingPipeline:
                 msg.message_id, _INBOX_DEAD, last_error=error, attempts=attempts
             )
             self._notifier.send_group_now(
-                msg.group_id, "智能识别暂时不可用，本条消息未执行，请使用标准关键词或稍后重试。",
+                msg.group_id, "智能识别暂时不可用，本条消息未执行，请稍后重试或联系管理员。",
                 message_id=msg.message_id,
             )
             return _INBOX_DEAD
@@ -876,11 +1078,148 @@ class MessageProcessingPipeline:
                     msg.message_id, attempts, self._max_attempts, delay)
         return _INBOX_RETRY
 
+    def _handle_incomplete_create(
+        self, item: dict[str, Any], msg: NormalizedMessage, decision: SemanticDecision, errors: tuple[str, ...]
+    ) -> str:
+        """ticket.create 因缺字段被拒 → 创建待补充草稿，下条消息可直接补缺失字段。"""
+        draft = PendingActionDraft(
+            source_message_id=msg.message_id,
+            group_id=msg.group_id,
+            user_id=msg.sender_id,
+            decision=decision,
+            expected_ticket_versions={},
+            expires_at=datetime.now(),
+        )
+        self._pending.create_or_supersede(draft, datetime.now())
+        self._db.inbox_set_status(msg.message_id, _INBOX_COMPLETED, processed_result="REJECTED")
+        self._db.record_processed_event(msg.message_id, msg.group_id, "REJECTED")
+        self._save_decision(msg, decision)
+        text = "无法执行：" + "；".join(errors) + "\n请直接回复缺失的信息（如 时效：3天）即可补齐，无需重发全部内容。"
+        self._notifier.send_group_now(msg.group_id, text, message_id=msg.message_id)
+        return _INBOX_COMPLETED
+
+    async def _try_supplement_create_pending(
+        self, item: dict[str, Any], msg: NormalizedMessage, pending: Any, decision: SemanticDecision
+    ) -> str | None:
+        """尝试将当前消息作为对 pending ticket.create 草稿的补充。"""
+        # 仅当 pending 是 ticket.create 且存储了部分字段时才尝试补充
+        if pending.intent != "ticket.create":
+            return None
+        # 若当前决策是无关意图（如查询/取消），不视为补充，让正常流程处理
+        if decision.intent not in ("ticket.create", "chat.ignore", "system.clarify"):
+            # 但若消息本身含有可补充字段（如单独的时效），仍尝试提取
+            supplement = _extract_supplement_fields(msg.content)
+            if not supplement:
+                return None
+            # 视为补充，构造补充决策
+            decision = SemanticDecision(
+                protocol_version=self._protocol.protocol_version,
+                source="SEMANTIC_MODEL",
+                intent="ticket.create",
+                target_ticket_no=None,
+                intent_confidence=0.8,
+                fields=supplement,
+                evidence=("supplement_extract",),
+            )
+        # 合并草稿字段与当前决策字段
+        merged: dict[str, Any] = dict(pending.fields or {})
+        # 当前决策字段覆盖草稿
+        for k, v in (decision.fields or {}).items():
+            if v not in (None, "", []):
+                merged[k] = v
+        # 本地兜底提取：裸 "3天"/"待商榷" 等时效
+        local = _extract_supplement_fields(msg.content)
+        for k, v in local.items():
+            if k not in merged or not merged[k]:
+                merged[k] = v
+        if not merged:
+            return None
+        # 若合并后仍无实质新信息（如用户发闲聊），不消耗草稿
+        new_keys = set(merged.keys()) - set(pending.fields.keys() or {})
+        has_new_value = any(merged.get(k) != (pending.fields or {}).get(k) for k in merged)
+        if not new_keys and not has_new_value:
+            # 若当前决策是 ticket.create 且有字段，至少算有补充意图
+            if decision.intent != "ticket.create":
+                return None
+        # 构造合成的 ticket.create 决策
+        synthetic = SemanticDecision(
+            protocol_version=decision.protocol_version,
+            source="SEMANTIC_MODEL",
+            intent="ticket.create",
+            target_ticket_no=None,
+            intent_confidence=max(0.6, decision.intent_confidence),
+            fields=merged,
+            evidence=tuple(list(pending.fields.keys()) + ["supplement"]),
+        )
+        # 校验合成决策
+        status, cmd, errors = validate_decision(
+            synthetic, message=msg, candidates=[], protocol=self._protocol
+        )
+        if status == DecisionStatus.VALIDATION_REJECTED and _is_missing_fields_error(errors):
+            # 仍缺字段 → 更新草稿并再次提示
+            draft = PendingActionDraft(
+                source_message_id=msg.message_id,
+                group_id=msg.group_id,
+                user_id=msg.sender_id,
+                decision=synthetic,
+                expected_ticket_versions={},
+                expires_at=datetime.now(),
+            )
+            self._pending.create_or_supersede(draft, datetime.now())
+            self._db.inbox_set_status(msg.message_id, _INBOX_COMPLETED, processed_result="REJECTED")
+            self._db.record_processed_event(msg.message_id, msg.group_id, "REJECTED")
+            self._save_decision(msg, synthetic)
+            text = "无法执行：" + "；".join(errors) + "\n请继续补充缺失信息。"
+            self._notifier.send_group_now(msg.group_id, text, message_id=msg.message_id)
+            return _INBOX_COMPLETED
+        if status == DecisionStatus.VALIDATION_REJECTED:
+            # 其他校验失败（如权限），按正常拒绝处理，不消耗草稿的补充逻辑
+            return None
+        if status == DecisionStatus.IGNORE:
+            return None
+        if self._mode == RuntimeMode.ASSISTED:
+            self._save_decision(msg, synthetic)
+            return self._create_confirm_pending(item, msg, synthetic, cmd, None, [])
+        # 校验通过 → 先执行；只在建单成功后才终结草稿。
+        self._save_decision(msg, synthetic)
+        result = self._executor.execute(cmd, message=msg)
+        logger.info("补充建单执行 msg=%s result=%s ticket_id=%s", msg.message_id, result.status, result.ticket_id)
+        if result.status == RESULT_OK:
+            self._pending.resolve(
+                pending.id, pending.version, PendingActionStatus.CONFIRMED,
+                msg.message_id, now=datetime.now(),
+            )
+        else:
+            retry_draft = PendingActionDraft(
+                source_message_id=msg.message_id,
+                group_id=msg.group_id,
+                user_id=msg.sender_id,
+                decision=synthetic,
+                expected_ticket_versions={},
+                expires_at=datetime.now(),
+            )
+            self._pending.create_or_supersede(retry_draft, datetime.now())
+        return self._complete_execution_result(item, msg, result)
+
     def _reject(self, item: dict[str, Any], msg: NormalizedMessage, errors: tuple[str, ...]) -> str:
         self._db.inbox_set_status(msg.message_id, _INBOX_COMPLETED, processed_result="REJECTED")
         self._db.record_processed_event(msg.message_id, msg.group_id, "REJECTED")
-        text = "无法执行：" + "；".join(errors[:3])
+        text = "无法执行：" + "；".join(errors)
         self._notifier.send_group_now(msg.group_id, text, message_id=msg.message_id)
+        return _INBOX_COMPLETED
+
+    def _complete_execution_result(self, item: dict[str, Any], msg: NormalizedMessage, result: Any) -> str:
+        """按执行器真实结果终结收件箱，并统一投递成功/失败反馈。"""
+        processed_result = "EXECUTED" if result.status == RESULT_OK else result.status
+        self._complete(item, msg, processed_result)
+        if result.status == RESULT_OK:
+            self._notifier.flush()
+        else:
+            self._notifier.send_group_now(
+                msg.group_id,
+                f"工单操作未完成（{result.status}），请重试或联系管理员。",
+                message_id=msg.message_id,
+            )
         return _INBOX_COMPLETED
 
     def _complete(self, item: dict[str, Any] | None, msg: NormalizedMessage | None, result: str) -> str:
@@ -890,6 +1229,40 @@ class MessageProcessingPipeline:
         if msg is not None and result != "SHADOW":
             self._db.record_processed_event(msg.message_id, msg.group_id, result)
         return _INBOX_COMPLETED
+
+
+def _is_missing_fields_error(errors: tuple[str, ...] | list[str]) -> bool:
+    """是否全为缺字段错误（可通过补充解决）。"""
+    if not errors:
+        return False
+    return all("缺少" in e for e in errors)
+
+
+def _extract_supplement_fields(content: str) -> dict[str, Any]:
+    """从补充消息中本地兜底提取可补字段（时效/主题等），与模型互补。"""
+    if not content:
+        return {}
+    fields: dict[str, Any] = {}
+    text = content.strip()
+    # 时效：裸 "3天" / "时效：3天" / "时效(7天)"
+    m = re.search(r"时效\s*[:：]?\s*(1天|3天|7天|待商榷)", text)
+    if m:
+        fields["sla"] = m.group(1)
+    elif re.fullmatch(r"\s*(1天|3天|7天|待商榷)\s*", text):
+        fields["sla"] = text.strip()
+    elif re.search(r"(?:^|\s)(1天|3天|7天|待商榷)(?:\s|$|，|。|；)", text):
+        # 裸时效词在短消息中（如"3天"）
+        mm = re.search(r"(1天|3天|7天|待商榷)", text)
+        if mm and len(text.strip()) <= 10:
+            fields["sla"] = mm.group(1)
+    # 主题/位置/问题描述 的显式键值（若用户补充时带键名）
+    for key, field in [("主题", "subject"), ("位置", "location"), ("问题描述", "problem_description")]:
+        mm = re.search(rf"{key}\s*[:：]\s*([^\n，；;]+)", text)
+        if mm:
+            val = mm.group(1).strip()
+            if val:
+                fields[field] = val
+    return fields
 
 
 # ─────────────────────── 工具 ───────────────────────

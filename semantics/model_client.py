@@ -66,6 +66,7 @@ class OpenAICompatibleModelClient:
         model: str | None = None,
         timeout_seconds: float | None = None,
         response_format: str | None = None,
+        thinking_mode: str | None = None,
     ) -> None:
         # 优先使用显式参数，其次环境变量
         self.base_url = (
@@ -94,6 +95,17 @@ class OpenAICompatibleModelClient:
                 "LLM_RESPONSE_FORMAT 必须是 auto、json_schema 或 json_object"
             )
         self.response_format = configured_format
+        # 思考模式（2026-08-26）：DeepSeek V4 默认开启思考(effort=high)，思考 token
+        # 计入 max_tokens，会把 json_object 正文挤空/挤断（官方已知偶发问题），
+        # 且思考模式下 temperature 被忽略。auto=仅对 DeepSeek 域名显式禁用。
+        self.thinking_mode = (
+            thinking_mode
+            or os.environ.get("LLM_THINKING_MODE", "auto")
+        ).lower()
+        if self.thinking_mode not in {"auto", "enabled", "disabled"}:
+            raise ValueError(
+                "LLM_THINKING_MODE 必须是 auto、enabled 或 disabled"
+            )
 
     @property
     def is_configured(self) -> bool:
@@ -165,15 +177,21 @@ class OpenAICompatibleModelClient:
             "model": self.model,
             "messages": messages,
             "temperature": 0.0,
-            "max_tokens": 1024,  # build 类完整 JSON 含多字段，512 会截断
+            # build 类完整 JSON 含多字段，512 会截断；2048 防长字段截断
+            # （思考禁用后预算全部留给正文，按实际生成计费，不虚增成本）
+            "max_tokens": 2048,
             "response_format": response_format_body,
         }
+        resolved_thinking = self._resolved_thinking()
+        if resolved_thinking is not None:
+            request_body["thinking"] = {"type": resolved_thinking}
 
         logger.info(
-            "模型请求 trace=%s model=%s format=%s idempotency=%s msg_count=%d",
+            "模型请求 trace=%s model=%s format=%s thinking=%s idempotency=%s msg_count=%d",
             request_trace_id,
             self.model,
             resolved_format,
+            resolved_thinking or "unset",
             idempotency_key,
             len(request_body["messages"]),
         )
@@ -205,11 +223,21 @@ class OpenAICompatibleModelClient:
             raise ModelResponseError("模型响应不是有效 JSON") from exc
 
         try:
-            content = data["choices"][0]["message"]["content"]
+            choice = data["choices"][0]
+            content = choice["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise ModelResponseError(
                 f"模型响应缺少 choices[0].message.content: {str(data)[:200]}"
             ) from exc
+
+        # 容错：DeepSeek json_object 已知偶发返回空 content（官方文档承认的问题，
+        # 思考模式挤占 max_tokens 会加剧）。空内容单独报错并带 finish_reason 便于诊断。
+        if not (content or "").strip():
+            raise ModelResponseError(
+                "模型返回空 content"
+                f"(finish_reason={_safe_finish_reason(data)})"
+                "——DeepSeek json_object 已知偶发问题，等待外层重试"
+            )
 
         # 容错：部分模型返回 markdown 代码块包裹的 JSON，或 JSON 后附加分析文字
         result = _extract_json(content)
@@ -296,6 +324,12 @@ class OpenAICompatibleModelClient:
             else "json_object"
         )
 
+    def _resolved_thinking(self) -> str | None:
+        """解析思考模式；None=不发送 thinking 参数（非 DeepSeek 服务不加未知字段）。"""
+        if self.thinking_mode == "auto":
+            return "disabled" if "deepseek" in self.base_url else None
+        return self.thinking_mode
+
 
 def _extract_json(content: str) -> dict[str, Any]:
     """从模型输出中提取第一个完整 JSON 对象。
@@ -360,6 +394,14 @@ def _require_json_object(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ModelResponseError("模型 content 必须是 JSON 对象")
     return value
+
+
+def _safe_finish_reason(data: dict[str, Any]) -> str:
+    """安全读取 choices[0].finish_reason，缺失时返回 unknown。"""
+    try:
+        return str(data["choices"][0].get("finish_reason") or "unknown")
+    except (KeyError, IndexError, AttributeError, TypeError):
+        return "unknown"
 
 
 def _redact_secrets(text: str, api_key: str) -> str:

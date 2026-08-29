@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from qa.feedback import compare_suggestion_with_diagnosis
+from test_pipeline_integration import FakeClassifier
 
 
 def _sugg(causes):
@@ -45,6 +46,7 @@ class TestIntegration:
         monkeypatch.setattr(_config, "TAOBAO_ORDER_DETAIL_XLSX", tmp_path / "y.xlsx")
         monkeypatch.setattr(_config, "TAOBAO_PENDING_XLSX", tmp_path / "z.xlsx")
         from datetime import datetime
+        from pathlib import Path
         from db import Database
         from notifier import Notifier
         from pipeline import MessageProcessingPipeline, RuntimeMode
@@ -72,14 +74,15 @@ class TestIntegration:
                              detail={"causes": ["制冷剂泄漏"], "repairs": ["补充制冷剂"]})
 
         sent = []
+        protocol = load_protocol(Path("protocols/ticket_semantics.v4.json"))
         pipeline = MessageProcessingPipeline(
             db=db, repo=TicketRepository(db),
-            protocol=load_protocol(Path("protocols/ticket_semantics.v4.json")
-                                   if (Path := __import__("pathlib").Path) else None),
+            protocol=protocol,
             router=TicketRouter(), context=TicketContextStore(db),
             pending=PendingActionService(db),
             executor=TicketCommandExecutor(db, TicketRepository(db)),
             notifier=Notifier(db, lambda t, x: sent.append(x)),
+            classifier=FakeClassifier(protocol=protocol),
             mode=RuntimeMode.PRODUCTION,
         )
         from models import NormalizedMessage

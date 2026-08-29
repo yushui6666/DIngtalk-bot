@@ -239,8 +239,7 @@ def test_compiler_is_reproducible_and_matches_committed_protocol(tmp_path):
 
     project_root = Path(__file__).parents[1]
     source = project_root / "dashbord" / "维修工单_流程关键词.json"
-    if not source.exists():
-        pytest.skip(f"业务源缺失，跳过编译一致性检查: {source}")
+    assert source.exists(), f"业务源文件不存在: {source}"
     first = tmp_path / "first.json"
     second = tmp_path / "second.json"
 
