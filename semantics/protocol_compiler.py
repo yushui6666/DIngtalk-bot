@@ -47,6 +47,52 @@ _ROLE_MAP: dict[str, str] = {
 
 # 新增 v4.0 动作（业务源中还没有的定义）
 _EXTRA_ACTIONS: list[dict[str, Any]] = [
+    # v4.3 RAG 闭环：AI 建议未解决反馈（pipeline 层处理，不进执行器）
+    {
+        "intent_id": "qa.unresolved",
+        "display_name": "AI建议未解决",
+        "explicit_keywords": ["#未解决"],
+        "semantic_enabled": True,
+        "allowed_roles": ["MANAGER", "ENGINEER", "LEADER", "OTHER"],
+        "allowed_ticket_states": ["ACTIVE", "ACTIVE_OVERDUE"],
+        "required_fields": ["ticket_no"],
+        "optional_fields": [],
+        "target_ticket_policy": "MUST_EXIST",
+        "risk_level": "LOW",
+        "confirmation_policy": {
+            "EXPLICIT_KEYWORD": "NOT_REQUIRED",
+            "SEMANTIC_MODEL": "NOT_REQUIRED",
+        },
+        "positive_examples": [
+            "还是不行，跟之前一样",
+            "没修好，还是不制冷",
+            "按建议弄了，没用",
+            "试过了，还是嗡嗡响",
+            "建议没用，问题还在",
+            "更严重了，现在完全不制冷了",
+            "没解决，你来看看吧",
+            "搞不定，还是漏水",
+            "试了半天还是不行",
+            "#未解决",
+            "#未解决 工单编号：W001",
+        ],
+        "negative_examples": [
+            "解决了，正常了",
+            "修好了，谢谢",
+            "正常了",
+            "还是不行吗？",
+            "我先试试",
+            "等会儿再试",
+            "怎么还没人来修",
+            "工程师说要明天来",
+            "#查询工单",
+            "好的",
+            "大家下午好",
+        ],
+        "confirmation_template": "",
+        "executor": "qa_unresolved",
+        "field_definitions": {},
+    },
     {
         "intent_id": "ticket.add_detail",
         "display_name": "补充工单信息",
@@ -746,6 +792,8 @@ def _ensure_minimum_examples(action: dict[str, Any], minimum: int = 10) -> None:
 
 
 def _sort_key(intent_id: str) -> tuple[int, str]:
+    if intent_id.startswith("qa."):
+        return (-1, intent_id)
     if intent_id.startswith("ticket."):
         return (0, intent_id)
     elif intent_id.startswith("system."):

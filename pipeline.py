@@ -98,6 +98,7 @@ class MessageProcessingPipeline:
         notifier: Any,
         classifier: Any | None = None,
         archiver: Any | None = None,
+        advisor: Any | None = None,
         mode: RuntimeMode = RuntimeMode.PRODUCTION,
         llm_enabled: bool = LLM_ENABLED,
         max_attempts: int = LLM_MAX_ATTEMPTS,
@@ -113,6 +114,7 @@ class MessageProcessingPipeline:
         self._notifier = notifier
         self._classifier = classifier
         self._archiver = archiver
+        self._advisor = advisor
         self._mode = mode
         self._llm_enabled = llm_enabled and classifier is not None
         self._max_attempts = max_attempts
@@ -318,6 +320,10 @@ class MessageProcessingPipeline:
         if status == DecisionStatus.IGNORE:
             return self._complete(item, msg, "IGNORED")
 
+        # v4.3：AI 建议未解决 → 升级转工程师（只读通知动作，不进执行器/确认流）
+        if decision.intent == "qa.unresolved":
+            return self._handle_qa_unresolved(item, msg, decision, route, candidates)
+
         # 协议确认策略（如模型来源 complete/cancel/reopen ALWAYS）→ 待确认
         if status == DecisionStatus.WAITING_CONFIRMATION:
             return self._create_confirm_pending(item, msg, decision, cmd, route, validate_candidates)
@@ -335,13 +341,94 @@ class MessageProcessingPipeline:
         if result.status == RESULT_OK:
             # 维修方式带订单号 → 登记订单监控 + 共享表（v4.1 起不再自动延期，签收后计时）
             self._handle_order_submitted(cmd, result, msg)
+            # 先 flush 建单回执，再发 RAG 建议 —— 保证群里顺序：回执 → 建议
             self._notifier.flush()
+            self._maybe_advise_new_ticket(cmd, result, msg)
         else:
             self._notifier.send_group_now(
                 msg.group_id, f"工单操作未完成（{result.status}），请重试或联系管理员。",
                 message_id=msg.message_id,
             )
         return _INBOX_COMPLETED
+
+    # ─────────────────────── AI 未解决升级（v4.3） ───────────────────────
+    def _handle_qa_unresolved(
+        self, item: dict[str, Any], msg: NormalizedMessage,
+        decision: SemanticDecision, route: Any, candidates: list[Any],
+    ) -> str:
+        """「未解决」反馈：标记建议升级 + 工单 ai_escalated + 上下文摘要@工程师。
+
+        升级语义（业务确认 2026-08-20）：AI 给出的建议解决不了问题 →
+        需要工程师解决。此后该工单 AI 静默（advisor 不再介入）。
+        """
+        if self._mode == RuntimeMode.SHADOW:
+            return self._complete(item, msg, "SHADOW")
+
+        target_id = route.target_ticket_id
+        if target_id is None and decision.target_ticket_no:
+            target_id = next(
+                (c.ticket_id for c in candidates
+                 if c.ticket_no == decision.target_ticket_no), None,
+            )
+        if target_id is None:
+            self._notifier.send_group_now(
+                msg.group_id,
+                "未找到对应工单。请带编号回复，如「#未解决 工单编号：W001」。",
+                message_id=f"qa-esc-na:{msg.message_id}",
+            )
+            return self._complete(item, msg, "EXECUTED")
+
+        ticket = self._db.get_ticket(target_id)
+        suggestion = self._db.get_latest_suggestion(target_id)
+        with self._db.transaction("qa_unresolved"):
+            if suggestion is not None and not suggestion.get("escalated_at"):
+                self._db.mark_suggestion_escalated(target_id)
+            self._db.mark_ticket_ai_escalated(target_id)
+
+        if suggestion is None:
+            self._notifier.send_group_now(
+                msg.group_id,
+                f"工单 {ticket['ticket_no']} 没有 AI 建议记录，无需升级；"
+                f"请直接描述最新情况，工程师会跟进。",
+                message_id=f"qa-esc-nosugg:{msg.message_id}",
+            )
+            return self._complete(item, msg, "EXECUTED")
+
+        excerpt = (suggestion["content"] or "").replace(chr(10), " ")[:80]
+        text = (
+            "🚨 AI 建议未解决，已请工程师接手" + chr(10)
+            + f"工单 {ticket['ticket_no']}：{ticket['subject']} @ {ticket['location']}" + chr(10)
+            + f"故障描述：{ticket['problem_description']}" + chr(10)
+            + f"已给建议：{excerpt}" + chr(10)
+            + f"用户反馈：{msg.content[:60]}"
+        )
+        self._notifier.send_group_now(
+            msg.group_id, text, message_id=f"qa-esc:{msg.message_id}",
+        )
+        logger.info(
+            "AI 未解决升级 ticket=%s suggestion=%s msg=%s",
+            ticket["ticket_no"], suggestion["id"], msg.message_id,
+        )
+        return self._complete(item, msg, "EXECUTED")
+
+    # ─────────────────────── RAG 建单建议（v4.3） ───────────────────────
+    def _maybe_advise_new_ticket(self, cmd: Any, result: Any, msg: NormalizedMessage) -> None:
+        """建单成功后的相似案例建议：检索→模板组装→Outbox 发群→台账。
+
+        失败一律静默降级（advisor 内部兜底），绝不影响建单主链路；
+        建单回执已在 Outbox，建议随后发送，顺序天然保证。
+        """
+        if self._advisor is None or cmd.intent != "ticket.create":
+            return
+        ticket = self._db.get_ticket(result.ticket_id)
+        if ticket is None:
+            return
+        advice = self._advisor.advise_for_new_ticket(ticket)
+        if advice is None:
+            return
+        self._notifier.send_group_now(
+            msg.group_id, advice["text"], message_id=f"advice:{msg.message_id}",
+        )
 
     # ─────────────────────── 订单提交处理 ───────────────────────
     def _handle_order_submitted(self, cmd: Any, result: Any, msg: NormalizedMessage) -> None:

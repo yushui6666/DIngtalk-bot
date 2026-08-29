@@ -236,8 +236,11 @@ class TicketCommandExecutor:
             _diag = fields.get("diagnosis_items", [])
             if isinstance(_diag, str):
                 _diag = [_diag] if _diag.strip() else []
+            diagnosis_items = [str(x) for x in _diag]
             self._db.add_diagnosis_version(ticket["id"], command.message_id,
-                                           list(_diag), command.actor_id)
+                                           diagnosis_items, command.actor_id)
+            # v4.3 任务7：工程师诊断 vs AI 建议 隐式比对（零打扰，失败不影响主链路）
+            self._maybe_compare_ai_suggestion(ticket["id"], diagnosis_items)
         elif kind == "repair":
             repair_method = fields.get("repair_method", "")
             if repair_method:
@@ -253,9 +256,10 @@ class TicketCommandExecutor:
             if isinstance(diagnosis_items, str):
                 diagnosis_items = [diagnosis_items] if diagnosis_items.strip() else []
             if diagnosis_items:
+                items = [str(x) for x in diagnosis_items]
                 self._db.add_diagnosis_version(
-                    ticket["id"], command.message_id,
-                    [str(x) for x in diagnosis_items], command.actor_id)
+                    ticket["id"], command.message_id, items, command.actor_id)
+                self._maybe_compare_ai_suggestion(ticket["id"], items)
         elif kind == "timeout":
             # 计划书 §4.8：仅当存在尚未解释的超时周期时接受原因
             if not self._db.add_timeout_cycle_reason(
@@ -291,6 +295,8 @@ class TicketCommandExecutor:
             )
             if not ok:
                 return CommandResult(RESULT_REJECTED, ticket["id"], ticket["version"], ())
+            # v4.3 决策6：店长直通完工同样适用 AI 建议自动落档（与确认完工一致）
+            self._maybe_record_ai_resolution(ticket["id"])
             self._db.close_responsibility_cycles(ticket["id"], command.message_id)
             self._db.clear_contexts_by_ticket(ticket["id"])
             updated = self._db.get_ticket(ticket["id"])
@@ -331,11 +337,60 @@ class TicketCommandExecutor:
         )
         if not ok:
             return CommandResult(RESULT_REJECTED, ticket["id"], ticket["version"], ())
+        # v4.3 决策6：AI 建议存在且未反馈时，「解决了」即结果级验证——
+        # 建议的原因/处理自动落档为诊断与维修方式（来源 AI，无需工程师确认）
+        self._maybe_record_ai_resolution(ticket["id"])
         self._db.close_responsibility_cycles(ticket["id"], command.message_id)
         self._db.clear_contexts_by_ticket(ticket["id"])
         updated = self._db.get_ticket(ticket["id"])
         self._finalize(command, updated, LINK_EXECUTED, message)
         return CommandResult(RESULT_OK, updated["id"], updated["version"], ())
+
+    def _maybe_compare_ai_suggestion(self, ticket_id: int, diagnosis_items: list[str]) -> None:
+        """工程师诊断与 AI 建议的隐式比对（任务 7）。
+
+        有建议且未反馈过时比对落库；任何异常静默跳过（不影响诊断主链路）。
+        """
+        try:
+            suggestion = self._db.get_latest_suggestion(ticket_id)
+            if suggestion is None or suggestion["feedback"] is not None:
+                return
+            from qa.feedback import compare_suggestion_with_diagnosis
+            result = compare_suggestion_with_diagnosis(suggestion, diagnosis_items)
+            self._db.set_suggestion_implicit_match(ticket_id, result)
+            logger.info(
+                "隐式比对完成 ticket_id=%s hit=%s matched=%s",
+                ticket_id, result["hit"], result["matched_items"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("隐式比对失败（忽略）ticket_id=%s: %s", ticket_id, exc)
+
+    def _maybe_record_ai_resolution(self, ticket_id: int) -> None:
+        """AI 建议自动落档（决策 6，2026-08-20）。
+
+        前提：该工单有未反馈的 AI 建议。行为：
+        - 建议标记 RESOLVED（结果级验证）；
+        - 工单尚无当前诊断 → 建议原因落 diagnosis_versions（engineer_id='AI'）；
+        - 工单尚无当前维修方式 → 建议处理落 repair_method_versions（engineer_id='AI'）。
+        巧合性自愈风险由 AI 来源标记全程可追溯，不做人工确认（业务确认）。
+        """
+        suggestion = self._db.get_latest_suggestion(ticket_id)
+        if suggestion is None or suggestion["feedback"] is not None:
+            return
+        detail = suggestion.get("detail") or {}
+        causes = [str(c) for c in (detail.get("causes") or []) if str(c).strip()]
+        repairs = [str(r) for r in (detail.get("repairs") or []) if str(r).strip()]
+        source_id = f"ai-sugg-{suggestion['id']}"
+        if causes and not self._db.has_current_diagnosis(ticket_id):
+            self._db.add_diagnosis_version(ticket_id, source_id, causes[:3], "AI")
+        if repairs and not self._db.has_current_repair_method(ticket_id):
+            self._db.add_repair_method_version(
+                ticket_id, source_id, repairs[0], None, "AI")
+        self._db.set_suggestion_feedback(suggestion["id"], "RESOLVED")
+        logger.info(
+            "AI 建议已随完单落档 ticket_id=%s suggestion=%s causes=%d repairs=%d",
+            ticket_id, suggestion["id"], len(causes), len(repairs),
+        )
 
     def _execute_reject_complete(self, command: ValidatedCommand, message: NormalizedMessage | None) -> CommandResult:
         """店长「没修好」：PENDING_CONFIRM → ACTIVE，交还工程师继续处理。"""

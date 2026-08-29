@@ -35,6 +35,8 @@ ALLOWED_EXECUTORS = frozenset({
     "cancel_ticket", "stop_ticket", "reopen_ticket", "query_ticket", "select_ticket",
     "clarify", "confirm_pending_action", "reject_pending_action",
     "correct_pending_action", "ignore_message",
+    # v4.3 RAG 闭环：AI 建议未解决 → 升级转工程师（pipeline 层处理，不进执行器）
+    "qa_unresolved",
     "submit_special_case",
 })
 

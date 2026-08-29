@@ -23,6 +23,8 @@ env/
 # ---- 测试与缓存 ----
 .pytest_cache/
 .coverage
+.pytest-tmp/
+.ptmp*/
 htmlcov/
 .mypy_cache/
 .ruff_cache/

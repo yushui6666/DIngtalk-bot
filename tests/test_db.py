@@ -1,4 +1,4 @@
-"""数据库层集成测试：20 张表、事务幂等、v4 多工单、upsert_group。
+"""数据库层集成测试：21 张表、事务幂等、v4 多工单、upsert_group。
 
 覆盖计划书 15 节数据模型 + Phase 1 清单：
 - 一次性建全 20 张表及索引、唯一约束；v4.0 Task 5 已移除
@@ -16,10 +16,11 @@ from config import GROUPS, DB_PATH
 from db import Database
 from models import TICKET_ACTIVE, TICKET_COMPLETED, TICKET_OVERDUE
 
-# 期望的 20 张业务表
+# 期望的 21 张业务表（v4.3 新增 ticket_suggestions）
 EXPECTED_TABLES = {
     "groups",
     "tickets",
+    "ticket_suggestions",
     "responsibility_cycles",
     "messages",
     "processed_events",
@@ -110,7 +111,7 @@ def test_init_schema_idempotent(db: Database):
     tables = db.connect().execute(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
     ).fetchone()[0]
-    assert tables == 21
+    assert tables == 22  # v4.3 ticket_suggestions + main ticket_special_cases
 
 
 # ─────────────────────── 2. 事务与幂等 ───────────────────────
