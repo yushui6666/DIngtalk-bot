@@ -22,6 +22,7 @@ from config import LLM_ENABLED, LLM_MAX_ATTEMPTS, LLM_RETRY_DELAYS_SECONDS
 from db import Database
 from logger import get_logger
 from models import (
+    ROLE_MANAGER,
     ROLE_SYSTEM,
     TICKET_PENDING_CONFIRM,
     NormalizedMessage,
@@ -35,6 +36,7 @@ from routing.ticket_router import (
     TicketRouter,
     RoutingConfig,
 )
+from semantics.classifier import normalize_semantic_decision
 from semantics.keyword_matcher import match_keyword
 from semantics.protocol_loader import TicketProtocol
 from semantics.types import (
@@ -171,6 +173,9 @@ class MessageProcessingPipeline:
         pending = self._pending.get_waiting(msg.group_id, msg.sender_id)
 
         decision = await self._decide(msg)
+        # 本地确定性后修正（幂等）：选单快路径/关键词路径同样受益，
+        # 模型路径在 classifier 内已做过一次（2026-09-03）。
+        decision = normalize_semantic_decision(decision, msg)
         logger.info(
             "语义决策 msg=%s source=%s intent=%s conf=%.2f target_no=%s missing=%s",
             msg.message_id, decision.source, decision.intent, decision.intent_confidence,
@@ -285,6 +290,36 @@ class MessageProcessingPipeline:
             msg.message_id, route.decision.value, route.link_type,
             route.target_ticket_id, len(route.candidate_ticket_ids),
         )
+
+        # ── 店长完工确认兜底（2026-09-03）：ticket.complete 在活动候选中
+        #    无明确归属（CLARIFY / 单候选兜底会误关无关工单），但消息短编号
+        #    唯一命中待确认工单时，按确认完工执行。实证 09-01：「009修好了」
+        #    经单候选误关 -011，「010修好了」因无候选被拒，#66/#69 滞留。
+        #    有显式「确认」措辞的消息已在 classifier 归一化，此处覆盖无确认词
+        #    的「NNN修好了」形态；无编号/多编号歧义时保持原路由不变。──
+        if (
+            decision.intent == "ticket.complete"
+            and msg.sender_role == ROLE_MANAGER
+            and (route.decision != RouteDecision.ROUTED or route.link_type == LINK_SINGLE)
+        ):
+            fallback_decision = self._manager_complete_fallback(msg)
+            if fallback_decision is not None:
+                decision = fallback_decision
+                candidates = [
+                    c for c in self._repo.snapshot_group_tickets(msg.group_id)
+                    if c.status == TICKET_PENDING_CONFIRM
+                ]
+                route = self._router.route(
+                    message=msg,
+                    decision=decision,
+                    candidates=candidates,
+                    quoted_ticket_id=self._quoted_ticket_id(msg),
+                    selected_ticket_id=self._context.get_active(msg.group_id, msg.sender_id, datetime.now()),
+                )
+                logger.info(
+                    "店长确认兜底命中 msg=%s target=%s",
+                    msg.message_id, decision.target_ticket_no,
+                )
 
         # ── 特殊情况归属守卫（2026-08-28）：消息开头显式提到无法解析的短编号
         #    （如「007今日胶未干…」而本群无 …-007）时，禁止静默落到选单上下文/
@@ -855,6 +890,37 @@ class MessageProcessingPipeline:
             message_id=msg.message_id,
         )
         return self._complete(item, msg, "WAITING_CONFIRMATION")
+
+    def _manager_complete_fallback(self, msg: NormalizedMessage) -> SemanticDecision | None:
+        """店长「NNN修好了」确认兜底：短编号唯一命中待确认工单 → confirm_complete 决策。
+
+        约束：消息中恰好一个短编号（≥2 位）唯一对应一张 PENDING_CONFIRM 工单
+        时才兜底；无编号、多编号、尾缀歧义一律返回 None（保持原路由，
+        避免把「008修好了」类直接完工误转为确认）。
+        """
+        numbers = re.findall(r"\d{2,}", msg.content or "")
+        normalized = [n.lstrip("0") for n in numbers]
+        if len(normalized) != 1 or not normalized[0]:
+            return None
+        pending = [
+            c for c in self._repo.snapshot_group_tickets(msg.group_id)
+            if c.status == TICKET_PENDING_CONFIRM
+        ]
+        matches = [
+            c for c in pending
+            if c.ticket_no.rsplit("-", 1)[-1].lstrip("0") == normalized[0]
+        ]
+        if len(matches) != 1:
+            return None
+        return SemanticDecision(
+            protocol_version=self._protocol.protocol_version,
+            source="local",
+            intent="ticket.confirm_complete",
+            target_ticket_no=matches[0].ticket_no,
+            intent_confidence=0.9,
+            fields={},
+            evidence=(f"manager_complete_fallback:{numbers[0]}",),
+        )
 
     def _explain_non_active_reference(self, msg: NormalizedMessage, hint: str) -> str:
         """编号指向本群非活动工单（待确认/终态）时返回解释性文案，否则空串。

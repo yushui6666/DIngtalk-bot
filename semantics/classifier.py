@@ -69,6 +69,116 @@ _ALLOWED_REPAIR_METHODS = frozenset({
     "远程视频维修",
 })
 
+# ───────────────────────── 本地归一化/兜底（2026-09-03）────────────────────────
+# 生产实证（9 月核查）：模型对同构表达输出不稳定——
+# 「004确认修好」→ ticket.confirm_complete（对）、「003确认修好」→ ticket.complete（错）；
+# 「004更换吸铁石」→ repair_plan 但 fields={}（维修方式丢失）；
+# 「011电磁阀坏了 淘宝重新采购」→ order_no="011"（短编号污染订单监控）。
+# 以下归一化在模型输出后、校验前做确定性修正，不依赖再次调用模型。
+_MANAGER_CONFIRM_RE = re.compile(r"确认\s*(修好|完成|完毕)")
+_ORDER_NO_FORMAT_RE = re.compile(r"^[A-Za-z0-9-]{6,64}$")
+# 消息开头工单短编号前缀（如「004更换吸铁石」「007：…」「#004 …」），剥离后取动作原文
+_LEADING_TICKET_NO_PREFIX_RE = re.compile(r"^\s*(?:工单|#|第)?\s*\d{1,4}(?![\dA-Za-z-])\s*[:：，,、\s]*")
+
+
+def _is_plausible_order_no(value: Any) -> bool:
+    """订单号形态校验：6-64 位字母数字连字符，且满足任一条件：
+
+    - 至少含 6 个数字（纯数字长单号，如 5127629004214178517）；
+    - 含字母且长度≥6、至少含 3 个数字（字母单号，如 TB-2024-0001）。
+
+    短编号（「011」）、中文短语（「淘宝采购吸铁石」）一律不算订单号，
+    避免污染 order_monitor 与共享表（2026-09-01 两条脏行实证）。
+    """
+    if value is None:
+        return False
+    text = str(value).strip()
+    if not _ORDER_NO_FORMAT_RE.match(text):
+        return False
+    digits = sum(ch.isdigit() for ch in text)
+    if digits >= 6:
+        return True
+    return any(ch.isalpha() for ch in text) and len(text) >= 6 and digits >= 3
+
+
+def normalize_semantic_decision(
+    decision: SemanticDecision, message: NormalizedMessage
+) -> SemanticDecision:
+    """模型输出的确定性后修正（幂等，可重入）。
+
+    1. 店长说「确认修好/确认完成/确认完毕」→ ticket.confirm_complete：
+       ticket.complete 只允许 ACTIVE 系状态，待确认工单会被判「无活动工单」。
+    2. order_no 形态守卫：非法值直接剔除（不进订单监控）。
+    3. repair_plan 无维修方式且无有效订单号 → 用消息原文（剥离开头编号）
+       回填 repair_method，口语化维修动作不再被「请明确维修方式」拒绝。
+    """
+    from semantics.types import SemanticDecision as _Decision
+
+    intent = decision.intent
+    fields = dict(decision.fields or {})
+    missing = list(decision.missing_fields or [])
+    evidence = list(decision.evidence or [])
+    changed = False
+
+    # 1. 店长确认归一化（仅显式「确认」措辞，避免误伤「008修好了」类直接完工）
+    if (
+        intent == "ticket.complete"
+        and message.sender_role == ROLE_MANAGER
+        and _MANAGER_CONFIRM_RE.search(message.content or "")
+    ):
+        intent = "ticket.confirm_complete"
+        evidence.append("manager_confirm_normalized")
+        changed = True
+        logger.info(
+            "店长确认归一化 message_id=%s complete→confirm_complete",
+            getattr(message, "message_id", "?"),
+        )
+
+    # 2. 订单号形态守卫
+    if "order_no" in fields and not _is_plausible_order_no(fields.get("order_no")):
+        logger.info(
+            "剔除非法订单号 order_no=%s message_id=%s",
+            fields.get("order_no"), getattr(message, "message_id", "?"),
+        )
+        del fields["order_no"]
+        changed = True
+
+    # 3. 维修方式兜底回填
+    if intent == "ticket.repair_plan.submit" and not str(fields.get("repair_method") or "").strip():
+        raw_order = fields.get("order_no")
+        if not _is_plausible_order_no(raw_order):
+            text = _LEADING_TICKET_NO_PREFIX_RE.sub("", message.content or "").strip()
+            if _is_plausible_order_no(text) and len(text) <= 64:
+                # 裸订单号被模型漏抽 → 补回 order_no（如「订单号：5127…」判对但 fields 丢失时）
+                fields["order_no"] = text
+                changed = True
+            elif len(text) >= 2:
+                # 口语化维修动作原文即维修方式（「004更换吸铁石」→「更换吸铁石」）
+                fields["repair_method"] = text[:500]
+                if "repair_method" in missing:
+                    missing.remove("repair_method")
+                evidence.append("repair_method_fallback")
+                changed = True
+                logger.info(
+                    "维修方式兜底回填 message_id=%s method=%s",
+                    getattr(message, "message_id", "?"), fields["repair_method"][:40],
+                )
+
+    if not changed:
+        return decision
+    return _Decision(
+        protocol_version=decision.protocol_version,
+        source=decision.source,
+        intent=intent,
+        target_ticket_no=decision.target_ticket_no,
+        intent_confidence=decision.intent_confidence,
+        fields=fields,
+        missing_fields=tuple(missing),
+        candidate_scores=decision.candidate_scores,
+        evidence=tuple(evidence),
+        requires_confirmation=decision.requires_confirmation,
+    )
+
 _BUSINESS_ACTION_CUES: dict[str, tuple[str, ...]] = {
     "ticket.create": ("报修",),
     "ticket.diagnosis.submit": ("故障判断", "判断是", "应该是"),
@@ -247,18 +357,21 @@ class SemanticClassifier:
                     "业务动作词兜底 message_id=%s cue_intent=%s（模型判 ignore）",
                     message.message_id, cue_intent,
                 )
-                return SemanticDecision(
-                    protocol_version=self._protocol.protocol_version,
-                    source="SEMANTIC_MODEL",
-                    intent=cue_intent,
-                    target_ticket_no=None,
-                    intent_confidence=0.6,
-                    fields={},
-                    missing_fields=tuple(
-                        f for f in self._protocol.get_action(cue_intent).required_fields
-                        if f != "ticket_no"
+                return normalize_semantic_decision(
+                    SemanticDecision(
+                        protocol_version=self._protocol.protocol_version,
+                        source="SEMANTIC_MODEL",
+                        intent=cue_intent,
+                        target_ticket_no=None,
+                        intent_confidence=0.6,
+                        fields={},
+                        missing_fields=tuple(
+                            f for f in self._protocol.get_action(cue_intent).required_fields
+                            if f != "ticket_no"
+                        ),
+                        evidence=tuple(_cues),
                     ),
-                    evidence=tuple(_cues),
+                    message,
                 )
 
         action = self._protocol.get_action(intent)
@@ -376,7 +489,7 @@ class SemanticClassifier:
         if isinstance(evidence_raw, list):
             evidence = tuple(str(e) for e in evidence_raw if e)
 
-        return SemanticDecision(
+        decision = SemanticDecision(
             protocol_version=self._protocol.protocol_version,
             source="SEMANTIC_MODEL",
             intent=intent,
@@ -387,6 +500,8 @@ class SemanticClassifier:
             candidate_scores=candidate_scores,
             evidence=evidence,
         )
+        # 本地确定性后修正（店长确认归一化/订单号守卫/维修方式兜底，2026-09-03）
+        return normalize_semantic_decision(decision, message)
 
 
 def _find_business_action_cues(
@@ -464,6 +579,15 @@ def _build_payload(
             parts.append("必填:" + ",".join(a.required_fields))
         if a.optional_fields:
             parts.append("可选:" + ",".join(a.optional_fields))
+        # 字段提示（2026-09-03）：required/optional 为空的动作（如 repair_plan）
+        # 模型不知道要抽什么字段，按 overrides 补全，避免维修方式系统性漏抽
+        extra_hints = [
+            f for f in _INTENT_FIELD_OVERRIDES.get(a.intent_id, ())
+            if f not in (a.required_fields or []) and f not in (a.optional_fields or [])
+            and f != "ticket_no"
+        ]
+        if extra_hints:
+            parts.append("字段:" + ",".join(extra_hints))
         example = next((e for e in a.positive_examples if e), "")
         if example:
             parts.append("例:" + example.replace("\n", " ")[:48])
@@ -514,6 +638,8 @@ def _build_payload(
         "- 工程师使用‘可能’‘应该是’等保留表达给出具体故障判断时，仍可返回 ticket.diagnosis.submit，但应降低置信度\n"
         "- 疑问句但明确描述故障（含设备/位置/问题）时，仍返回 ticket.create；纯笼统询问、否定句返回 chat.ignore\n"
         "- 用户表示问题已解决、恢复正常、可以使用（如「正常了」「搞定了」「弄好了」「没问题了」「修好了」）→ 返回 ticket.complete\n"
+        "- 店长说「确认修好/确认完成/确认完毕」（可带短编号如「003确认修好」）→ ticket.confirm_complete；工程师说「修好了/完成了」→ ticket.complete\n"
+        "- 工程师描述具体维修动作（如「更换吸铁石」「重新绑绳子」「找焊工重新焊接」，可带工单短编号前缀如「004更换吸铁石」）→ ticket.repair_plan.submit：repair_method=动作原文（剥离开头编号）；order_no 只有消息含 6 位以上字母数字连字符订单串时才填，短编号（2-4 位数字）与中文短语绝不能填入 order_no\n"
         "- 用户回复「特殊情况：原因；预计恢复：时间」（通常是对系统一小时提醒的答复，声明等待到货/等待工程师上门/等待门店或客户配合/等待第三方等外部依赖暂时无法推进）→ 返回 ticket.special_case.submit：special_case_reason=原因原文，expected_resume_at=恢复时间原文（保留「一小时内」「明天下午」等用户原话，不要换算）；消息若以短编号开头（如「007今日胶未干」），该编号可能指其他工单：把编号放入 ticket_no 字段、不要并入 special_case_reason（原因从编号之后提取）\n"
         "- 取消工单(ticket.cancel)、重开工单(ticket.reopen) 只在用户非常确定时才返回\n"
     )
